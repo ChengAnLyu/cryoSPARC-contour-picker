@@ -1,4 +1,4 @@
-SARU Picker 2.3.0 — Windows CPU edition
+SARU Picker 2.4.0 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -28,19 +28,40 @@ drag around the micrograph, then Detect. The panel remains visible throughout. G
 appear directly over cryoSPARC. Enable picking and click inside a target
 contour. The program waits for your mouse release, hides its annotation layer,
 then fills only that contour. The panel stays visible and the remaining outlines
-return. Box prompt and Next alternative provide guided selection.
+return. Box prompt provides guided selection.
+Next micrograph replaces Next alternative. It sends Down once to cryoSPARC,
+waits for a different stable image, and detects fresh contours in the same
+screen area. It does not pick them until you click a contour. This also works
+with Disable Picking checked, so you can navigate and review without picking.
 The next contour is enabled after completed picks are recorded. Delayed marker
 painting around those known picks is ignored when checking image movement.
 Each contour has its own manual-style spacing grid, zero inset and default
-0.10-second click interval. Previously placed or nearby picks are not repeated.
+0.03-second click delay. Previously placed or nearby picks are not repeated.
 
 AUTO
-Select the screen area, set Frames and Wait (s), enable picking and Start auto.
+Select the screen area, enable picking and Start auto.
 The app fills every contour one after another, showing contour/pick progress.
 If Detect already displayed contours, Start auto reuses that exact set after
-checking the screen still matches. Otherwise it detects first. For additional
-frames it finishes every contour, then uses Down, waits, and checks that a new
-stable image appeared. Same-scene detection retains previous pick locations.
+checking the screen still matches. Otherwise it detects first. After each
+micrograph it uses Down once, waits for a new stable image, detects, picks,
+and repeats. Same-scene detection retains previous pick locations.
+Limit (0=all) defaults to 0 for continuous operation. Set 1 for the current
+image only, or 2-1000 for a bounded run. Positive limits include the current
+image and empty images. Images with no detected contours are counted and
+skipped while the limit allows.
+Load (s), default 10, is the maximum loading timeout. The app continues sooner
+when a changed image becomes stable. An unchanged/end-of-list view, a recently
+repeated image, a loading timeout, or lost focus stops the cycle. It does not
+send repeated Down-key retries.
+
+PICKING SPEED
+Semi-auto/auto use a default 0.03-second delay between clicks. Change this in
+Advanced from 0.02 to 2 seconds. Manual mode remains at 0.10 seconds.
+For 200 picks, a synthetic playback test measured 20.885 -> 6.597 seconds with
+the new delay. This used simulated adapter/scene-check costs; it excludes real
+browser interaction, screen capture, detection and image loading. It is not a
+measurement of your cryoSPARC throughput. Per-click cancellation, focus and
+position checks, and the mouse fail-safe remain enabled.
 
 DETECTION
 The default capsid profile filters SAM proposals for dense granular interiors

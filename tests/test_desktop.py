@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from desktop import DesktopAdapter, DesktopError, GlobalHotkeys, enable_dpi_awareness
-from execution import CaptureGeometry
+from execution import CancelledOperation, CancellationToken, CaptureGeometry, play_clicks
 
 
 class FakeBackend:
@@ -235,6 +235,60 @@ class DesktopTests(unittest.TestCase):
         with self.assertRaises(DesktopError):
             self.adapter.press_next("down")
         self.assertEqual(self.backend.keys, ["down"])
+
+    def test_fast_playback_stops_before_next_pick_if_focus_changes(self):
+        self.adapter.bind_target(11)
+        original_click = self.backend.click
+
+        def click_then_lose_focus(x, y):
+            original_click(x, y)
+            self.windows.current = 22
+
+        self.backend.click = click_then_lose_focus
+        with self.assertRaisesRegex(DesktopError, "lost focus"):
+            play_clicks([(30, 40), (40, 40), (50, 40)], self.adapter.click,
+                        CaptureGeometry(20, 20, 100, 100), CancellationToken(), delay=.03)
+        self.assertEqual(self.backend.clicks, [(30, 40)])
+        self.assertTrue(self.backend.FAILSAFE)
+        self.assertEqual(self.backend.PAUSE, 0)
+
+    def test_fast_playback_does_not_swallow_backend_fail_safe(self):
+        class FailSafeError(RuntimeError):
+            pass
+
+        self.adapter.bind_target(11)
+        original_click = self.backend.click
+        failure = FailSafeError("Mouse reached a fail-safe corner")
+
+        def guarded_backend(x, y):
+            if self.backend.clicks:
+                raise failure
+            original_click(x, y)
+
+        self.backend.click = guarded_backend
+        with self.assertRaises(FailSafeError) as raised:
+            play_clicks([(30, 40), (40, 40), (50, 40)], self.adapter.click,
+                        CaptureGeometry(20, 20, 100, 100), CancellationToken(), delay=.03)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(self.backend.clicks, [(30, 40)])
+        self.assertTrue(self.backend.FAILSAFE)
+
+    def test_fast_playback_cancellation_prevents_remaining_native_calls(self):
+        self.adapter.bind_target(11)
+        token = CancellationToken()
+        progress = []
+
+        def cancel_after_first_pick(done, total):
+            progress.append((done, total))
+            token.cancel()
+
+        with self.assertRaises(CancelledOperation):
+            play_clicks([(30, 40), (40, 40), (50, 40)], self.adapter.click,
+                        CaptureGeometry(20, 20, 100, 100), token, delay=.03,
+                        progress=cancel_after_first_pick)
+        self.assertEqual(self.backend.clicks, [(30, 40)])
+        self.assertEqual(progress, [(1, 3)])
+        self.assertEqual(self.backend.keys, [])
 
     def test_minimized_target_is_restored_before_focus(self):
         self.windows.minimized.add(11)

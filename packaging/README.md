@@ -3,7 +3,7 @@
 This directory turns the source into an installed Windows x64 application. The
 installer includes the Python interpreter, Tcl/Tk, CPU PyTorch/torchvision,
 desktop automation libraries, and the original SAM ViT-B weights. End users
-install `SARU-Picker-Setup-2.3.0-win64.exe` and open **SARU Picker** from the Start
+install `SARU-Picker-Setup-2.4.0-win64.exe` and open **SARU Picker** from the Start
 menu or desktop shortcut. The installed application does not download models.
 
 The source archive is not itself an installer. A successful Windows workflow
@@ -87,10 +87,29 @@ no operating-system mouse clicks or keyboard input. It also checks the actual
 Windows small/large window icon handles and three consecutive semi-auto contour
 selections through native Tk events and the real worker with an in-memory
 desktop adapter. The second selection includes late pick-marker painting to
-exercise the repaired alignment guard. Both the exit code and the individual JSON
+exercise the repaired alignment guard. Navigation fixtures also exercise the
+detect/pick/Down cycle and semi-auto advancement while picking is disabled.
+Both the exit code and the individual JSON
 check results must pass. Its purpose is deployment validation, not measurement
 of scientific recognition accuracy. The installed application is tested with
 the same command.
+
+Version 2.4.0's screen controller uses **Next micrograph** in semi-auto mode
+and **Limit (0=all)** / **Load (s)** in auto mode. The default auto limit is 0
+for continuous operation; positive limits include the current image and empty
+images. Load is a maximum timeout, default 10 seconds, rather than a fixed
+post-navigation delay. A new stable image starts the next detection. Empty
+images are skipped, and unchanged/repeated images, loading failures and lost
+target focus stop navigation without repeated Down-key retries. Semi-auto
+navigation performs fresh detection without picking, including while Disable
+Picking is checked.
+
+The model-mode delay defaults to 0.03 seconds, adjustable from 0.02 to 2 seconds;
+manual remains at 0.10 seconds. A controlled 200-pick synthetic playback
+benchmark measured 20.885 to 6.597 seconds with unchanged per-click guards.
+This benchmark simulated adapter/capture costs and excluded real browser
+input, inference and image loading; it is not a Windows or cryoSPARC throughput
+claim. Recognition weights and the private-icon packaging path are unchanged.
 
 The public geometric fallback lives in `assets/app-icon.png` and a
 multi-resolution `assets/app-icon.ico`; `generate_fallback_icon.py` reproduces
@@ -139,7 +158,7 @@ acceptance test until those steps have actually been completed.
 Build outputs:
 
 - `dist/SARU_Picker/`: full portable application directory.
-- `artifacts/SARU-Picker-Setup-2.3.0-win64.exe`: Windows installer.
+- `artifacts/SARU-Picker-Setup-2.4.0-win64.exe`: Windows installer.
 - `artifacts/frozen-smoke-test.json`: frozen application validation.
 - `artifacts/installed-smoke-test.json`: installation validation when requested.
 - `artifacts/build-manifest.json`: versions, source commit, and model checksum.

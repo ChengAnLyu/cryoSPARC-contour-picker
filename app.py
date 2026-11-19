@@ -45,7 +45,7 @@ from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fr
 from screen_overlay import control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -501,6 +501,223 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
         picker.set_mode(previous_mode)
 
 
+def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
+    """Drive actual UI/worker navigation against a synthetic micrograph list.
+
+    Only our own Tk button is invoked. Keyboard and picking effects terminate
+    in the in-memory adapter, so this check cannot operate another application.
+    The real screen controller and changed/stable-frame waiter remain in use.
+    """
+    import threading
+
+    root = picker.root
+    previous_mode = picker.mode
+    previous_desktop, previous_hotkeys, previous_mouse = (picker.desktop, picker.hotkeys,
+                                                         picker.mouse_observer)
+    previous_model_override = picker.__dict__.get("_get_recognizer")
+    picker.set_mode("semi-auto")
+    _smoke_settle_panel(picker)
+    width, height = root.winfo_screenwidth(), root.winfo_screenheight()
+    occupied = control_panel_bounds(root)
+    geometry = next((CaptureGeometry(x, y, 240, 160)
+                     for x, y in ((width-260, 30), (width-260, height-190),
+                                  (20, height-190), (20, 30))
+                     if x >= 0 and y >= 0
+                     and not screen_region_overlaps_panel(CaptureGeometry(x, y, 240, 160), occupied)), None)
+    if geometry is None:
+        raise RuntimeError("No free screen area for the micrograph-cycle UI check.")
+
+    class Hooks:
+        def enable_space_pause(self, enabled):
+            pass
+        def stop(self):
+            pass
+
+    class MemoryDesktop:
+        def __init__(self):
+            self.frames = [np.repeat(np.random.default_rng(210+index).integers(
+                60, 190, (geometry.height, geometry.width), dtype=np.uint8)[..., None], 3, axis=2)
+                for index in range(4)]
+            self.reset()
+        def reset(self, index=0):
+            self.index = index
+            self.keys, self.clicks, self.thread_ids = [], [], set()
+        def focus_target(self, target):
+            self.ensure_target(target)
+        def ensure_target(self, target):
+            if target != 12345:
+                raise RuntimeError("Unexpected synthetic navigation target.")
+        def window_under_roi(self, region):
+            if region != geometry:
+                raise RuntimeError("Unexpected synthetic capture area.")
+            return 12345
+        def _layers_hidden(self):
+            if ((picker.overlay is not None and picker.overlay.visible)
+                    or (picker.input_surface is not None and picker.input_surface.visible)):
+                raise RuntimeError("A screen layer remained visible during navigation/capture.")
+        def screenshot(self, region):
+            self.window_under_roi(region)
+            self._layers_hidden()
+            return self.frames[self.index].copy()
+        def click(self, x, y):
+            self._layers_hidden()
+            if not geometry.contains(x, y):
+                raise RuntimeError("A generated cycle test pick escaped the selected area.")
+            self.thread_ids.add(threading.get_ident())
+            self.clicks.append((self.index, x, y))
+        def press_next(self, key):
+            self._layers_hidden()
+            if key != "down":
+                raise RuntimeError(f"Unexpected navigation key: {key!r}")
+            self.thread_ids.add(threading.get_ident())
+            self.keys.append(key)
+            self.index = min(self.index + 1, len(self.frames)-1)
+
+    desktop = MemoryDesktop()
+    candidates = []
+    for index in range(4):
+        left = 15 + index * 30
+        mask = polygon_mask([(left+9, 30), (left+43, 30), (left+54, 48),
+                             (left+49, 94), (left+10, 101), (left, 73)],
+                            (geometry.height, geometry.width))
+        candidates.append(make_candidate(mask, source="synthetic micrograph-cycle check"))
+
+    class Recognizer:
+        def __init__(self):
+            self.calls = []
+            self.empty_frames = set()
+        def automatic(self, rgb, *, cancel):
+            if cancel():
+                raise CancelledOperation("Synthetic recognition was cancelled.")
+            index = desktop.index
+            if not np.array_equal(rgb, desktop.frames[index]):
+                raise RuntimeError("Recognition used a stale synthetic micrograph.")
+            self.calls.append(index)
+            return [] if index in self.empty_frames else [candidates[index]]
+
+    model = Recognizer()
+
+    def panel_visible():
+        if (root.state() != "normal" or not root.winfo_viewable()
+                or not root.tk.getboolean(root.attributes("-topmost"))):
+            raise RuntimeError("Control panel disappeared during the micrograph cycle.")
+
+    def pump_until(predicate, label, *, seconds=20):
+        deadline = time.monotonic() + seconds
+        while True:
+            root.update()
+            panel_visible()
+            if predicate():
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{label} did not complete: {picker.status.get()}")
+            time.sleep(.005)
+
+    def idle():
+        return not picker.transition and not picker.runner.busy and not picker.auto_remaining
+
+    def next_button():
+        buttons = [child for child in picker.semi_controls.winfo_children()
+                   if child.winfo_class() == "TButton" and child.cget("text") == "Next micrograph"]
+        if len(buttons) != 1:
+            raise RuntimeError("The semi-auto Next micrograph button is missing or ambiguous.")
+        return buttons[0]
+
+    def prepare(mode, index=0, *, show_contour=False):
+        picker.set_mode(mode)
+        _smoke_settle_panel(picker)
+        desktop.reset(index)
+        model.calls.clear()
+        model.empty_frames.clear()
+        picker.geometry, picker.target = geometry, 12345
+        picker.rgb = desktop.frames[index].copy()
+        picker.reference = picker.rgb.copy()
+        picker.frame_id += 1
+        picker.candidates = [candidates[index]] if show_contour else []
+        picker.alternatives = []
+        picker.picked_points.clear()
+        picker.spacing.set(20)
+        picker.click_delay.set(.03)
+        picker.wait_seconds.set(2)
+        picker.disabled.set(False)
+        if show_contour:
+            picker._present_masks()
+        root.update()
+
+    try:
+        picker.desktop, picker.hotkeys, picker.mouse_observer = desktop, Hooks(), Hooks()
+        picker._get_recognizer = lambda config: model
+
+        # A real Tk button must advance once, clear the old frame's picks, and
+        # detect the next frame without placing any picks automatically.
+        prepare("semi-auto", show_contour=True)
+        picker.picked_points.add((30, 45))
+        next_button().invoke()
+        pump_until(idle, "Semi-auto next micrograph")
+        if (desktop.keys != ["down"] or desktop.clicks or model.calls != [1]
+                or picker.picked_points or picker.disabled.get()
+                or [candidate.id for candidate in picker.candidates] != [candidates[1].id]
+                or picker.input_surface is None or not picker.input_surface.visible):
+            raise RuntimeError(f"Semi-auto next micrograph failed: {picker.status.get()}")
+        semi = {"down_keys": len(desktop.keys), "detections": list(model.calls),
+                "picks_sent": len(desktop.clicks), "old_pick_history_cleared": True,
+                "new_contour_selectable": True, "real_tk_button_invoked": True}
+
+        # Continuous auto must cross a zero-proposal frame and keep going.
+        # Stop while the next navigation job is waiting: no stale continuation
+        # may detect or pick the fourth frame after this explicit stop.
+        prepare("auto")
+        model.empty_frames = {1}
+        picker.frames.set(0)
+        picker.start_auto()
+        pump_until(lambda: len(desktop.keys) >= 3 or idle(), "Continuous micrograph cycle")
+        if len(desktop.keys) != 3:
+            raise RuntimeError(f"Continuous auto stopped before its third advance: {picker.status.get()}")
+        picker.stop(message="Synthetic Stop during navigation.")
+        pump_until(idle, "Stop during navigation")
+        if model.calls != [0, 1, 2] or desktop.keys != ["down"] * 3:
+            raise RuntimeError("Auto navigation skipped a detection or continued after Stop.")
+        if {index for index, _, _ in desktop.clicks} != {0, 2}:
+            raise RuntimeError("Auto picked an empty or stopped micrograph.")
+        if len(desktop.clicks) != len(set(desktop.clicks)) or not picker.disabled.get():
+            raise RuntimeError("Auto produced duplicate test picks or did not disable after Stop.")
+        if len(desktop.thread_ids) != 1 or threading.get_ident() in desktop.thread_ids:
+            raise RuntimeError("Navigation/picking did not use the serialized background worker.")
+        auto = {"continuous_setting": 0, "detected_frames": list(model.calls),
+                "picked_frames": sorted({index for index, _, _ in desktop.clicks}),
+                "empty_frame_skipped": True, "down_keys": len(desktop.keys),
+                "unique_test_picks": len(desktop.clicks), "stop_during_navigation": True,
+                "no_detection_or_picks_after_stop": True}
+
+        # The last list item returns the same screenshot after Down. This must
+        # stop with no new recognition or picking, rather than re-picking it.
+        prepare("semi-auto", index=3, show_contour=True)
+        next_button().invoke()
+        pump_until(idle, "End-of-list handling")
+        if (desktop.keys != ["down"] or model.calls or desktop.clicks
+                or not picker.disabled.get() or picker.candidates):
+            raise RuntimeError(f"An unchanged micrograph was accepted: {picker.status.get()}")
+        unchanged = {"down_keys": 1, "new_detections": 0, "picks_sent": 0,
+                     "stopped_before_repeated_picking": True}
+        return {"semi_auto_next": semi, "continuous_auto": auto,
+                "unchanged_frame": unchanged, "panel_visible_throughout": True,
+                "real_worker_and_navigation_waiter": True, "desktop_events_sent": 0,
+                "note": "Real Tk/controller/worker; in-memory frame list, recognizer, key and click sinks; not cryoSPARC."}
+    finally:
+        picker.stop()
+        if not picker.runner.shutdown(wait=True, timeout=5):
+            raise RuntimeError("Micrograph-cycle test worker did not terminate.")
+        picker.runner.poll_results()
+        picker.runner = TaskRunner()
+        if previous_model_override is None:
+            picker.__dict__.pop("_get_recognizer", None)
+        else:
+            picker._get_recognizer = previous_model_override
+        picker.desktop, picker.hotkeys, picker.mouse_observer = (previous_desktop,
+                                                               previous_hotkeys, previous_mouse)
+        picker.set_mode(previous_mode)
+
+
 def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None) -> dict[str, Any]:
     # These are native Windows widgets at simulated Tk font/layout scales. The
     # Windows monitor's DPI setting is never changed. Each fresh interpreter is
@@ -513,6 +730,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
     panel_layouts = {}
     overlay_checks = None
     repeated_contours = None
+    micrograph_cycle = None
     icon_checks = None
     tk_version = None
     long_status = ("Recognition is running on the selected screen area.\n"
@@ -570,6 +788,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                                        f"native={icon_checks}, assets="
                                        f"{[(str(path), path.is_file()) for path in application_icon_paths()]}")
                 repeated_contours = _smoke_repeated_screen_picks(picker)
+                micrograph_cycle = _smoke_micrograph_cycle(picker)
         finally:
             if original_scaling is not None:
                 window.tk.call("tk", "scaling", original_scaling)
@@ -596,6 +815,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
             "screen_overlay": overlay_checks,
             "application_icon": icon_checks,
             "repeated_semi_auto_contours": repeated_contours,
+            "micrograph_navigation_cycle": micrograph_cycle,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 
 

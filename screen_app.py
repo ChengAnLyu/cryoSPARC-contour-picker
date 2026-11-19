@@ -20,12 +20,14 @@ from application_icon import apply_application_icon
 from desktop import DesktopAdapter, GlobalHotkeys
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskRunner, play_clicks
 from manual_sampling import legacy_contour_points, mask_contour_points
+from micrograph_navigation import NoNewMicrographError, wait_for_next_micrograph
 from recognition import Cancelled, RecognitionConfig, SamRecognizer, union_masks
 from screen_overlay import (ScreenOverlay, InputSurface, ManualMouseObserver,
                             keep_control_panel_above, control_panel_bounds)
 
 
 SCREEN_LOG = logging.getLogger("saru.screen")
+DEFAULT_MODEL_CLICK_DELAY = .03
 
 
 def screen_changed_fraction(before, after, tolerance=12):
@@ -222,6 +224,7 @@ class ScreenPickerApp:
         self.picked_points = set()
         self.frame_id = 0
         self.auto_remaining = 0
+        self.auto_completed = 0
         self.auto_history = []
         self.recognizer = self.recognizer_config = None
         self.input_kind = None
@@ -294,12 +297,13 @@ class ScreenPickerApp:
         ttk.Label(self.model_controls, textvariable=self.region_label, wraplength=wrap).pack(anchor="w", pady=4)
         self.semi_controls = ttk.Frame(self.model_controls)
         ttk.Button(self.semi_controls, text="Box prompt", command=self.box_prompt).pack(side="left")
-        ttk.Button(self.semi_controls, text="Next alternative", command=self.next_alternative).pack(side="left", padx=5)
+        self.next_micrograph_button = ttk.Button(self.semi_controls, text="Next micrograph", command=self.next_micrograph)
+        self.next_micrograph_button.pack(side="left", padx=5)
         self.auto_controls = ttk.Frame(self.model_controls)
-        self.frames, self.wait_seconds = tk.IntVar(value=1), tk.DoubleVar(value=5)
-        ttk.Label(self.auto_controls, text="Frames").pack(side="left")
-        ttk.Spinbox(self.auto_controls, from_=1, to=1000, textvariable=self.frames, width=4).pack(side="left", padx=3)
-        ttk.Label(self.auto_controls, text="Wait (s)").pack(side="left")
+        self.frames, self.wait_seconds = tk.IntVar(value=0), tk.DoubleVar(value=10)
+        ttk.Label(self.auto_controls, text="Limit (0=all)").pack(side="left")
+        ttk.Spinbox(self.auto_controls, from_=0, to=1000, textvariable=self.frames, width=4).pack(side="left", padx=3)
+        ttk.Label(self.auto_controls, text="Load (s)").pack(side="left")
         ttk.Spinbox(self.auto_controls, from_=1, to=60, textvariable=self.wait_seconds, width=4).pack(side="left", padx=3)
         ttk.Button(self.auto_controls, text="Start auto", command=self.start_auto).pack(side="right")
         self.model_note = ttk.Label(self.model_controls, wraplength=wrap)
@@ -309,7 +313,7 @@ class ScreenPickerApp:
         self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
         self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
         self.grid_side = tk.IntVar(value=8)
-        self.click_delay = tk.DoubleVar(value=.10)
+        self.click_delay = tk.DoubleVar(value=DEFAULT_MODEL_CLICK_DELAY)
         for variable in (self.status, self.region_label):
             identifier = variable.trace_add("write", self._queue_panel_fit)
             self._variable_traces.append((variable, identifier))
@@ -481,10 +485,10 @@ class ScreenPickerApp:
             self.model_controls.pack(fill="x")
             if mode == "semi-auto":
                 self.semi_controls.pack(fill="x", before=self.model_note, pady=3)
-                self.model_note.configure(text="Green outlines are proposals. Click an intended region to pick it.")
+                self.model_note.configure(text="Click a green region to pick it. Next micrograph moves Down and detects again.")
             else:
                 self.auto_controls.pack(fill="x", before=self.model_note, pady=3)
-                self.model_note.configure(text="Auto picks all proposals. Test semi-auto first. Space pauses; Escape stops.")
+                self.model_note.configure(text="Auto picks every contour. Limit 0 repeats; Load is the maximum wait. Space pauses; Escape stops.")
             self.status.set("Select the screen area, then detect or start auto.")
         self.fit_panel()
 
@@ -725,7 +729,7 @@ class ScreenPickerApp:
                     raise RuntimeError("Another window covers the selected screen area.")
                 rgb = self._capture_region(geometry)
                 if expected is not None and screen_changed_fraction(expected, rgb) > .01:
-                    raise RuntimeError("The micrograph changed between automatic frames. Auto stopped.")
+                    raise RuntimeError("The micrograph changed after navigation. Detect again before picking.")
                 model = self._get_recognizer(config)
                 candidates = (model.prompt(rgb, box=box, cancel=lambda: token.cancelled) if box is not None
                               else model.automatic(rgb, cancel=lambda: token.cancelled))
@@ -782,12 +786,20 @@ class ScreenPickerApp:
         except Exception as exc:
             self._error(exc)
 
-    def next_alternative(self):
-        if self.mode == "semi-auto" and self.alternatives and not self.runner.busy and not self.transition:
-            self.alternative_index = (self.alternative_index + 1) % len(self.alternatives)
-            self.candidates = [self.alternatives[self.alternative_index]]
-            self._present_masks()
-            self.status.set(f"Alternative {self.alternative_index+1}/{len(self.alternatives)}. Click the region to pick it.")
+    def next_micrograph(self):
+        """Advance one screen image and show fresh contours without picking."""
+        try:
+            self._idle()
+            if self.mode != "semi-auto":
+                return
+            if self.hotkeys is None:
+                raise RuntimeError("Global hotkeys are unavailable. Restart the Windows application.")
+            # Disable Picking controls generated picks, not this explicit
+            # navigation request. Recognition can still run for review.
+            self._model_config()
+            self._next_frame(auto=False)
+        except Exception as exc:
+            self._error(exc)
 
     def _start_model_picks(self, candidates, *, auto=False):
         delay = self._live_ready()
@@ -876,9 +888,11 @@ class ScreenPickerApp:
                 return
             self._live_ready()
             count, wait = int(self.frames.get()), float(self.wait_seconds.get())
-            if not 1 <= count <= 1000 or not 1 <= wait <= 60:
-                raise ValueError("Choose 1–1000 frames and a load wait of 1–60 seconds.")
-            self.auto_remaining, self.auto_history, self.paused = count, [], False
+            if not 0 <= count <= 1000 or not 1 <= wait <= 60:
+                raise ValueError("Choose a limit of 0–1000 micrographs (0 repeats) and a load timeout of 1–60 seconds.")
+            # -1 is an active continuous run; zero always means no active run.
+            self.auto_remaining, self.auto_history, self.paused = count if count else -1, [], False
+            self.auto_completed = 0
             self.hotkeys.enable_space_pause(True)
             if self.candidates and self.reference is not None:
                 # Execute the exact displayed proposals. The picking worker
@@ -890,25 +904,68 @@ class ScreenPickerApp:
         except Exception as exc:
             self._error(exc)
 
-    def _next_frame(self):
+    def _finish_auto_frame(self):
+        self.auto_completed += 1
+        if self.reference is not None:
+            self.auto_history = (self.auto_history + [self.reference.copy()])[-20:]
+        if self.auto_remaining > 0:
+            self.auto_remaining -= 1
+        if self.auto_remaining:
+            self._next_frame()
+        else:
+            self.paused = False
+            self.hotkeys.enable_space_pause(False)
+            self._show_panel()
+            self.status.set(f"Auto finished: {self.auto_completed} micrograph(s) processed. Review the picks in cryoSPARC.")
+
+    def _next_frame(self, *, auto=True):
         geometry, target = self.geometry, self.target
-        wait, history = float(self.wait_seconds.get()), tuple(self.auto_history)
+        if geometry is None or target is None:
+            raise ValueError("Select the micrograph screen area first.")
+        wait = float(self.wait_seconds.get())
+        if not 1 <= wait <= 60:
+            raise ValueError("Choose a load timeout of 1–60 seconds.")
+        history = tuple(self.auto_history) if auto else ()
+        reference, picked = self.reference, set(self.picked_points)
+        spacing = int(self.spacing.get())
         self._hide_overlays()
         self._check_panel_clear(geometry)
-        def work(token):
-            self.desktop.focus_target(target)
-            token.wait_until_ready()
-            self.desktop.press_next("down")
-            token.sleep(wait)
-            first = self._capture_region(geometry)
-            token.sleep(.35)
-            second = self._capture_region(geometry)
-            if screen_changed_fraction(first, second) > .01:
-                raise RuntimeError("The next micrograph is still loading. Increase the wait time.")
-            if any(screen_changed_fraction(previous, second) < .02 for previous in history):
-                raise RuntimeError("The micrograph did not change or a recent image reappeared. Auto stopped.")
-            return second
-        self._submit("next frame", work)
+        # Down may advance before a cancelled worker returns. Retire the old
+        # contours now so re-enabling picking cannot draw them on a new image.
+        self.candidates, self.alternatives = [], []
+        self.transition = True
+        def begin():
+            self.transition = False
+            def work(token):
+                self.desktop.focus_target(target)
+                token.wait_until_ready()
+                def check_target():
+                    self.desktop.ensure_target(target)
+                    if self.desktop.window_under_roi(geometry) != target:
+                        raise RuntimeError("Another window covers the micrograph. Navigation stopped.")
+                check_target()
+                background = screen_background_guard((), geometry, spacing, picked)
+                if background is None:
+                    raise RuntimeError("Too little unchanged background to verify the next micrograph. Select a larger screen area.")
+                before = self._capture_region(geometry)
+                if reference is not None and screen_background_changed(reference, before, background) > .03:
+                    raise RuntimeError("The micrograph changed before navigation. Detect again.")
+                token.wait_until_ready()
+                self.desktop.press_next("down")
+                SCREEN_LOG.info("Sent one Down key for %s navigation", "auto" if auto else "semi-auto")
+                try:
+                    after = wait_for_next_micrograph(
+                        lambda: self._capture_region(geometry), before, token,
+                        unchanged_mask=background, history=history, timeout=wait,
+                        check_target=check_target)
+                except NoNewMicrographError as exc:
+                    # At the last image (or if Down was not handled), do not
+                    # detect or pick the old image again. Preserve actual picks.
+                    return {"rgb": before, "auto": auto, "advanced": False, "reason": str(exc)}
+                return {"rgb": after, "auto": auto, "advanced": True}
+            self._submit("next frame", work)
+        # Let the native input/annotation layers disappear before capturing.
+        self._schedule(90, begin)
 
     def _submit(self, kind, function):
         token = CancellationToken(self.runner.generation)
@@ -934,7 +991,15 @@ class ScreenPickerApp:
             self._show_panel()
             self.status.set(f"{value['count']} picks placed. Hold left mouse button to draw the next shape.")
         elif kind == "recognition":
-            same_scene = self.reference is not None and screen_changed_fraction(self.reference, value["rgb"]) < .02
+            same_scene = False
+            if self.reference is not None:
+                guard = screen_background_guard((), self.geometry, int(self.spacing.get()), self.picked_points)
+                # Late marker painting is not a new micrograph. If so much of
+                # the old image was picked that identity is uncertain, retain
+                # its actual picks until navigation/area selection verifies a
+                # new frame; guessing here could place duplicate picks.
+                same_scene = (guard is None or
+                              screen_background_changed(self.reference, value["rgb"], guard) < .02)
             if not same_scene:
                 self.picked_points.clear()
             self.rgb = value["rgb"]
@@ -944,10 +1009,12 @@ class ScreenPickerApp:
             self.alternative_index = 0
             self.candidates = self.alternatives[:1] if value["prompt"] else list(value["candidates"])
             if value["auto"]:
-                if not self.candidates:
-                    raise RuntimeError("No proposals found. Auto stopped for review.")
                 self.auto_history = (self.auto_history + [self.reference.copy()])[-20:]
-                self._start_model_picks(self.candidates, auto=True)
+                if self.candidates:
+                    self._start_model_picks(self.candidates, auto=True)
+                else:
+                    SCREEN_LOG.info("No contours on auto micrograph %s; continuing without picks", self.auto_completed + 1)
+                    self._finish_auto_frame()
             else:
                 self._present_masks()
                 if self.candidates:
@@ -971,22 +1038,23 @@ class ScreenPickerApp:
             self.candidates = [c for c in self.candidates if c.id not in value["ids"]]
             self.alternatives = []
             if value["auto"]:
-                self.auto_history = (self.auto_history + [self.reference.copy()])[-20:]
-                self.auto_remaining -= 1
-                if self.auto_remaining:
-                    self._next_frame()
-                else:
-                    self.paused = False
-                    self.hotkeys.enable_space_pause(False)
-                    self._show_panel()
-                    self.status.set("Auto finished. Review the picks in cryoSPARC.")
+                self._finish_auto_frame()
             else:
                 self._present_masks()
                 self.status.set(f"{value['count']} picks placed. Click another green region or detect again.")
         elif kind == "next frame":
+            if not value["advanced"]:
+                self.reference = self.rgb = value["rgb"]
+                self.candidates, self.alternatives = [], []
+                count = f" {self.auto_completed} micrograph(s) processed." if value["auto"] else ""
+                self.stop(message=f"No new micrograph appeared. Stopped; this may be the last image or Down was not handled.{count}")
+                return
             self.picked_points.clear()
-            self.reference = self.rgb = value
-            self._start_detection(auto=True, expected=value)
+            self.candidates, self.alternatives = [], []
+            # Retire old queued progress before recognition of this image.
+            self.frame_id += 1
+            self.reference = self.rgb = value["rgb"]
+            self._start_detection(auto=value["auto"], expected=value["rgb"])
 
     def pause(self):
         if not self.runner.busy and not self.transition and not self.auto_remaining:
@@ -1133,7 +1201,7 @@ class ScreenPickerApp:
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
-                                                                        ("Click delay (seconds)", self.click_delay, .02, 2, .01)), 5):
+                                                                        ("Model click delay (seconds)", self.click_delay, .02, 2, .01)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
             def close_settings():

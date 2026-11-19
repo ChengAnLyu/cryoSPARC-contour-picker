@@ -11,8 +11,10 @@ import numpy as np
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskResult
 from manual_sampling import legacy_contour_points, mask_contour_points
 from recognition import make_candidate
+from micrograph_navigation import NoNewMicrographError, MicrographLoadTimeoutError
 from screen_app import (ScreenPickerApp, screen_changed_fraction, screen_mask_at, screen_model_points, screen_model_batches,
-                        screen_background_guard, screen_background_changed, screen_region_overlaps_panel)
+                        screen_background_guard, screen_background_changed, screen_region_overlaps_panel,
+                        DEFAULT_MODEL_CLICK_DELAY)
 
 
 class Variable:
@@ -182,9 +184,9 @@ def app_state(mode="manual"):
     app.disabled, app.spacing = Variable(False), Variable(13)
     app.status, app.region_label = Variable(""), Variable("")
     app.checkpoint, app.model_type = Variable("supplied-model.pth"), Variable("vit_b")
-    app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(.10)
+    app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(DEFAULT_MODEL_CLICK_DELAY)
     app.automatic_profile = Variable("capsid")
-    app.frames, app.wait_seconds = Variable(1), Variable(5.0)
+    app.frames, app.wait_seconds = Variable(0), Variable(10.0)
     app.closed = app.transition = app.paused = False
     app._fit_after = None
     app._poll_after = app._shutdown_after = None
@@ -202,6 +204,7 @@ def app_state(mode="manual"):
     app.reference = app.rgb.copy() if app.rgb is not None else None
     app.candidates, app.alternatives, app.auto_history = [], [], []
     app.alternative_index, app.frame_id, app.auto_remaining = 0, 1, 0
+    app.auto_completed = 0
     app.picked_points = set()
     app.recognizer = app.recognizer_config = None
     app.input_kind = app.input_start = None
@@ -1023,6 +1026,7 @@ class ScreenControllerTests(unittest.TestCase):
 
     def test_auto_is_explicit_finite_and_arms_space_only_for_the_run(self):
         app = app_state("auto")
+        app.frames.set(1)
         app._start_detection = Mock()
         self.assertEqual(app.auto_remaining, 0)
         app.start_auto()
@@ -1033,6 +1037,182 @@ class ScreenControllerTests(unittest.TestCase):
         self.assertEqual(app.auto_remaining, 0)
         app.hotkeys.enable_space_pause.assert_called_with(False)
         self.assertEqual(app.desktop.keys, [])
+
+    def test_continuous_auto_keeps_advancing_until_explicitly_stopped(self):
+        app = app_state("auto")
+        app._start_detection, app._next_frame = Mock(), Mock()
+        app.frames.set(0)
+        app.start_auto()
+        self.assertEqual(app.auto_remaining, -1)
+        for _ in range(3):
+            app._result("model picks", {"count": 1, "ids": set(),
+                                       "reference": app.reference, "auto": True})
+        self.assertEqual(app.auto_remaining, -1)
+        self.assertEqual(app.auto_completed, 3)
+        self.assertEqual(app._next_frame.call_count, 3)
+        app.stop()
+        self.assertEqual(app.auto_remaining, 0)
+        app.hotkeys.enable_space_pause.assert_called_with(False)
+
+    def test_empty_last_micrograph_completes_limit_without_extra_down(self):
+        app = app_state("auto")
+        app.auto_remaining = 1
+        app._next_frame = Mock()
+        app._result("recognition", {"rgb": app.rgb, "candidates": [], "auto": True, "prompt": False})
+        app._next_frame.assert_not_called()
+        self.assertEqual(app.auto_completed, 1)
+        self.assertEqual(app.auto_remaining, 0)
+        self.assertEqual(app.desktop.keys, [])
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertIn("Auto finished", app.status.get())
+
+    def test_invalid_auto_limits_never_start_detection_or_navigation(self):
+        for limit, wait in ((-1, 10), (1001, 10), (0, .5), (0, float("nan")), (0, 61)):
+            with self.subTest(limit=limit, wait=wait):
+                app = app_state("auto")
+                app.frames.set(limit)
+                app.wait_seconds.set(wait)
+                app._start_detection = Mock()
+                app.start_auto()
+                app._start_detection.assert_not_called()
+                self.assertFalse(app.auto_remaining)
+                self.assertEqual(app.desktop.keys, [])
+
+    def test_semi_next_moves_once_then_detects_without_picking(self):
+        app = app_state("semi-auto")
+        candidate = make_candidate(np.ones((70, 80), bool))
+        app.candidates = [candidate]
+        app.input_surface = Surface()
+        app.input_kind = "masks"
+        app.input_surface.show()
+        app.overlay.show()
+        app.picked_points = {(10, 15)}
+        old_frame = app.frame_id
+        new = np.full_like(app.reference, 150)
+        app.next_micrograph()
+        self.assertEqual(app.candidates, [], "Navigation must retire old contours immediately")
+        self.assertIsNone(app.input_surface)
+        self.assertFalse(app.overlay.visible)
+        self.assertEqual(app.runner.jobs, [], "Allow native layers to hide before capturing")
+        app.root.run_next()
+        with patch("screen_app.wait_for_next_micrograph", return_value=new) as waiter:
+            result = app.runner.finish()
+        self.assertEqual(app.desktop.keys, ["down"])
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertEqual(waiter.call_args.kwargs["timeout"], 10.0)
+        guard = waiter.call_args.kwargs["unchanged_mask"]
+        self.assertFalse(guard[15, 10])
+        self.assertTrue(guard[60, 70])
+        self.assertEqual(waiter.call_args.kwargs["history"], ())
+        app._start_detection = Mock()
+        app._result("next frame", result)
+        self.assertFalse(app._start_detection.call_args.kwargs["auto"])
+        np.testing.assert_array_equal(app._start_detection.call_args.kwargs["expected"], new)
+        self.assertEqual(app.picked_points, set())
+        self.assertGreater(app.frame_id, old_frame)
+        self.assertFalse(app.root.hidden)
+
+    def test_explicit_semi_navigation_still_works_with_picking_disabled(self):
+        app = app_state("semi-auto")
+        app.disabled.set(True)
+        app.next_micrograph()
+        app.root.run_next()
+        with patch("screen_app.wait_for_next_micrograph", return_value=np.full_like(app.reference, 150)):
+            result = app.runner.finish()
+        app._start_detection = Mock()
+        app._result("next frame", result)
+        self.assertEqual(app.desktop.keys, ["down"])
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertTrue(app.disabled.get())
+        self.assertFalse(app._start_detection.call_args.kwargs["auto"])
+
+    def test_stop_before_navigation_callback_sends_no_down(self):
+        app = app_state("semi-auto")
+        app.next_micrograph()
+        app.stop()
+        self.assertFalse(app.root.callbacks)
+        self.assertFalse(app.runner.jobs)
+        self.assertEqual(app.desktop.keys, [])
+        self.assertEqual(app.candidates, [])
+
+    def test_stop_after_down_does_not_restore_old_contours(self):
+        app = app_state("semi-auto")
+        mask = np.zeros((70, 80), bool)
+        mask[10:30, 10:30] = True
+        app.candidates = [make_candidate(mask)]
+        app.next_micrograph()
+        app.root.run_next()
+        def interrupted(capture, previous, token, **kwargs):
+            app._hotkey("stop")
+            token.check_cancelled()
+        with patch("screen_app.wait_for_next_micrograph", side_effect=interrupted):
+            with self.assertRaises(CancelledOperation):
+                app.runner.finish()
+        app.poll()
+        app.disabled.set(False)
+        app.disabled_changed()
+        self.assertEqual(app.desktop.keys, ["down"])
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertFalse(app.candidates)
+        self.assertFalse(app.overlay.visible)
+        self.assertIsNone(app.input_surface)
+
+    def test_navigation_focus_or_occlusion_failure_prevents_down(self):
+        for failure in ("focus", "occluded"):
+            with self.subTest(failure=failure):
+                app = app_state("semi-auto")
+                if failure == "focus":
+                    app.desktop.focus_target = Mock(side_effect=RuntimeError("focus lost"))
+                else:
+                    app.desktop.window_under_roi = Mock(return_value=77)
+                app.next_micrograph()
+                app.root.run_next()
+                with self.assertRaises(RuntimeError):
+                    app.runner.finish()
+                self.assertEqual(app.desktop.keys, [])
+                self.assertEqual(app.desktop.clicks, [])
+
+    def test_load_timeout_does_not_retry_down_or_start_recognition(self):
+        app = app_state("semi-auto")
+        app.next_micrograph()
+        app.root.run_next()
+        token = app.active_token
+        app._start_detection = Mock()
+        with patch("screen_app.wait_for_next_micrograph",
+                   side_effect=MicrographLoadTimeoutError("Still loading")):
+            with self.assertRaises(MicrographLoadTimeoutError) as error:
+                app.runner.finish()
+        app.runner.results = [TaskResult(token, error=error.exception)]
+        app.poll()
+        app._start_detection.assert_not_called()
+        self.assertEqual(app.desktop.keys, ["down"])
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertTrue(app.disabled.get())
+
+    def test_redetection_with_delayed_pick_markers_keeps_known_picks(self):
+        app = app_state("semi-auto")
+        app.picked_points = {(20, 20)}
+        frame = app.reference.copy()
+        frame[12:29, 12:29] = 250
+        self.assertGreater(screen_changed_fraction(app.reference, frame), .02)
+        app._present_masks = Mock()
+        app._result("recognition", {"rgb": frame, "candidates": [], "auto": False, "prompt": False})
+        self.assertEqual(app.picked_points, {(20, 20)})
+
+    def test_old_pick_progress_cannot_repopulate_new_micrograph(self):
+        app = app_state("semi-auto")
+        previous_frame = app.frame_id
+        app._start_detection = Mock()
+        app._result("next frame", {"rgb": np.full_like(app.rgb, 150), "auto": False, "advanced": True})
+        app.events.put(("picked", app.runner.generation, previous_frame, (10, 15), 1, 1, 1, 1))
+        app.poll()
+        self.assertEqual(app.picked_points, set())
+
+    def test_fast_model_default_does_not_change_manual_playback_delay(self):
+        app = app_state("semi-auto")
+        self.assertEqual(app._live_ready(), .03)
+        app.mode = "manual"
+        self.assertEqual(app._live_ready(), .10)
 
     def test_start_auto_reuses_exact_displayed_contours_without_redetecting(self):
         app = app_state("auto")
@@ -1137,21 +1317,34 @@ class ScreenControllerTests(unittest.TestCase):
                                      "prompt": False, "candidates": [make_candidate(mask)]})
         self.assertEqual(app.picked_points, set())
 
-    def test_no_proposals_stop_auto_before_navigation(self):
+    def test_no_proposals_advance_auto_without_sending_any_picks(self):
         app = app_state("auto")
         app.auto_remaining = 2
-        with self.assertRaisesRegex(RuntimeError, "No proposals"):
-            app._result("recognition", {"rgb": app.rgb, "candidates": [], "auto": True, "prompt": False})
+        app._next_frame = Mock()
+        app._result("recognition", {"rgb": app.rgb, "candidates": [], "auto": True, "prompt": False})
+        app._next_frame.assert_called_once_with()
+        self.assertEqual(app.auto_remaining, 1)
+        self.assertEqual(app.auto_completed, 1)
         self.assertEqual(app.desktop.keys, [])
         self.assertEqual(app.desktop.clicks, [])
 
-    def test_next_frame_rejects_unchanged_image(self):
+    def test_next_frame_stops_on_unchanged_image_without_clearing_actual_picks(self):
         app = app_state("auto")
         app.auto_remaining = 1
         app.auto_history = [app.reference.copy()]
+        app.picked_points = {(10, 15)}
         app._next_frame()
-        with self.assertRaisesRegex(RuntimeError, "did not change"):
-            app.runner.finish()
+        app.root.run_next()
+        with patch("screen_app.wait_for_next_micrograph", side_effect=NoNewMicrographError("did not change")):
+            result = app.runner.finish()
+        app._start_detection = Mock()
+        app._result("next frame", result)
+        app._start_detection.assert_not_called()
+        self.assertEqual(app.auto_remaining, 0)
+        self.assertTrue(app.disabled.get())
+        self.assertEqual(app.picked_points, {(10, 15)})
+        self.assertIsNotNone(app.reference)
+        self.assertIn("No new micrograph", app.status.get())
         self.assertEqual(app.desktop.keys, ["down"])
         self.assertEqual(app.desktop.clicks, [])
 
@@ -1171,7 +1364,7 @@ class ScreenControllerTests(unittest.TestCase):
         expected = np.zeros_like(app.rgb)
         app._start_detection(auto=True, expected=expected)
         app.root.run_next()
-        with self.assertRaisesRegex(RuntimeError, "between automatic frames"):
+        with self.assertRaisesRegex(RuntimeError, "after navigation"):
             app.runner.finish()
         app._get_recognizer.assert_not_called()
 

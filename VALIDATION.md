@@ -112,3 +112,71 @@ shutdown and the requested icon; the control layout is unchanged.
 
 ---
 
+## Version 2.4.0 navigation and picking speed
+
+This section adds evidence for 2.4.0; the earlier recognition diagnostics and
+version-specific test counts above are historical results, not the current
+release's test count. Version 2.4.0 does not introduce a new checkpoint, retrain
+the recognition model, or claim improved biological recognition accuracy.
+
+### Navigation behavior and release checks
+
+The screen panel replaces **Next alternative** with **Next micrograph** in
+semi-auto mode. It sends one Down key to the verified cryoSPARC window, waits
+for a different stable image, and detects new contours without picking them.
+This navigation/detection path is available while Disable Picking is checked.
+
+Auto mode completes every contour, advances with Down, detects, and repeats.
+**Limit (0=all)** defaults to 0 for continuous operation. A positive limit from
+1 to 1000 includes the current image and images with no detected contours.
+Empty images are counted and skipped. **Load (s)** defaults to 10 seconds and
+is a maximum timeout; the app continues when a changed image becomes stable.
+An unchanged/end-of-list view, a recently repeated image, a loading timeout,
+lost target focus, or an unexpected scene change stops the cycle. Navigation
+does not repeatedly send Down while waiting for a response.
+
+The source regression and native Windows release gates exercise navigation
+with synthetic image sequences and in-memory input, including continuous and
+finite runs, empty images, semi-auto navigation while picking is disabled,
+and cancellation/focus failures. The native fixtures use the actual controller,
+Tk widgets and worker, but send no operating-system clicks or keys. Source,
+frozen and installed test reports from the release workflow determine whether
+the build passes these gates. They do not certify real cryoSPARC browser input
+delivery or its loading behavior on another workstation.
+
+### Faster model-mode pacing
+
+Semi-auto/auto now default to a **0.03-second delay between clicks**, adjusted
+through Advanced in the existing 0.02–2 second range. Manual mode retains its
+0.10-second cadence. The playback engine and desktop click adapter are
+unchanged: PyAutoGUI's additional global pause remains disabled, its fail-safe
+remains enabled, and cancellation, foreground and point-obscuration checks
+remain in the per-click path. Targeted regressions exercise focus loss after
+the first fast pick, backend fail-safe propagation, and cancellation before the
+remaining native calls.
+
+A diagnostic used the actual `play_clicks` and `DesktopAdapter` implementations
+with in-memory native/input facades on Linux with Python 3.12.14. Each trial
+contained 200 unique picks; two trials were run at each delay. Both rates used
+the same explicit simulated costs: 2 milliseconds per click adapter call and
+20 milliseconds per scene check, scheduled every 0.75 seconds. No desktop
+input was sent.
+
+| Measure | Previous 0.10-second delay | New 0.03-second delay |
+| --- | ---: | ---: |
+| Median synthetic playback time | 20.885 s | 6.597 s |
+| Inter-pick waiting budget, 199 waits | 19.90 s | 5.97 s |
+| Point-obscuration checks per trial | 200 | 200 |
+| Foreground checks per trial | 401 | 401 |
+
+The synthetic playback measurement was 3.166 times faster, with a 68.41%
+reduction in elapsed time. The configured inter-pick waiting budget falls by
+70%. Every trial delivered the expected 200 in-memory picks; the minimum
+observed spacing at the new setting was 32.16 milliseconds.
+
+**These are synthetic playback measurements, not end-to-end cryoSPARC
+throughput.** They exclude actual Windows/browser input delivery, screenshot
+capture, model inference, image loading and UI handoff. The simulated costs
+are controlled assumptions rather than measurements of those operations.
+Browser response and workstation timing determine the practical contour time.
+
