@@ -37,7 +37,7 @@ from execution import (
 )
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
 from screen_app import ScreenPickerApp
-from screen_overlay import verify_screen_overlay
+from screen_overlay import control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
 APP_VERSION = "2.1.1"
@@ -162,6 +162,38 @@ def _smoke_torchvision() -> dict[str, Any]:
             "native_nms": True}
 
 
+def _smoke_layout_diagnostics(window, widget=None, ancestor=None) -> str:
+    """Include native mapping and geometry in build-host layout failures."""
+    def describe(control):
+        return {"path": str(control),
+                "actual": [int(control.winfo_width()), int(control.winfo_height())],
+                "requested": [int(control.winfo_reqwidth()), int(control.winfo_reqheight())],
+                "screen_xy": [int(control.winfo_rootx()), int(control.winfo_rooty())],
+                "mapped": bool(control.winfo_ismapped()),
+                "viewable": bool(control.winfo_viewable()),
+                "geometry": str(control.winfo_geometry()),
+                "manager": str(control.winfo_manager())}
+    details = {"state": str(window.state()), "panel": describe(window)}
+    if widget is not None:
+        details["widget"] = describe(widget)
+    if ancestor is not None:
+        details["clipping_ancestor"] = describe(ancestor)
+    return json.dumps(details, sort_keys=True)
+
+
+def _smoke_settle_panel(picker) -> None:
+    """Dispatch native mapping events, fit content, then dispatch the resize.
+
+    Idle-only processing can leave Windows child HWNDs unmapped after the root
+    is shown. Two fixed update calls service the native queue without a polling
+    loop, delayed retry, or any visibility/state repair that could hide a bug.
+    The smoke picker has no input listeners and remains disabled throughout.
+    """
+    picker.root.update()
+    picker.fit_panel()
+    picker.root.update()
+
+
 def _smoke_widget_layout(window, widget, description: str) -> dict[str, Any]:
     """Reject a managed control that is hidden, shrunk, or ancestor-clipped.
 
@@ -172,10 +204,12 @@ def _smoke_widget_layout(window, widget, description: str) -> dict[str, Any]:
     size = [int(widget.winfo_width()), int(widget.winfo_height())]
     requested = [int(widget.winfo_reqwidth()), int(widget.winfo_reqheight())]
     if not widget.winfo_viewable():
-        raise RuntimeError(f"{description} is not visible in the floating panel.")
+        raise RuntimeError(f"{description} is not visible in the floating panel; "
+                           f"layout={_smoke_layout_diagnostics(window, widget)}")
     if min(size) <= 0 or any(actual < needed for actual, needed in zip(size, requested)):
         raise RuntimeError(
-            f"{description} is clipped below its requested size: actual {size}, requested {requested}.")
+            f"{description} is clipped below its requested size: actual {size}, requested {requested}; "
+            f"layout={_smoke_layout_diagnostics(window, widget)}")
     left, top = int(widget.winfo_rootx()), int(widget.winfo_rooty())
     right, bottom = left + size[0], top + size[1]
     parent = widget.master
@@ -184,12 +218,14 @@ def _smoke_widget_layout(window, widget, description: str) -> dict[str, Any]:
         parent_right = parent_left + int(parent.winfo_width())
         parent_bottom = parent_top + int(parent.winfo_height())
         if (left < parent_left or top < parent_top or right > parent_right or bottom > parent_bottom):
-            raise RuntimeError(f"{description} extends outside its parent and is not fully usable.")
+            raise RuntimeError(f"{description} extends outside its parent and is not fully usable; "
+                               f"layout={_smoke_layout_diagnostics(window, widget, parent)}")
         if parent is window:
             break
         parent = parent.master
     if parent is not window:
-        raise RuntimeError(f"{description} is not attached to the floating panel.")
+        raise RuntimeError(f"{description} is not attached to the floating panel; "
+                           f"layout={_smoke_layout_diagnostics(window, widget)}")
     return {"actual": size, "requested": requested,
             "panel_rect": [left-int(window.winfo_rootx()), top-int(window.winfo_rooty()), *size],
             "viewable": True, "full_requested_size": True}
@@ -211,12 +247,14 @@ def _smoke_terminate_text(window, button) -> dict[str, Any]:
     text_height = line_height * len(lines)
     if text_width > usable[0] or text_height > usable[1]:
         raise RuntimeError(
-            f"Terminate's text or font baseline is clipped: usable {usable}, text {[text_width, text_height]}.")
+            f"Terminate's text or font baseline is clipped: usable {usable}, text {[text_width, text_height]}; "
+            f"layout={_smoke_layout_diagnostics(window, button)}")
     # The actual button retains its default centered anchor. This derived
     # baseline records the complete font line that must fit the usable area.
     baseline = border + pad_y + (usable[1]-text_height)//2 + ascent
     if baseline + (len(lines)-1)*line_height + descent > int(button.winfo_height())-border-pad_y:
-        raise RuntimeError("Terminate's text descender falls outside its usable button area.")
+        raise RuntimeError("Terminate's text descender falls outside its usable button area; "
+                           f"layout={_smoke_layout_diagnostics(window, button)}")
     return {"text_size": [text_width, text_height], "usable_text_size": usable,
             "font_metrics": {"ascent": ascent, "descent": descent, "linespace": line_height},
             "centered_first_baseline_from_top": baseline, "full_font_line_fits": True}
@@ -224,12 +262,13 @@ def _smoke_terminate_text(window, button) -> dict[str, Any]:
 
 def _smoke_panel_layout(picker, mode: str, status_case: str) -> dict[str, Any]:
     window = picker.root
-    picker.fit_panel()
-    window.update_idletasks()
+    _smoke_settle_panel(picker)
     if window.state() != "normal" or not window.winfo_viewable():
-        raise RuntimeError(f"The {mode} floating control panel is not visible.")
+        raise RuntimeError(f"The {mode} floating control panel is not visible; "
+                           f"layout={_smoke_layout_diagnostics(window)}")
     if not window.tk.getboolean(window.attributes("-topmost")):
-        raise RuntimeError("The floating control panel is not kept above the target application.")
+        raise RuntimeError("The floating control panel is not kept above the target application; "
+                           f"layout={_smoke_layout_diagnostics(window)}")
     controls = []
 
     def inspect(parent):
@@ -253,7 +292,17 @@ def _smoke_panel_layout(picker, mode: str, status_case: str) -> dict[str, Any]:
             "terminate": terminate, "status": status, "viewable": True, "topmost": True}
 
 
-def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
+def _smoke_panel_screenshot(window, destination: Path) -> dict[str, Any]:
+    """Capture only an explicitly requested synthetic build-host panel."""
+    image_grab = importlib.import_module("PIL.ImageGrab")
+    left, top, width, height = control_panel_bounds(window)
+    bbox = (left, top, left + width, top + height)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    image_grab.grab(bbox=bbox, include_layered_windows=True, all_screens=True).save(destination)
+    return {"path": str(destination), "native_outer_bbox": list(bbox)}
+
+
+def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None) -> dict[str, Any]:
     # These are native Windows widgets at simulated Tk font/layout scales. The
     # Windows monitor's DPI setting is never changed. Each fresh interpreter is
     # scaled before widgets/fonts exist, because changing Tk scaling afterwards
@@ -284,27 +333,29 @@ def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
                     or picker.overlay is not None):
                 raise RuntimeError("The compact screen application did not start in passive manual mode.")
             window.state("normal")
-            window.update_idletasks()
             layouts = {}
             for mode in ("manual", "semi-auto", "auto"):
                 if picker.mode != mode:
                     picker.set_mode(mode)
-                window.update_idletasks()
                 initial_status = picker.status.get()
                 normal = _smoke_panel_layout(picker, mode, "default")
+                if screenshot_dir is not None:
+                    normal["screenshot"] = _smoke_panel_screenshot(
+                        window, Path(screenshot_dir) / f"panel-{percent}-{mode}.png")
                 picker.status.set(long_status)
                 multiline = _smoke_panel_layout(picker, mode, "multiline_status")
                 picker._hide_overlays()
-                window.update_idletasks()
+                _smoke_settle_panel(picker)
                 if (window.state() != "normal" or not window.winfo_viewable()
                         or not window.tk.getboolean(window.attributes("-topmost"))):
-                    raise RuntimeError(f"The {mode} control panel disappeared while hiding the screen overlays.")
+                    raise RuntimeError(f"The {mode} control panel disappeared while hiding the screen overlays; "
+                                       f"layout={_smoke_layout_diagnostics(window)}")
                 layouts[mode] = {"default": normal, "multiline_status": multiline,
                                  "panel_persists_when_overlays_hidden": True}
                 if percent == 100:
                     panel_layouts[mode] = normal["panel_size"]
                 picker.status.set(initial_status)
-                picker.fit_panel()
+                _smoke_settle_panel(picker)
             tk_version = str(window.tk.call("info", "patchlevel"))
             scale_checks.append({"scale_percent": percent, "requested_dpi": requested_dpi,
                                  "native_tk_scaling_before_test": original_scaling,

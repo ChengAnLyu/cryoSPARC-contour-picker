@@ -615,8 +615,85 @@ class ManualMouseObserver:
             listener.stop()
 
 
+def _verify_main_control_panel(root, api) -> dict:
+    """Verify the real Tk root against its own full-screen overlay Toplevels.
+
+    A sibling synthetic panel does not establish the owner/root z-order case.
+    This phase uses each surface's default control_panel=root and checks the
+    real Terminate button and caption without clicking or activating anything.
+    """
+    root.update()
+    handle = root.winfo_id()
+    if not api.visible(handle) or api.minimized(handle):
+        raise OverlayError("The main control panel must remain visible for native verification.")
+    width, height = api.primary_size()
+    geometry = CaptureGeometry(0, 0, width, height)
+    outer = control_panel_bounds(root, style_api=api)
+    client_x, client_y = root.winfo_rootx(), root.winfo_rooty()
+    if client_y <= outer[1]:
+        raise OverlayError("The main control panel has no native caption to verify.")
+    points = [(client_x + root.winfo_width() // 2,
+               client_y + root.winfo_height() // 2),
+              (client_x + root.winfo_width() // 3, (outer[1] + client_y) // 2)]
+    pending = list(root.winfo_children())
+    terminate = None
+    while pending:
+        widget = pending.pop()
+        if (widget.winfo_class() in ("Button", "TButton")
+                and str(widget.cget("text")).strip().lower() == "terminate"
+                and widget.winfo_viewable()):
+            terminate = widget
+            break
+        pending.extend(widget.winfo_children())
+    if terminate is None:
+        raise OverlayError("The main control panel has no visible Terminate button.")
+    points.append((terminate.winfo_rootx() + terminate.winfo_width() // 2,
+                   terminate.winfo_rooty() + terminate.winfo_height() // 2))
+    if not all(geometry.contains(*point) for point in points):
+        raise OverlayError("The main panel's test points lie outside the primary screen.")
+    main_handle = api.root_handle(handle)
+    foreground = api.foreground()
+    events = []
+    record_input = lambda x, y: events.append((x, y))
+    # Deliberately use the normal constructor defaults here: the real root is
+    # the panel, rather than a sibling Toplevel supplied through control_panel.
+    overlay = ScreenOverlay(root, style_api=api)
+    input_surface = InputSurface(root, geometry, record_input, record_input,
+                                 record_input, style_api=api)
+    try:
+        overlay.draw_box((outer[0], outer[1], outer[0] + outer[2], outer[1] + outer[3]))
+        input_surface.show()
+        overlay.show()
+        root.update()
+        if not api.visible(handle) or api.minimized(handle):
+            raise OverlayError("The main control panel disappeared beneath its own screen surfaces.")
+        if any(not api.is_above(handle, surface.window.winfo_id())
+               for surface in (input_surface, overlay)):
+            raise OverlayError("A screen surface covers the main Tk control panel.")
+        if any(api.window_at(*point) != main_handle for point in points):
+            raise OverlayError("A screen surface intercepts the main panel's button, client, or caption.")
+        if api.foreground() != foreground:
+            raise OverlayError("Showing the main panel's screen surfaces changed foreground focus.")
+        input_surface.hide()
+        overlay.hide()
+        root.update()
+        if (not api.visible(handle) or api.minimized(handle)
+                or any(api.window_at(*point) != main_handle for point in points)):
+            raise OverlayError("Hiding screen surfaces made the main control panel inaccessible.")
+        if events:
+            raise OverlayError("Unexpected input arrived during main-panel verification.")
+        return {"main_root_visible_during_overlay": True,
+                "main_root_above_surfaces": True,
+                "main_root_button_and_caption_hit_testable": True,
+                "main_root_visible_after_hide": True,
+                "main_root_stacking_does_not_activate": True}
+    finally:
+        input_surface.close()
+        overlay.close()
+
+
 def verify_screen_overlay(root) -> dict:
-    """Exercise native Windows hit testing using only our synthetic windows.
+    """Exercise native Windows hit testing on synthetic windows and the real panel.
 
     No mouse/keyboard events, screenshots, or global listeners are generated.
     The controller should call this only from its deliberate Windows smoke test.
@@ -746,13 +823,21 @@ def verify_screen_overlay(root) -> dict:
             raise OverlayError("Hiding the screen surfaces did not restore the target window.")
         if events:
             raise OverlayError("Unexpected input arrived during the no-input overlay smoke test.")
+        # Remove only our synthetic windows before testing the real main root.
+        # Its own Toplevels may have different native owner/root relationships
+        # from the sibling synthetic panel used in the first phase.
+        panel.withdraw()
+        target.withdraw()
+        root.update()
+        main_panel_checks = _verify_main_control_panel(root, api)
         return {"annotation_hit_transparent": True, "roi_input_intercepts": True,
                 "outside_roi_passes": True, "hidden_restores_target": True,
                 "panel_visible_during_overlay": True, "panel_above_surfaces": True,
                 "panel_button_and_caption_hit_testable": True,
                 "panel_move_supported": True, "panel_visible_after_hide": True,
                 "stacking_does_not_activate": True,
-                "desktop_events_sent": 0, "global_listeners_started": 0}
+                "desktop_events_sent": 0, "global_listeners_started": 0,
+                **main_panel_checks}
     finally:
         if input_surface is not None:
             input_surface.close()

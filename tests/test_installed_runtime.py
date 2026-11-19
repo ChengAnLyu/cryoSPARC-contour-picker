@@ -142,12 +142,62 @@ def layout_widget(parent=None, *, x=0, y=0, width=100, height=30,
     widget.winfo_rootx.return_value = x
     widget.winfo_rooty.return_value = y
     widget.winfo_viewable.return_value = visible
+    widget.winfo_ismapped.return_value = visible
+    widget.winfo_geometry.return_value = f"{width}x{height}{x:+d}{y:+d}"
     widget.winfo_manager.return_value = manager
     widget.winfo_class.return_value = "Button"
     return widget
 
 
 class PanelLayoutValidationTests(unittest.TestCase):
+    def test_native_map_and_resize_events_are_dispatched_before_measurements(self):
+        root = layout_widget(width=500, height=500)
+        root.state.return_value = "normal"
+        root.attributes.return_value = True
+        root.tk.getboolean.side_effect = bool
+        footer = layout_widget(root, x=0, y=440, width=500, height=60, visible=False)
+        button = layout_widget(footer, x=200, y=450, width=100, height=1,
+                               requested=(100, 30), visible=False)
+        status = layout_widget(root, x=10, y=300, width=480, height=80)
+        calls = []
+        def dispatch():
+            calls.append("update")
+            for widget in (footer, button):
+                widget.winfo_viewable.return_value = True
+                widget.winfo_ismapped.return_value = True
+            if "fit" in calls:
+                button.winfo_height.return_value = 30
+        root.update.side_effect = dispatch
+        picker = SimpleNamespace(root=root, fit_panel=Mock(side_effect=lambda: calls.append("fit")),
+                                 terminate_button=button, status_label=status)
+        # Idle updates do not model the pending native map/resize messages.
+        root.update_idletasks()
+        self.assertFalse(footer.winfo_viewable())
+        with patch.object(app, "_smoke_terminate_text", return_value={}):
+            result = app._smoke_panel_layout(picker, "manual", "default")
+        self.assertEqual(calls, ["update", "fit", "update"])
+        self.assertTrue(result["all_managed_controls_fit"])
+        root.withdraw.assert_not_called()
+        root.deiconify.assert_not_called()
+        root.lift.assert_not_called()
+        self.assertTrue(all(not call.args for call in root.state.call_args_list))
+
+    def test_mapping_failure_includes_actionable_native_geometry(self):
+        root = layout_widget(x=30, y=40, width=420, height=320)
+        root.state.return_value = "normal"
+        footer = layout_widget(root, x=30, y=331, width=420, height=1,
+                               requested=(420, 49), visible=False)
+        with self.assertRaisesRegex(RuntimeError, "not visible") as error:
+            app._smoke_widget_layout(root, footer, "manual/default Frame")
+        details = json.loads(str(error.exception).split("layout=", 1)[1])
+        self.assertEqual(details["state"], "normal")
+        self.assertEqual(details["panel"]["actual"], [420, 320])
+        self.assertEqual(details["widget"]["actual"], [420, 1])
+        self.assertEqual(details["widget"]["requested"], [420, 49])
+        self.assertFalse(details["widget"]["mapped"])
+        self.assertFalse(details["widget"]["viewable"])
+        self.assertEqual(details["widget"]["geometry"], "420x1+30+331")
+
     def test_shortened_terminate_fails_even_when_bottom_edge_fits_window(self):
         root = layout_widget(width=420, height=320)
         footer = layout_widget(root, x=0, y=291, width=420, height=29)
@@ -232,6 +282,20 @@ class PanelLayoutValidationTests(unittest.TestCase):
 
 
 class WindowsScaleCoverageTests(unittest.TestCase):
+    def test_explicit_screenshot_captures_complete_native_frame_bounds(self):
+        window, image_grab = Mock(), Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ui" / "panel-125-manual.png"
+            with patch.object(app.importlib, "import_module", return_value=image_grab) as imports, \
+                 patch.object(app, "control_panel_bounds", return_value=(-200, 30, 525, 440)):
+                result = app._smoke_panel_screenshot(window, path)
+            imports.assert_called_once_with("PIL.ImageGrab")
+            image_grab.grab.assert_called_once_with(
+                bbox=(-200, 30, 325, 470), include_layered_windows=True, all_screens=True)
+            image_grab.grab.return_value.save.assert_called_once_with(path)
+            self.assertTrue(path.parent.is_dir())
+            self.assertEqual(result["native_outer_bbox"], [-200, 30, 325, 470])
+
     def test_native_smoke_constructs_each_scale_before_widgets_and_checks_every_mode(self):
         windows, pickers, constructions, measured = [], [], [], []
         original_scaling = 1.5

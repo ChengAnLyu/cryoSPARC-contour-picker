@@ -11,6 +11,7 @@ from execution import CaptureGeometry
 from screen_overlay import (INPUT_ALPHA, TRANSPARENT_COLOR, TRANSPARENT_RGB,
                             InputSurface, ManualMouseObserver, OverlayError,
                             ScreenOverlay, _OverlayWindowsAPI, _mask_image,
+                            _verify_main_control_panel,
                             control_panel_bounds, keep_control_panel_above)
 
 
@@ -352,6 +353,48 @@ class NativeStyleTests(unittest.TestCase):
         api.raise_without_activation(15)
         self.assertEqual(native.position[:2], (handle, -1))
         self.assertTrue(native.position[-1] & 0x0010)
+
+
+class MainPanelVerifierTests(unittest.TestCase):
+    def setUp(self):
+        button = SimpleNamespace(winfo_class=lambda: "Button", cget=lambda key: "terminate",
+                                 winfo_viewable=lambda: True, winfo_rootx=lambda: 130,
+                                 winfo_rooty=lambda: 260, winfo_width=lambda: 100,
+                                 winfo_height=lambda: 40)
+        self.root = SimpleNamespace(update=lambda: None, winfo_id=lambda: 50,
+                                    winfo_rootx=lambda: 108, winfo_rooty=lambda: 130,
+                                    winfo_width=lambda: 240, winfo_height=lambda: 200,
+                                    winfo_children=lambda: [button])
+        self.api = FakeStyles()
+        self.api.panel_rectangle = (100, 100, 256, 238)
+        self.api.root_handle = lambda handle: handle
+        self.api.foreground = lambda: 999  # The test must not activate the panel.
+        self.api.is_above = lambda first, second: first == 50
+        self.api.window_at = lambda x, y: 50
+
+    def test_main_root_check_uses_fullscreen_defaults_and_keeps_panel_accessible(self):
+        with patch("screen_overlay.platform.system", return_value="Windows"), \
+             patch("screen_overlay.ScreenOverlay") as overlay, \
+             patch("screen_overlay.InputSurface") as input_surface:
+            result = _verify_main_control_panel(self.root, self.api)
+            overlay.assert_called_once_with(self.root, style_api=self.api)
+            self.assertEqual(input_surface.call_args.args[:2],
+                             (self.root, CaptureGeometry(0, 0, 800, 600)))
+            self.assertNotIn("control_panel", input_surface.call_args.kwargs)
+            self.assertTrue(result["main_root_above_surfaces"])
+            self.assertTrue(result["main_root_button_and_caption_hit_testable"])
+            input_surface.return_value.close.assert_called_once()
+            overlay.return_value.close.assert_called_once()
+
+    def test_main_root_check_rejects_owned_popup_ordering_and_cleans_up(self):
+        self.api.is_above = lambda first, second: False
+        with patch("screen_overlay.platform.system", return_value="Windows"), \
+             patch("screen_overlay.ScreenOverlay") as overlay, \
+             patch("screen_overlay.InputSurface") as input_surface:
+            with self.assertRaisesRegex(OverlayError, "covers the main Tk control panel"):
+                _verify_main_control_panel(self.root, self.api)
+            input_surface.return_value.close.assert_called_once()
+            overlay.return_value.close.assert_called_once()
 
 
 class FakeMouseListener:

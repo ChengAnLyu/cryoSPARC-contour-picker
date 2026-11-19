@@ -119,7 +119,7 @@ try {
     Invoke-Checked $VenvPython @("build_standalone.py")
     Invoke-Checked $VenvPython @("-m", "unittest", "discover", "-s", "tests", "-v")
     # Catch native overlay/focus/layout defects before bundling the large model.
-    Invoke-Checked $VenvPython @("-c", "from pathlib import Path; from app import setup_logging, _smoke_windows_runtime, write_json_report; result=_smoke_windows_runtime(setup_logging()); write_json_report(Path('artifacts/source-ui-smoke.json'), {'status':'ok', 'mode':'ui-smoke', 'details':result})")
+    Invoke-Checked $VenvPython @("-c", "from pathlib import Path; from app import setup_logging, _smoke_windows_runtime, write_json_report; result=_smoke_windows_runtime(setup_logging(), screenshot_dir=Path('artifacts/ui')); write_json_report(Path('artifacts/source-ui-smoke.json'), {'status':'ok', 'mode':'ui-smoke', 'details':result})")
 
     if ($Checkpoint) {
         $ModelFile = (Resolve-Path -LiteralPath $Checkpoint).Path

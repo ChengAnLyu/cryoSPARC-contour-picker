@@ -83,6 +83,7 @@ jobs:
           path: |
             artifacts/*.json
             artifacts/*.log
+            artifacts/ui/*.png
             build/pyinstaller/**/warn-*.txt
             build/diagnostics/*.log
           if-no-files-found: warn
