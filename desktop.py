@@ -168,7 +168,9 @@ class DesktopAdapter:
 
     ``backend`` and ``windows_api`` may be fake adapters in tests. The actual
     PyAutoGUI backend is configured with PAUSE=0 and FAILSAFE=True. ``click``
-    and ``press_next`` require a target established by ``focus_target``.
+    and ``press_next`` require a target established by ``focus_target`` or
+    ``bind_target``. Manual mode can bind a window already activated by the
+    user's physical mouse gesture without moving focus itself.
     """
 
     def __init__(
@@ -324,10 +326,21 @@ class DesktopAdapter:
         self.ensure_target(handle)
         self._target = handle
 
+    def bind_target(self, handle) -> None:
+        """Use an already foreground target without focusing or restoring it.
+
+        A rejected new batch must not retain an older batch's implicit target.
+        ``click`` still validates foreground and the window under each point.
+        """
+        self._target = None
+        handle = _desktop_integer(handle, "Target window handle")
+        self.ensure_target(handle)
+        self._target = handle
+
     def ensure_target(self, handle=None) -> None:
         handle = self._target if handle is None else handle
         if handle is None:
-            raise DesktopError("No captured target window has been focused for playback.")
+            raise DesktopError("No picking target has been selected for playback.")
         handle = self._validate_handle(handle)
         api = self._get_api()
         if api.is_minimized(handle) or api.root_window(api.foreground()) != handle:

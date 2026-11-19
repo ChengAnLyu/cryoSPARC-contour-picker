@@ -5,6 +5,8 @@ physical, unscaled pixels on the primary monitor, whose origin is (0, 0).
 All ScreenOverlay/InputSurface methods must run on their creating GUI thread.
 The controller must hide *both* surfaces and allow a paint turn before taking
 a screenshot or replaying clicks. Hiding only the input surface is insufficient.
+The control panel remains visible above both surfaces. Model capture regions
+must exclude its native outer rectangle; hiding these surfaces never hides it.
 
 The annotation window is explicitly mouse-transparent and nonactivating.
 The separate input window has nonzero alpha and no transparent color: fully
@@ -78,12 +80,23 @@ class _OverlayWindowsAPI:
             self.user32.GetSystemMetrics.restype = ctypes.c_int
             self.user32.WindowFromPoint.argtypes = [wintypes.POINT]
             self.user32.WindowFromPoint.restype = wintypes.HWND
+            self.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            self.user32.GetWindowRect.restype = wintypes.BOOL
+            self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
+            self.user32.IsWindowVisible.restype = wintypes.BOOL
+            self.user32.IsIconic.argtypes = [wintypes.HWND]
+            self.user32.IsIconic.restype = wintypes.BOOL
+            self.user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+            self.user32.GetWindow.restype = wintypes.HWND
+            self.user32.GetForegroundWindow.argtypes = []
+            self.user32.GetForegroundWindow.restype = wintypes.HWND
             self.user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
                                                ctypes.c_int, ctypes.c_int,
                                                ctypes.c_int, ctypes.c_int,
                                                wintypes.UINT]
             self.user32.SetWindowPos.restype = wintypes.BOOL
         self._point_type = wintypes.POINT
+        self._rect_type = wintypes.RECT
 
     def primary_size(self) -> tuple[int, int]:
         return self.user32.GetSystemMetrics(0), self.user32.GetSystemMetrics(1)
@@ -96,6 +109,37 @@ class _OverlayWindowsAPI:
 
     def styles(self, child: int) -> int:
         return int(self._get_long(self.root_handle(child), self.GWL_EXSTYLE))
+
+    def visible(self, child: int) -> bool:
+        return bool(self.user32.IsWindowVisible(self.root_handle(child)))
+
+    def minimized(self, child: int) -> bool:
+        return bool(self.user32.IsIconic(self.root_handle(child)))
+
+    def foreground(self) -> int:
+        return int(self.user32.GetForegroundWindow() or 0)
+
+    def bounds(self, child: int) -> tuple[int, int, int, int]:
+        rectangle = self._rect_type()
+        if not self.user32.GetWindowRect(self.root_handle(child), ctypes.byref(rectangle)):
+            raise OverlayError("The control panel's screen bounds could not be read.")
+        width, height = rectangle.right - rectangle.left, rectangle.bottom - rectangle.top
+        if width <= 0 or height <= 0:
+            raise OverlayError("The control panel has invalid screen bounds.")
+        return rectangle.left, rectangle.top, width, height
+
+    def is_above(self, first: int, second: int) -> bool:
+        """Compare two top-level windows without changing focus or z-order."""
+        first, current = self.root_handle(first), self.root_handle(second)
+        visited = {current}
+        for _ in range(8192):
+            current = int(self.user32.GetWindow(current, 3) or 0)  # GW_HWNDPREV
+            if not current or current in visited:
+                return False
+            if current == first:
+                return True
+            visited.add(current)
+        return False
 
     def configure(self, child: int, *, click_through: bool) -> int:
         handle = self.root_handle(child)
@@ -123,10 +167,45 @@ class _OverlayWindowsAPI:
             raise OverlayError("Could not show the screen overlay without activating it.")
 
 
+def control_panel_bounds(root, *, style_api=None, platform_name=None) -> tuple[int, int, int, int]:
+    """Return the panel's screen (left, top, width, height) on the GUI thread.
+
+    Windows uses the complete native outer window, including caption and frame.
+    The Tk client bounds are available only as an offline non-Windows fallback;
+    live screen capture remains Windows-only.
+    """
+    if (platform_name or platform.system()) == "Windows":
+        api = style_api or _OverlayWindowsAPI()
+        return api.bounds(root.winfo_id())
+    return (int(root.winfo_rootx()), int(root.winfo_rooty()),
+            int(root.winfo_width()), int(root.winfo_height()))
+
+
+def keep_control_panel_above(root, *, style_api=None, platform_name=None) -> bool:
+    """Restack a visible control panel without activating it or changing input.
+
+    Call on the GUI thread after showing a screen surface or a controller
+    transition. An intentionally minimized/hidden panel is not resurrected.
+    The screen surfaces call this automatically after each ``show``.
+    """
+    if (platform_name or platform.system()) != "Windows":
+        root.attributes("-topmost", True)
+        return False
+    api = style_api or _OverlayWindowsAPI()
+    handle = root.winfo_id()
+    if not api.visible(handle) or api.minimized(handle):
+        return False
+    # Do not configure the panel as a passive overlay. Its buttons, caption,
+    # keyboard focus, and normal mouse interaction must remain available.
+    api.raise_without_activation(handle)
+    return True
+
+
 class _ScreenSurface:
     def __init__(self, root, *, window_factory=None, canvas_factory=None,
-                 style_api=None, platform_name=None):
+                 style_api=None, platform_name=None, control_panel=None):
         self.root = root
+        self.control_panel = root if control_panel is None else control_panel
         self.window = None
         self.canvas = None
         self.visible = False
@@ -166,6 +245,8 @@ class _ScreenSurface:
         try:
             window.withdraw()
             window.overrideredirect(True)
+            # Do not make this transient(panel): an owned Windows popup must
+            # stay above its owner, preventing the control panel from winning.
             window.attributes("-topmost", True)
             window.geometry(f"{bounds.width}x{bounds.height}+{bounds.left}+{bounds.top}")
             background = "black" if input_surface else TRANSPARENT_COLOR
@@ -196,6 +277,8 @@ class _ScreenSurface:
             api = self._api()
             api.configure(self.window.winfo_id(), click_through=not input_surface)
             api.raise_without_activation(self.window.winfo_id())
+            keep_control_panel_above(self.control_panel, style_api=api,
+                                     platform_name=self._platform_name)
             self.visible = True
         except Exception:
             # A failed native update must not strand a nearly invisible mouse
@@ -381,27 +464,53 @@ class InputSurface(_ScreenSurface):
         # Do not use canvas-local x/y or Tk scaling: coordinates are screen pixels.
         return _screen_xy(event.x_root, event.y_root)
 
+    def _over_panel(self, point):
+        # The native z-order normally routes these directly to the panel. This
+        # also rejects queued events or an existing mouse grab after it moves.
+        api = self._api()
+        panel = self.control_panel.winfo_id()
+        if not api.visible(panel) or api.minimized(panel):
+            return False
+        left, top, width, height = control_panel_bounds(
+            self.control_panel, style_api=api, platform_name=self._platform_name)
+        return left <= point[0] < left + width and top <= point[1] < top + height
+
+    def _cancel_drag_over_panel(self):
+        was_dragging, self._dragging = self._dragging, False
+        if was_dragging and self._cancel_callback:
+            self._cancel_callback()
+
     def _press(self, event):
         point = self._event_xy(event)
-        if self.visible and self.bounds.contains(*point):
+        if self.visible and self.bounds.contains(*point) and not self._over_panel(point):
             self._dragging = True
             self._press_callback(*point)
         return "break"
 
     def _move(self, event):
         if self.visible and self._dragging:
-            self._move_callback(*self._event_xy(event))
+            point = self._event_xy(event)
+            if self._over_panel(point):
+                self._cancel_drag_over_panel()
+            else:
+                self._move_callback(*point)
         return "break"
 
     def _release(self, event):
         was_dragging, self._dragging = self._dragging, False
         if self.visible and was_dragging:
-            self._release_callback(*self._event_xy(event))
+            point = self._event_xy(event)
+            if self._over_panel(point):
+                if self._cancel_callback:
+                    self._cancel_callback()
+            else:
+                self._release_callback(*point)
         return "break"
 
     def _right(self, event):
         point = self._event_xy(event)
-        if self.visible and self.bounds.contains(*point) and self._right_callback:
+        if (self.visible and self.bounds.contains(*point) and self._right_callback
+                and not self._over_panel(point)):
             self._right_callback(*point)
         return "break"
 
@@ -519,67 +628,136 @@ def verify_screen_overlay(root) -> dict:
         raise OverlayError("Native overlay verification requires Windows.")
     api = _OverlayWindowsAPI()
     width, height = api.primary_size()
-    if width < 240 or height < 240:
+    if width < 360 or height < 300:
         raise OverlayError("The Windows smoke-test display is too small.")
+    # Keep the actual control panel visible throughout the probe. Choose an
+    # unused corner for our synthetic target/panel rather than hiding the root.
+    occupied = (control_panel_bounds(root, style_api=api)
+                if api.visible(root.winfo_id()) and not api.minimized(root.winfo_id()) else None)
+    position = None
+    for left, top in ((width - 340, 20), (width - 340, height - 280),
+                      (20, height - 280), (20, 20)):
+        if occupied is not None:
+            ox, oy, ow, oh = occupied
+            if left < ox + ow and left + 320 > ox and top < oy + oh and top + 260 > oy:
+                continue
+        position = (left, top)
+        break
+    if position is None:
+        raise OverlayError("No free display area remains for the visible-panel overlay smoke test.")
+    left, top = position
     target = tk.Toplevel(root)
-    overlay = input_surface = None
+    panel = overlay = input_surface = None
     events = []
     try:
         target.withdraw()
         target.overrideredirect(True)
         target.attributes("-topmost", True)
-        target.geometry("160x160+40+40")
+        target.geometry(f"320x260+{left}+{top}")
         target.configure(bg="#445566")
         target.state("normal")
         target.update_idletasks()
         api.raise_without_activation(target.winfo_id())
         root.update()
         target_handle = api.root_handle(target.winfo_id())
-        geometry = CaptureGeometry(60, 60, 100, 100)
-        mask = np.zeros((100, 100), dtype=bool)
-        mask[20:80, 20:80] = True
-        mask[40:60, 40:60] = False
+        geometry = CaptureGeometry(left + 20, top + 20, 280, 220)
+        panel = tk.Toplevel(root)
+        panel.withdraw()
+        panel.title("SARU panel smoke test")
+        panel.geometry(f"100x70+{left + 140}+{top + 70}")
+        button = tk.Button(panel, text="Terminate", command=lambda: events.append("terminate"))
+        button.pack(fill="both", expand=True, padx=4, pady=4)
+        panel.state("normal")
+        panel.update_idletasks()
+        keep_control_panel_above(panel, style_api=api)
+        root.update()
+        panel_handle = api.root_handle(panel.winfo_id())
+
+        def panel_points():
+            outer = control_panel_bounds(panel, style_api=api)
+            button_center = (button.winfo_rootx() + button.winfo_width() // 2,
+                             button.winfo_rooty() + button.winfo_height() // 2)
+            caption = (outer[0] + 12, outer[1] + 10)
+            if not geometry.contains(*button_center) or not geometry.contains(*caption):
+                raise OverlayError("The synthetic panel does not overlap the input test region.")
+            return button_center, caption
+
+        def check_panel_above(*surfaces):
+            if not api.visible(panel.winfo_id()) or api.minimized(panel.winfo_id()):
+                raise OverlayError("The control panel disappeared while a screen surface was shown.")
+            for surface in surfaces:
+                if not api.is_above(panel.winfo_id(), surface.window.winfo_id()):
+                    raise OverlayError("A screen surface covers the control panel.")
+            if any(api.window_at(*point) != panel_handle for point in panel_points()):
+                raise OverlayError("A screen surface intercepts the panel's button or caption.")
+
+        mask = np.zeros((geometry.height, geometry.width), dtype=bool)
+        mask[25:180, 25:220] = True
+        mask[55:80, 45:65] = False
         candidate = SimpleNamespace(id="synthetic-mask", mask=mask)
-        overlay = ScreenOverlay(root, style_api=api)
+        overlay = ScreenOverlay(root, style_api=api, control_panel=panel)
         overlay.draw_masks([candidate], geometry, {candidate.id})
-        overlay.draw_trace([(70, 70), (150, 70)])
+        overlay.draw_trace([(left + 40, top + 35), (left + 100, top + 35)])
+        foreground = api.foreground()
         overlay.show()
         root.update()
+        check_panel_above(overlay)
         styles = api.styles(overlay.window.winfo_id())
         required = api.WS_EX_LAYERED | api.WS_EX_TRANSPARENT | api.WS_EX_NOACTIVATE
         if styles & required != required:
             raise OverlayError("The visual overlay lacks its native passive styles.")
         # Include a rendered red line, a rendered green mask edge, and a hole.
-        points = [(100, 70), (80, 100), (110, 110)]
+        points = [(left + 80, top + 35), (left + 45, top + 80),
+                  (left + 74, top + 88)]
         if any(api.window_at(*point) != target_handle for point in points):
             raise OverlayError("A visual annotation intercepted input intended for the target.")
         record_input = lambda x, y: events.append((x, y))
         input_surface = InputSurface(root, geometry, record_input,
-                                     record_input, record_input, style_api=api)
+                                     record_input, record_input, style_api=api,
+                                     control_panel=panel)
         input_surface.show()
         overlay.show()  # Put visible annotations above the input catcher too.
         root.update()
+        check_panel_above(overlay, input_surface)
         input_handle = api.root_handle(input_surface.window.winfo_id())
         if any(api.window_at(*point) != input_handle for point in points):
             raise OverlayError("The ROI input surface does not catch mask-interior input.")
         input_style = api.styles(input_surface.window.winfo_id())
         if input_style & api.WS_EX_TRANSPARENT or not input_style & api.WS_EX_NOACTIVATE:
             raise OverlayError("The ROI input surface has incorrect native window styles.")
-        if api.window_at(45, 45) != target_handle:
+        if api.window_at(left + 5, top + 5) != target_handle:
             raise OverlayError("The ROI input surface extends beyond its selected bounds.")
+        original_panel_bounds = control_panel_bounds(panel, style_api=api)
+        panel.geometry(f"100x70+{left + 160}+{top + 85}")
+        root.update()
+        input_surface.show()
+        overlay.show()
+        root.update()
+        check_panel_above(overlay, input_surface)
+        if original_panel_bounds == control_panel_bounds(panel, style_api=api):
+            raise OverlayError("The synthetic control panel did not move during verification.")
+        if api.foreground() != foreground:
+            raise OverlayError("Showing a screen surface activated a window unexpectedly.")
         input_surface.hide()
         overlay.hide()
         root.update()
+        check_panel_above()
         if any(api.window_at(*point) != target_handle for point in points):
             raise OverlayError("Hiding the screen surfaces did not restore the target window.")
         if events:
             raise OverlayError("Unexpected input arrived during the no-input overlay smoke test.")
         return {"annotation_hit_transparent": True, "roi_input_intercepts": True,
                 "outside_roi_passes": True, "hidden_restores_target": True,
+                "panel_visible_during_overlay": True, "panel_above_surfaces": True,
+                "panel_button_and_caption_hit_testable": True,
+                "panel_move_supported": True, "panel_visible_after_hide": True,
+                "stacking_does_not_activate": True,
                 "desktop_events_sent": 0, "global_listeners_started": 0}
     finally:
         if input_surface is not None:
             input_surface.close()
         if overlay is not None:
             overlay.close()
+        if panel is not None:
+            panel.destroy()
         target.destroy()

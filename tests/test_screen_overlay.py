@@ -10,7 +10,8 @@ import numpy as np
 from execution import CaptureGeometry
 from screen_overlay import (INPUT_ALPHA, TRANSPARENT_COLOR, TRANSPARENT_RGB,
                             InputSurface, ManualMouseObserver, OverlayError,
-                            ScreenOverlay, _OverlayWindowsAPI, _mask_image)
+                            ScreenOverlay, _OverlayWindowsAPI, _mask_image,
+                            control_panel_bounds, keep_control_panel_above)
 
 
 class FakeWindow:
@@ -90,6 +91,9 @@ class FakeStyles:
     def __init__(self):
         self.configurations = []
         self.raised = []
+        self.panel_rectangle = (600, 450, 180, 120)
+        self.hidden = set()
+        self.minimized_windows = set()
 
     def primary_size(self):
         return 800, 600
@@ -101,10 +105,19 @@ class FakeStyles:
     def raise_without_activation(self, handle):
         self.raised.append(handle)
 
+    def visible(self, handle):
+        return handle not in self.hidden
+
+    def minimized(self, handle):
+        return handle in self.minimized_windows
+
+    def bounds(self, handle):
+        return self.panel_rectangle
+
 
 class ScreenSurfaceTests(unittest.TestCase):
     def setUp(self):
-        self.root = SimpleNamespace(windows=[])
+        self.root = SimpleNamespace(windows=[], winfo_id=lambda: 50)
         self.styles = FakeStyles()
         self.options = dict(window_factory=FakeWindow, canvas_factory=FakeCanvas,
                             style_api=self.styles, platform_name="Windows")
@@ -121,13 +134,67 @@ class ScreenSurfaceTests(unittest.TestCase):
         self.assertTrue(window.options["-topmost"])
         self.assertIn(("state", "normal"), window.calls)
         self.assertTrue(all(click_through for _, click_through in self.styles.configurations))
-        self.assertEqual(self.styles.raised, [window.handle])
+        self.assertEqual(self.styles.raised, [window.handle, self.root.winfo_id()])
         overlay.hide()
         self.assertFalse(overlay.visible)
         self.assertEqual(window.calls[-1], "withdraw")
         overlay.close()
         overlay.close()
         self.assertTrue(window.destroyed)
+
+    def test_each_surface_show_restores_the_interactive_panel_above_it(self):
+        overlay = ScreenOverlay(self.root, **self.options)
+        surface = InputSurface(self.root, CaptureGeometry(0, 0, 800, 600),
+                               lambda *xy: None, lambda *xy: None, lambda *xy: None,
+                               **self.options)
+        surface.show()
+        overlay.show()
+        overlay.show()
+        self.assertEqual(self.styles.raised, [surface.window.handle, 50,
+                                              overlay.window.handle, 50,
+                                              overlay.window.handle, 50])
+        # The panel is raised only; its styles are never changed to passive.
+        self.assertNotIn(50, [handle for handle, _ in self.styles.configurations])
+        surface.hide()
+        overlay.hide()
+        self.assertTrue(self.styles.visible(50))
+
+    def test_panel_helpers_use_native_outer_bounds_without_activating_it(self):
+        self.assertEqual(control_panel_bounds(self.root, style_api=self.styles,
+                                              platform_name="Windows"),
+                         (600, 450, 180, 120))
+        self.assertTrue(keep_control_panel_above(self.root, style_api=self.styles,
+                                                 platform_name="Windows"))
+        self.assertEqual(self.styles.raised, [50])
+        self.assertEqual(self.styles.configurations, [])
+        self.styles.hidden.add(50)
+        self.assertFalse(keep_control_panel_above(self.root, style_api=self.styles,
+                                                  platform_name="Windows"))
+        self.assertEqual(self.styles.raised, [50])
+
+    def test_input_excludes_panel_caption_and_rechecks_after_panel_moves(self):
+        events = []
+        self.styles.panel_rectangle = (100, 100, 120, 80)
+        surface = InputSurface(self.root, CaptureGeometry(0, 0, 800, 600),
+                               lambda *xy: events.append(("press", *xy)),
+                               lambda *xy: events.append(("move", *xy)),
+                               lambda *xy: events.append(("release", *xy)),
+                               on_right=lambda *xy: events.append(("right", *xy)),
+                               on_cancel=lambda: events.append(("cancel",)),
+                               **self.options)
+        surface.show()
+        event = lambda x, y: SimpleNamespace(x_root=x, y_root=y)
+        surface._press(event(110, 105))  # Native caption, not just client area.
+        surface._right(event(110, 130))
+        self.assertEqual(events, [])
+        surface._press(event(50, 50))
+        surface._move(event(110, 120))
+        surface._release(event(60, 60))
+        self.assertEqual(events, [("press", 50, 50), ("cancel",)])
+        self.styles.panel_rectangle = (300, 200, 120, 80)
+        surface._press(event(110, 120))  # Old panel position is now usable.
+        surface._release(event(310, 210))  # Release over its new caption cancels.
+        self.assertEqual(events[-2:], [("press", 110, 120), ("cancel",)])
 
     def test_mask_pixels_keep_roi_origin_holes_and_disconnected_parts(self):
         geometry = CaptureGeometry(123, 234, 20, 16)

@@ -12,7 +12,7 @@ from execution import CancellationToken, CaptureGeometry, TaskResult
 from manual_sampling import legacy_contour_points
 from recognition import make_candidate
 from screen_app import (ScreenPickerApp, screen_changed_fraction, screen_mask_at, screen_model_points,
-                        screen_background_guard, screen_background_changed)
+                        screen_background_guard, screen_background_changed, screen_region_overlaps_panel)
 
 
 class Variable:
@@ -29,6 +29,7 @@ class Root:
         self.hidden = False
         self.callbacks = {}
         self.next_id = 0
+        self.bounds = (0, 0, 100, 80)
     def after(self, delay, callback):
         self.next_id += 1
         self.callbacks[self.next_id] = callback
@@ -39,7 +40,7 @@ class Root:
         identifier = next(iter(self.callbacks))
         self.callbacks.pop(identifier)()
     def withdraw(self):
-        self.hidden = True
+        raise AssertionError("The control panel must never be withdrawn")
     def deiconify(self):
         raise AssertionError("Panel restoration must not request foreground focus")
     def state(self, value):
@@ -50,13 +51,13 @@ class Root:
     def destroy(self):
         pass
     def winfo_rootx(self):
-        return 0
+        return self.bounds[0]
     def winfo_rooty(self):
-        return 0
+        return self.bounds[1]
     def winfo_width(self):
-        return 100
+        return self.bounds[2]
     def winfo_height(self):
-        return 80
+        return self.bounds[3]
 
 
 class Surface:
@@ -137,24 +138,26 @@ class Desktop:
         return self.target
     def focus_target(self, target):
         self.foreground = target
+    def bind_target(self, target):
+        self.ensure_target(target)
     def ensure_target(self, target=None):
         if self.foreground != (target or self.target):
             raise RuntimeError("focus changed")
-    def _hidden(self):
-        assert self.app.root.hidden, "Control panel must be hidden before capture or clicks"
+    def _ready_screen(self):
+        assert not self.app.root.hidden, "Control panel must remain visible during capture and clicks"
         assert self.app.overlay is None or not self.app.overlay.visible
         assert self.app.input_surface is None or not self.app.input_surface.visible
     def screenshot(self, region=None):
-        self._hidden()
+        self._ready_screen()
         self.captures.append(region)
         if region is None:
             return self.rgb.copy()
         return self.rgb[region.top:region.top+region.height, region.left:region.left+region.width].copy()
     def click(self, x, y):
-        self._hidden()
+        self._ready_screen()
         self.clicks.append((x, y))
     def press_next(self, key):
-        self._hidden()
+        self._ready_screen()
         self.keys.append(key)
 
 
@@ -179,11 +182,13 @@ def app_state(mode="manual"):
     app.checkpoint, app.model_type = Variable("supplied-model.pth"), Variable("vit_b")
     app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(.08)
     app.frames, app.wait_seconds = Variable(1), Variable(5.0)
-    app.closed = app.transition = app.hidden = app.paused = False
+    app.closed = app.transition = app.paused = False
+    app._fit_after = None
+    app._fitting = False
     app.scheduled = set()
     app.active_token = None
     app.job_kind = None
-    app.manual_window = app.manual_geometry = app.manual_baseline = None
+    app.manual_window = app.manual_geometry = None
     app.trace, app.drawing, app.released = [], False, False
     app.trace_dirty = False
     app.panel_bounds = (0, 0, 100, 80)
@@ -201,6 +206,13 @@ def app_state(mode="manual"):
 
 
 class ScreenGeometryTests(unittest.TestCase):
+    def test_visible_panel_overlap_uses_full_rectangle_not_roi_sample_points(self):
+        region = CaptureGeometry(100, 100, 300, 200)
+        self.assertTrue(screen_region_overlaps_panel(region, (120, 120, 50, 40)))
+        self.assertTrue(screen_region_overlaps_panel(region, (380, 280, 80, 80)))
+        self.assertFalse(screen_region_overlaps_panel(region, (400, 100, 80, 80)))
+        self.assertFalse(screen_region_overlaps_panel(region, None))
+
     def test_image_drift_does_not_wrap_unsigned_values(self):
         bright = np.full((10, 20, 3), 250, np.uint8)
         dark = np.full((10, 20, 3), 5, np.uint8)
@@ -246,6 +258,12 @@ class ScreenControllerTests(unittest.TestCase):
         self.sleep = patch.object(CancellationToken, "sleep", lambda token, seconds: token.check_cancelled())
         self.sleep.start()
         self.addCleanup(self.sleep.stop)
+        for replacement in (
+            patch("screen_app.keep_control_panel_above"),
+            patch("screen_app.control_panel_bounds", side_effect=lambda root: root.bounds),
+        ):
+            replacement.start()
+            self.addCleanup(replacement.stop)
 
     def test_listener_callbacks_only_enqueue_and_cancel_token(self):
         app = app_state()
@@ -266,12 +284,13 @@ class ScreenControllerTests(unittest.TestCase):
         self.assertFalse(app.drawing)
         self.assertEqual(app.desktop.captures, [])
 
-    def test_manual_ignores_other_windows_after_binding_target(self):
+    def test_each_manual_stroke_acquires_its_current_window(self):
         app = app_state()
         app.manual_window = 42
         app.desktop.target = app.desktop.foreground = 99
         app._manual_input(0, "press", 160, 100)
-        self.assertFalse(app.drawing)
+        self.assertTrue(app.drawing)
+        self.assertEqual(app.manual_window, 99)
         self.assertFalse(app.root.hidden)
 
     def test_manual_does_not_acquire_its_own_native_titlebar_as_target(self):
@@ -287,44 +306,66 @@ class ScreenControllerTests(unittest.TestCase):
         app.click_delay.set("unfinished model setting")
         self.assertEqual(app._live_ready(), .1)
 
-    def test_short_manual_stroke_released_before_baseline_still_picks_original_grid(self):
+    def test_manual_release_immediately_submits_original_grid_with_panel_visible(self):
         app = app_state()
         polygon = [(150, 110), (210, 110), (210, 155), (150, 155), (150, 110)]
         app._manual_input(0, "press", *polygon[0])
         app._sync_manual()
-        self.assertTrue(app._manual_gate.is_set(), "Record movement during hidden baseline delay")
+        self.assertTrue(app._manual_gate.is_set())
+        self.assertTrue(app.overlay.visible, "Show the red trace immediately")
+        self.assertEqual(app.runner.jobs, [], "Drawing must not start capture or a model job")
         for point in polygon[1:]:
             app._manual_input(0, "move", *point)
         app._manual_input(0, "release", *polygon[-1])
         app._sync_manual()
         self.assertFalse(app._manual_gate.is_set(), "Release must gate later movement")
-        app.root.run_next()
-        baseline = app.runner.finish()
-        app._result("manual baseline", baseline)
+        self.assertEqual(len(app.runner.jobs), 1, "Release submits picking without a capture delay")
+        self.assertEqual(app.root.callbacks, {})
         self.assertIsNone(app.geometry, "Manual mode must not require a selected ROI")
         self.assertIsNone(app.recognizer)
-        app.root.run_next()
+        app.desktop.focus_target = Mock(side_effect=AssertionError("Manual must not change focus"))
         with patch("screen_app.play_clicks", wraps=__import__("execution").play_clicks) as playback:
             result = app.runner.finish()
         self.assertEqual(playback.call_args.kwargs["delay"], .1)
         self.assertEqual(app.desktop.clicks, [tuple(p) for p in legacy_contour_points(polygon, 13)])
+        self.assertEqual(app.desktop.captures, [], "Manual mode must never take screenshots")
         app._result("manual picks", result)
         app._sync_manual()
         self.assertTrue(app._manual_gate.is_set())
         self.assertFalse(app.disabled.get())
         self.assertFalse(app.root.hidden)
 
-    def test_manual_scene_change_rejects_all_clicks(self):
+    def test_manual_does_not_reject_normal_hover_or_pick_feedback(self):
         app = app_state()
         app.manual_window = 42
         app.trace = [(150, 110), (210, 110), (210, 155), (150, 155)]
-        app.manual_baseline = app.desktop.rgb.copy()
         app.desktop.rgb[100:180, 140:230] = 0
         app._finish_manual()
-        app.root.run_next()
-        with self.assertRaisesRegex(RuntimeError, "moved while drawing"):
+        result = app.runner.finish()
+        self.assertGreater(result["count"], 0)
+        self.assertEqual(app.desktop.captures, [])
+
+    def test_first_press_is_not_lost_while_browser_activation_is_pending(self):
+        app = app_state()
+        app.desktop.foreground = 123
+        app._manual_input(0, "press", 150, 110)
+        self.assertTrue(app.drawing)
+        app.desktop.foreground = 42
+        for point in [(210, 110), (210, 155), (150, 155)]:
+            app._manual_input(0, "move", *point)
+        app._manual_input(0, "release", 150, 155)
+        self.assertGreater(app.runner.finish()["count"], 0)
+
+    def test_manual_playback_stops_if_browser_loses_focus(self):
+        app = app_state()
+        app.manual_window = 42
+        app.trace = [(150, 110), (210, 110), (210, 155), (150, 155)]
+        app._finish_manual()
+        app.desktop.foreground = 99
+        with self.assertRaisesRegex(RuntimeError, "focus changed"):
             app.runner.finish()
         self.assertEqual(app.desktop.clicks, [])
+        self.assertFalse(app.root.hidden)
 
     def test_old_mouse_epoch_and_playback_mouse_callbacks_are_ignored(self):
         app = app_state()
@@ -358,16 +399,16 @@ class ScreenControllerTests(unittest.TestCase):
         app._manual_input(*records[0][1:])
         self.assertFalse(app.drawing)
 
-    def test_escape_prevents_rearming_or_a_pending_capture_before_queue_is_polled(self):
+    def test_escape_prevents_rearming_or_release_submission_before_queue_is_polled(self):
         app = app_state()
         app._manual_input(0, "press", 150, 110)
         app._hotkey("stop")
         app._sync_manual()
         self.assertFalse(app._manual_gate.is_set())
-        app.root.run_next()
+        app._manual_input(0, "release", 190, 140)
         self.assertEqual(app.runner.jobs, [])
 
-    def test_disable_cancels_pending_capture_and_removes_catchers(self):
+    def test_disable_cancels_drawing_and_removes_catchers_with_panel_visible(self):
         app = app_state()
         app._manual_input(0, "press", 150, 110)
         catcher = app.input_surface = Surface()
@@ -379,14 +420,17 @@ class ScreenControllerTests(unittest.TestCase):
         self.assertTrue(catcher.closed)
         self.assertEqual(app.desktop.captures, [])
 
-    def test_detection_captures_only_hidden_clean_screen_and_keeps_recognition_off_tk(self):
+    def test_detection_hides_only_temporary_layers_and_keeps_controls_visible(self):
         app = app_state("semi-auto")
         app.overlay.show()
         app.input_surface = Surface()
         app.input_surface.show()
         app.input_kind = "masks"
         model = Mock()
-        model.automatic.return_value = []
+        def recognize(*args, **kwargs):
+            self.assertFalse(app.root.hidden, "Panel must remain visible throughout inference")
+            return []
+        model.automatic.side_effect = recognize
         app._get_recognizer = Mock(return_value=model)
         app.detect()
         app.root.run_next()
@@ -396,6 +440,39 @@ class ScreenControllerTests(unittest.TestCase):
         self.assertEqual(len(app.desktop.captures), 2)
         model.automatic.assert_called_once()
         self.assertEqual(app.desktop.clicks, [])
+
+    def test_detection_rejects_panel_inside_roi_without_hiding_it(self):
+        app = app_state("semi-auto")
+        app.root.bounds = (155, 115, 10, 10)  # misses the ROI center and corners
+        app.detect()
+        self.assertIn("Move the SARU panel", app.status.get())
+        self.assertEqual(app.runner.jobs, [])
+        self.assertEqual(app.desktop.captures, [])
+        self.assertFalse(app.root.hidden)
+
+    def test_panel_moved_into_roi_during_recognition_invalidates_capture(self):
+        app = app_state("semi-auto")
+        def recognize(*args, **kwargs):
+            app.root.bounds = (155, 115, 10, 10)
+            app._remember_panel()
+            return []
+        app._get_recognizer = Mock(return_value=SimpleNamespace(automatic=recognize))
+        app.detect()
+        app.root.run_next()
+        with self.assertRaisesRegex(ValueError, "Move the SARU panel"):
+            app.runner.finish()
+        self.assertEqual(len(app.desktop.captures), 1)
+        self.assertFalse(app.root.hidden)
+
+    def test_all_temporary_layer_hides_leave_control_panel_visible(self):
+        app = app_state()
+        app.overlay.show()
+        catcher = app.input_surface = Surface()
+        catcher.show()
+        app._hide_overlays()
+        self.assertFalse(app.root.hidden)
+        self.assertFalse(app.overlay.visible)
+        self.assertTrue(catcher.closed)
 
     def test_clicking_mask_interior_uses_screen_coordinates_without_a_review_window(self):
         app = app_state("semi-auto")
@@ -514,7 +591,6 @@ class ScreenControllerTests(unittest.TestCase):
         app = app_state()
         app.drawing = True
         app.trace = [(150, 110)]
-        app.manual_baseline = app.desktop.rgb.copy()
         app.manual_geometry = CaptureGeometry(0, 0, 480, 320)
         app.manual_window = 42
         for x in range(151, 190):

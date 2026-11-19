@@ -1,10 +1,10 @@
 # SARU Picker 2.1 for Windows
 
-Install **SARU-Picker-Setup-2.1.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed.
+Install **SARU-Picker-Setup-2.1.1-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed.
 
 ## Work directly over cryoSPARC
 
-The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer.
+The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer. Version 2.1.1 keeps the panel visible during drawing, detection and picking, and sizes it to fit its controls and Windows text scaling. The terminate button has a reserved footer.
 
 | Mode | Screen interaction |
 | --- | --- |
@@ -14,7 +14,7 @@ The normal application is the original compact floating control panel. cryoSPARC
 
 Escape stops and disables picking. Space pauses/resumes an active auto run; F8 is an additional pause key. Keep cryoSPARC on the primary monitor and keep its micrograph zoom and position fixed during recognition and playback.
 
-The earlier 2.0 default snapshot editor is now optional, available with --review. Screenshots in the normal workflow are internal model input; they do not replace the live screen.
+The earlier 2.0 default snapshot editor is now optional, available with --review. Screenshots are internal model input; manual mode takes no screenshots. Keep the control panel outside the selected model screen area. It remains visible throughout detection and picking.
 
 ## Installed data
 

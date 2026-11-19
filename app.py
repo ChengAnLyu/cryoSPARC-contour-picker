@@ -40,7 +40,7 @@ from screen_app import ScreenPickerApp
 from screen_overlay import verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -162,43 +162,162 @@ def _smoke_torchvision() -> dict[str, Any]:
             "native_nms": True}
 
 
+def _smoke_widget_layout(window, widget, description: str) -> dict[str, Any]:
+    """Reject a managed control that is hidden, shrunk, or ancestor-clipped.
+
+    Tk's packer can shrink a button to only a few visible pixels while its
+    bottom edge still fits the root. Comparing only the two bottom edges does
+    not establish that the label or complete clickable area is available.
+    """
+    size = [int(widget.winfo_width()), int(widget.winfo_height())]
+    requested = [int(widget.winfo_reqwidth()), int(widget.winfo_reqheight())]
+    if not widget.winfo_viewable():
+        raise RuntimeError(f"{description} is not visible in the floating panel.")
+    if min(size) <= 0 or any(actual < needed for actual, needed in zip(size, requested)):
+        raise RuntimeError(
+            f"{description} is clipped below its requested size: actual {size}, requested {requested}.")
+    left, top = int(widget.winfo_rootx()), int(widget.winfo_rooty())
+    right, bottom = left + size[0], top + size[1]
+    parent = widget.master
+    while parent is not None:
+        parent_left, parent_top = int(parent.winfo_rootx()), int(parent.winfo_rooty())
+        parent_right = parent_left + int(parent.winfo_width())
+        parent_bottom = parent_top + int(parent.winfo_height())
+        if (left < parent_left or top < parent_top or right > parent_right or bottom > parent_bottom):
+            raise RuntimeError(f"{description} extends outside its parent and is not fully usable.")
+        if parent is window:
+            break
+        parent = parent.master
+    if parent is not window:
+        raise RuntimeError(f"{description} is not attached to the floating panel.")
+    return {"actual": size, "requested": requested,
+            "panel_rect": [left-int(window.winfo_rootx()), top-int(window.winfo_rooty()), *size],
+            "viewable": True, "full_requested_size": True}
+
+
+def _smoke_terminate_text(window, button) -> dict[str, Any]:
+    """Check the full text line, including ascent/descent and button padding."""
+    tk_font = importlib.import_module("tkinter.font")
+    font = tk_font.Font(root=window, font=button.cget("font"))
+    lines = str(button.cget("text")).splitlines() or [""]
+    text_width = max(int(font.measure(line)) for line in lines)
+    ascent, descent = int(font.metrics("ascent")), int(font.metrics("descent"))
+    line_height = int(font.metrics("linespace"))
+    border = sum(int(window.winfo_pixels(button.cget(name)))
+                 for name in ("borderwidth", "highlightthickness"))
+    pad_x, pad_y = (int(window.winfo_pixels(button.cget(name))) for name in ("padx", "pady"))
+    usable = [int(button.winfo_width())-2*(border+pad_x),
+              int(button.winfo_height())-2*(border+pad_y)]
+    text_height = line_height * len(lines)
+    if text_width > usable[0] or text_height > usable[1]:
+        raise RuntimeError(
+            f"Terminate's text or font baseline is clipped: usable {usable}, text {[text_width, text_height]}.")
+    # The actual button retains its default centered anchor. This derived
+    # baseline records the complete font line that must fit the usable area.
+    baseline = border + pad_y + (usable[1]-text_height)//2 + ascent
+    if baseline + (len(lines)-1)*line_height + descent > int(button.winfo_height())-border-pad_y:
+        raise RuntimeError("Terminate's text descender falls outside its usable button area.")
+    return {"text_size": [text_width, text_height], "usable_text_size": usable,
+            "font_metrics": {"ascent": ascent, "descent": descent, "linespace": line_height},
+            "centered_first_baseline_from_top": baseline, "full_font_line_fits": True}
+
+
+def _smoke_panel_layout(picker, mode: str, status_case: str) -> dict[str, Any]:
+    window = picker.root
+    picker.fit_panel()
+    window.update_idletasks()
+    if window.state() != "normal" or not window.winfo_viewable():
+        raise RuntimeError(f"The {mode} floating control panel is not visible.")
+    if not window.tk.getboolean(window.attributes("-topmost")):
+        raise RuntimeError("The floating control panel is not kept above the target application.")
+    controls = []
+
+    def inspect(parent):
+        for child in parent.winfo_children():
+            # pack_forget/grid_remove intentionally hide inactive mode groups.
+            # A managed child clipped away by pack still has a manager and must
+            # fail the visibility/size checks instead of being silently skipped.
+            if not child.winfo_manager():
+                continue
+            description = f"{mode}/{status_case} {child.winfo_class()} {child}"
+            controls.append(_smoke_widget_layout(window, child, description))
+            inspect(child)
+
+    inspect(window)
+    terminate = _smoke_widget_layout(window, picker.terminate_button, f"{mode}/{status_case} Terminate")
+    terminate["text"] = _smoke_terminate_text(window, picker.terminate_button)
+    status = _smoke_widget_layout(window, picker.status_label, f"{mode}/{status_case} status")
+    return {"panel_size": [int(window.winfo_width()), int(window.winfo_height())],
+            "panel_requested_size": [int(window.winfo_reqwidth()), int(window.winfo_reqheight())],
+            "managed_controls_checked": len(controls), "all_managed_controls_fit": True,
+            "terminate": terminate, "status": status, "viewable": True, "topmost": True}
+
+
 def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
-    # Importing desktop libraries is deliberate; no listener is started and no
-    # screenshot, mouse action, or key is sent in this packaging check.
+    # These are native Windows widgets at simulated Tk font/layout scales. The
+    # Windows monitor's DPI setting is never changed. Each fresh interpreter is
+    # scaled before widgets/fonts exist, because changing Tk scaling afterwards
+    # does not reliably resize previously constructed controls.
     enable_dpi_awareness()
     tkinter = importlib.import_module("tkinter")
-    window = tkinter.Tk()
-    picker = None
-    try:
-        window.withdraw()
-        args = argparse.Namespace(checkpoint=None, device="cpu", model_type="vit_b", image=None)
-        picker = ScreenPickerApp(window, args, log_path, resolve_checkpoint(), start_listeners=False)
-        if (picker.mode != "manual" or not picker.disabled.get()
-                or picker.hotkeys is not None or picker.mouse_observer is not None
-                or picker.overlay is not None):
-            raise RuntimeError("The compact screen application did not start in passive manual mode.")
-        panel_layouts = {}
-        for mode in ("manual", "semi-auto", "auto"):
-            if picker.mode != mode:
-                picker.set_mode(mode)
+    scale_checks = []
+    panel_layouts = {}
+    overlay_checks = None
+    tk_version = None
+    long_status = ("Recognition is running on the selected screen area.\n"
+                   "Escape stops picking; F8 pauses or resumes.\n"
+                   "Keep cryoSPARC's image position and zoom fixed.")
+    for percent in (100, 125, 150, 200):
+        window = tkinter.Tk()
+        picker = None
+        original_scaling = None
+        try:
+            window.withdraw()
+            original_scaling = float(window.tk.call("tk", "scaling"))
+            requested_dpi = 96 * percent / 100
+            window.tk.call("tk", "scaling", requested_dpi / 72)
+            actual_scaling = float(window.tk.call("tk", "scaling"))
+            args = argparse.Namespace(checkpoint=None, device="cpu", model_type="vit_b", image=None)
+            picker = ScreenPickerApp(window, args, log_path, resolve_checkpoint(), start_listeners=False)
+            if (picker.mode != "manual" or not picker.disabled.get()
+                    or picker.hotkeys is not None or picker.mouse_observer is not None
+                    or picker.overlay is not None):
+                raise RuntimeError("The compact screen application did not start in passive manual mode.")
             window.state("normal")
             window.update_idletasks()
-            width, height = window.winfo_width(), window.winfo_height()
-            button_bottom = picker.terminate_button.winfo_rooty() + picker.terminate_button.winfo_height()
-            if width != 420 or (mode == "manual" and height != 320):
-                raise RuntimeError("The original compact manual panel dimensions changed.")
-            if button_bottom > window.winfo_rooty() + height:
-                raise RuntimeError(f"The {mode} controls do not fit inside the floating panel.")
-            panel_layouts[mode] = [width, height]
-        window.withdraw()
-        window.update_idletasks()
-        overlay_checks = verify_screen_overlay(window)
-        tk_version = str(window.tk.call("info", "patchlevel"))
-    finally:
-        if picker is not None:
-            picker.close()
-        else:
-            window.destroy()
+            layouts = {}
+            for mode in ("manual", "semi-auto", "auto"):
+                if picker.mode != mode:
+                    picker.set_mode(mode)
+                window.update_idletasks()
+                initial_status = picker.status.get()
+                normal = _smoke_panel_layout(picker, mode, "default")
+                picker.status.set(long_status)
+                multiline = _smoke_panel_layout(picker, mode, "multiline_status")
+                picker._hide_overlays()
+                window.update_idletasks()
+                if (window.state() != "normal" or not window.winfo_viewable()
+                        or not window.tk.getboolean(window.attributes("-topmost"))):
+                    raise RuntimeError(f"The {mode} control panel disappeared while hiding the screen overlays.")
+                layouts[mode] = {"default": normal, "multiline_status": multiline,
+                                 "panel_persists_when_overlays_hidden": True}
+                if percent == 100:
+                    panel_layouts[mode] = normal["panel_size"]
+                picker.status.set(initial_status)
+                picker.fit_panel()
+            tk_version = str(window.tk.call("info", "patchlevel"))
+            scale_checks.append({"scale_percent": percent, "requested_dpi": requested_dpi,
+                                 "native_tk_scaling_before_test": original_scaling,
+                                 "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts})
+            if overlay_checks is None:
+                overlay_checks = verify_screen_overlay(window)
+        finally:
+            if original_scaling is not None:
+                window.tk.call("tk", "scaling", original_scaling)
+            if picker is not None:
+                picker.close()
+            else:
+                window.destroy()
     pyautogui = importlib.import_module("pyautogui")
     keyboard = importlib.import_module("pynput.keyboard")
     mouse = importlib.import_module("pynput.mouse")
@@ -207,6 +326,8 @@ def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
     return {"tk_version": tk_version, "desktop_modules_imported": True,
             "full_application_constructed": True, "synthetic_mask_rendered": True,
             "compact_manual_default": True, "panel_layouts": panel_layouts,
+            "layout_scaling_method": "Native Windows Tk widgets; pixels-per-point set before construction to simulate 100/125/150/200% of 96 DPI. Windows monitor scaling is unchanged.",
+            "layout_scale_checks": scale_checks,
             "screen_overlay": overlay_checks,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 

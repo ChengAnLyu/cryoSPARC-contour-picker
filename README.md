@@ -4,9 +4,9 @@ SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the imag
 
 ## Windows application
 
-The CPU installer is named **SARU-Picker-Setup-2.1.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+The CPU installer is named **SARU-Picker-Setup-2.1.1-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
 
-Version 2.1 restores the original direct-screen workflow. The earlier version 2.0 opened a separate snapshot editor by default; that editor is now optional.
+Version 2.1.1 fixes clipped controls, keeps the panel visible throughout screen operations, and restores immediate manual drawing without screenshot validation. The optional snapshot editor remains available with `--review`.
 
 ## Manual mode — original interaction
 
@@ -17,7 +17,7 @@ Version 2.1 restores the original direct-screen workflow. The earlier version 2.
 
 Manual mode requires no screen-area selection, model, image import, mask acceptance, or separate pick button. The original panel controls remain: the three mode buttons, **Particle spacing** slider (5–25 screen pixels, default 13), **Disable Picking**, status, and **terminate**.
 
-Manual pick placement preserves the original contour bounding-box origin, integer hexagonal row spacing, alternating half-spacing offset, polygon boundary rule, zero inset, and approximately 0.10-second click cadence. The implementation now uses a worker and queued drawing events to keep the panel responsive. Generated clicks are excluded from the contour listener.
+Manual pick placement preserves the original contour bounding-box origin, integer hexagonal row spacing, alternating half-spacing offset, polygon boundary rule, zero inset, and approximately 0.10-second click cadence. The implementation now uses a worker and queued drawing events to keep the panel responsive. Generated clicks are excluded from the contour listener. Manual mode takes no screenshots and starts picking directly on release; each stroke selects its own target window. The panel stays visible and its size fits the requested controls at the current Windows text scaling, including a reserved footer for **terminate**.
 
 ## Semi-auto mode
 
@@ -47,7 +47,7 @@ The app stops on errors, empty proposals, changed or repeated images, lost targe
 - **Disable Picking** removes the input-catching layer so cryoSPARC receives ordinary interaction again.
 - **terminate** closes the application and its listeners.
 
-Visible annotations are passive. A separate, nearly transparent input surface catches ROI selection, box prompts, and semi-auto mask clicks. All picker windows are hidden before screenshots and generated clicks. The underlying screen is never replaced by a required snapshot editor.
+Visible annotations are passive. A separate, nearly transparent input surface catches ROI selection, box prompts, and semi-auto mask clicks. Only the temporary annotation/input layers are hidden before screenshots and generated clicks. The control panel remains visible, interactive, and above these layers. Keep it outside the selected micrograph area; an overlapping panel produces an explicit message instead of disappearing. The underlying screen is never replaced by a required snapshot editor.
 
 Live control currently supports the primary Windows monitor. Moving the micrograph or changing zoom requires a fresh detection. Up to 10,000 generated clicks are allowed per operation. Cancellation is checked between clicks; an active native model forward pass must finish before its cancelled result can be discarded.
 
@@ -90,6 +90,6 @@ python -m unittest discover -s tests
 python main.py --diagnostics --report diagnostics.json
 ```
 
-The Windows build tests the compact panel, native overlay hit testing, image processing, compiled torchvision operations, and real synthetic SAM inference. It then installs, tests, and uninstalls the package. These checks use synthetic windows and images and send no clicks or keys to cryoSPARC. Live picking alignment still needs a check on the intended workstation.
+The Windows build tests complete control/button layout at four simulated Windows Tk font scales, persistent panel visibility, native overlay hit testing and stacking, image processing, compiled torchvision operations, and real synthetic SAM inference. It then installs, tests, and uninstalls the package. These checks use synthetic windows and images and send no clicks or keys to cryoSPARC. Live picking alignment still needs a check on the intended workstation.
 
 Logs are in %LOCALAPPDATA%\SARU_Picker on Windows and ~/.saru_picker elsewhere. The build and dependency manifest records the exact installer inputs.

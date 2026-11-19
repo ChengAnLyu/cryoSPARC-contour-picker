@@ -159,6 +159,48 @@ class DesktopTests(unittest.TestCase):
             self.adapter.click(31, 41)
         self.assertEqual(self.backend.clicks, [(30, 40)])
 
+    def test_bind_target_enables_first_batch_without_changing_native_focus(self):
+        with patch.object(self.windows, "focus", side_effect=AssertionError("Must not steal focus")), \
+             patch.object(self.windows, "restore", side_effect=AssertionError("Must not restore windows")):
+            self.adapter.bind_target(11)
+            self.adapter.click(30, 40)
+        self.assertEqual(self.adapter._target, 11)
+        self.assertEqual(self.windows.current, 11)
+        self.assertEqual(self.backend.clicks, [(30, 40)])
+
+    def test_bind_target_replaces_the_previous_batch_target(self):
+        self.adapter.focus_target(11)
+        self.windows.current = 22
+        self.windows.region_window = lambda x, y: 22
+        with patch.object(self.windows, "focus", side_effect=AssertionError("Must not steal focus")), \
+             patch.object(self.windows, "restore", side_effect=AssertionError("Must not restore windows")):
+            self.adapter.bind_target(22)
+            self.adapter.click(31, 41)
+        self.assertEqual(self.adapter._target, 22)
+        self.assertEqual(self.backend.clicks, [(31, 41)])
+
+    def test_failed_bind_clears_stale_target_and_never_focuses_or_restores(self):
+        self.adapter.focus_target(11)
+        self.windows.current = 22
+        with patch.object(self.windows, "focus", side_effect=AssertionError("Must not steal focus")), \
+             patch.object(self.windows, "restore", side_effect=AssertionError("Must not restore windows")):
+            with self.assertRaisesRegex(DesktopError, "lost focus"):
+                self.adapter.bind_target(11)
+        self.assertIsNone(self.adapter._target)
+        self.assertEqual(self.windows.current, 22)
+        with self.assertRaises(DesktopError):
+            self.adapter.click(30, 40)
+        self.assertEqual(self.backend.clicks, [])
+
+    def test_bind_rejects_a_minimized_target_without_restoring_it(self):
+        self.windows.minimized.add(11)
+        with patch.object(self.windows, "restore", side_effect=AssertionError("Must not restore windows")):
+            with self.assertRaisesRegex(DesktopError, "lost focus"):
+                self.adapter.bind_target(11)
+        self.assertIn(11, self.windows.minimized)
+        self.assertIsNone(self.adapter._target)
+        self.assertEqual(self.backend.clicks, [])
+
     def test_failed_focus_does_not_allow_clicks(self):
         self.windows.current = 22
         self.windows.allow_focus = False

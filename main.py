@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.1: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 2.1.1: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
@@ -1056,7 +1056,9 @@ class DesktopAdapter:
 
     ``backend`` and ``windows_api`` may be fake adapters in tests. The actual
     PyAutoGUI backend is configured with PAUSE=0 and FAILSAFE=True. ``click``
-    and ``press_next`` require a target established by ``focus_target``.
+    and ``press_next`` require a target established by ``focus_target`` or
+    ``bind_target``. Manual mode can bind a window already activated by the
+    user's physical mouse gesture without moving focus itself.
     """
 
     def __init__(
@@ -1212,10 +1214,21 @@ class DesktopAdapter:
         self.ensure_target(handle)
         self._target = handle
 
+    def bind_target(self, handle) -> None:
+        """Use an already foreground target without focusing or restoring it.
+
+        A rejected new batch must not retain an older batch's implicit target.
+        ``click`` still validates foreground and the window under each point.
+        """
+        self._target = None
+        handle = _desktop_integer(handle, "Target window handle")
+        self.ensure_target(handle)
+        self._target = handle
+
     def ensure_target(self, handle=None) -> None:
         handle = self._target if handle is None else handle
         if handle is None:
-            raise DesktopError("No captured target window has been focused for playback.")
+            raise DesktopError("No picking target has been selected for playback.")
         handle = self._validate_handle(handle)
         api = self._get_api()
         if api.is_minimized(handle) or api.root_window(api.foreground()) != handle:
@@ -1559,12 +1572,23 @@ class _OverlayWindowsAPI:
             self.user32.GetSystemMetrics.restype = ctypes.c_int
             self.user32.WindowFromPoint.argtypes = [wintypes.POINT]
             self.user32.WindowFromPoint.restype = wintypes.HWND
+            self.user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            self.user32.GetWindowRect.restype = wintypes.BOOL
+            self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
+            self.user32.IsWindowVisible.restype = wintypes.BOOL
+            self.user32.IsIconic.argtypes = [wintypes.HWND]
+            self.user32.IsIconic.restype = wintypes.BOOL
+            self.user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+            self.user32.GetWindow.restype = wintypes.HWND
+            self.user32.GetForegroundWindow.argtypes = []
+            self.user32.GetForegroundWindow.restype = wintypes.HWND
             self.user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
                                                ctypes.c_int, ctypes.c_int,
                                                ctypes.c_int, ctypes.c_int,
                                                wintypes.UINT]
             self.user32.SetWindowPos.restype = wintypes.BOOL
         self._point_type = wintypes.POINT
+        self._rect_type = wintypes.RECT
 
     def primary_size(self) -> tuple[int, int]:
         return self.user32.GetSystemMetrics(0), self.user32.GetSystemMetrics(1)
@@ -1577,6 +1601,37 @@ class _OverlayWindowsAPI:
 
     def styles(self, child: int) -> int:
         return int(self._get_long(self.root_handle(child), self.GWL_EXSTYLE))
+
+    def visible(self, child: int) -> bool:
+        return bool(self.user32.IsWindowVisible(self.root_handle(child)))
+
+    def minimized(self, child: int) -> bool:
+        return bool(self.user32.IsIconic(self.root_handle(child)))
+
+    def foreground(self) -> int:
+        return int(self.user32.GetForegroundWindow() or 0)
+
+    def bounds(self, child: int) -> tuple[int, int, int, int]:
+        rectangle = self._rect_type()
+        if not self.user32.GetWindowRect(self.root_handle(child), ctypes.byref(rectangle)):
+            raise OverlayError("The control panel's screen bounds could not be read.")
+        width, height = rectangle.right - rectangle.left, rectangle.bottom - rectangle.top
+        if width <= 0 or height <= 0:
+            raise OverlayError("The control panel has invalid screen bounds.")
+        return rectangle.left, rectangle.top, width, height
+
+    def is_above(self, first: int, second: int) -> bool:
+        """Compare two top-level windows without changing focus or z-order."""
+        first, current = self.root_handle(first), self.root_handle(second)
+        visited = {current}
+        for _ in range(8192):
+            current = int(self.user32.GetWindow(current, 3) or 0)  # GW_HWNDPREV
+            if not current or current in visited:
+                return False
+            if current == first:
+                return True
+            visited.add(current)
+        return False
 
     def configure(self, child: int, *, click_through: bool) -> int:
         handle = self.root_handle(child)
@@ -1604,10 +1659,45 @@ class _OverlayWindowsAPI:
             raise OverlayError("Could not show the screen overlay without activating it.")
 
 
+def control_panel_bounds(root, *, style_api=None, platform_name=None) -> tuple[int, int, int, int]:
+    """Return the panel's screen (left, top, width, height) on the GUI thread.
+
+    Windows uses the complete native outer window, including caption and frame.
+    The Tk client bounds are available only as an offline non-Windows fallback;
+    live screen capture remains Windows-only.
+    """
+    if (platform_name or platform.system()) == "Windows":
+        api = style_api or _OverlayWindowsAPI()
+        return api.bounds(root.winfo_id())
+    return (int(root.winfo_rootx()), int(root.winfo_rooty()),
+            int(root.winfo_width()), int(root.winfo_height()))
+
+
+def keep_control_panel_above(root, *, style_api=None, platform_name=None) -> bool:
+    """Restack a visible control panel without activating it or changing input.
+
+    Call on the GUI thread after showing a screen surface or a controller
+    transition. An intentionally minimized/hidden panel is not resurrected.
+    The screen surfaces call this automatically after each ``show``.
+    """
+    if (platform_name or platform.system()) != "Windows":
+        root.attributes("-topmost", True)
+        return False
+    api = style_api or _OverlayWindowsAPI()
+    handle = root.winfo_id()
+    if not api.visible(handle) or api.minimized(handle):
+        return False
+    # Do not configure the panel as a passive overlay. Its buttons, caption,
+    # keyboard focus, and normal mouse interaction must remain available.
+    api.raise_without_activation(handle)
+    return True
+
+
 class _ScreenSurface:
     def __init__(self, root, *, window_factory=None, canvas_factory=None,
-                 style_api=None, platform_name=None):
+                 style_api=None, platform_name=None, control_panel=None):
         self.root = root
+        self.control_panel = root if control_panel is None else control_panel
         self.window = None
         self.canvas = None
         self.visible = False
@@ -1647,6 +1737,8 @@ class _ScreenSurface:
         try:
             window.withdraw()
             window.overrideredirect(True)
+            # Do not make this transient(panel): an owned Windows popup must
+            # stay above its owner, preventing the control panel from winning.
             window.attributes("-topmost", True)
             window.geometry(f"{bounds.width}x{bounds.height}+{bounds.left}+{bounds.top}")
             background = "black" if input_surface else TRANSPARENT_COLOR
@@ -1677,6 +1769,8 @@ class _ScreenSurface:
             api = self._api()
             api.configure(self.window.winfo_id(), click_through=not input_surface)
             api.raise_without_activation(self.window.winfo_id())
+            keep_control_panel_above(self.control_panel, style_api=api,
+                                     platform_name=self._platform_name)
             self.visible = True
         except Exception:
             # A failed native update must not strand a nearly invisible mouse
@@ -1862,27 +1956,53 @@ class InputSurface(_ScreenSurface):
         # Do not use canvas-local x/y or Tk scaling: coordinates are screen pixels.
         return _screen_xy(event.x_root, event.y_root)
 
+    def _over_panel(self, point):
+        # The native z-order normally routes these directly to the panel. This
+        # also rejects queued events or an existing mouse grab after it moves.
+        api = self._api()
+        panel = self.control_panel.winfo_id()
+        if not api.visible(panel) or api.minimized(panel):
+            return False
+        left, top, width, height = control_panel_bounds(
+            self.control_panel, style_api=api, platform_name=self._platform_name)
+        return left <= point[0] < left + width and top <= point[1] < top + height
+
+    def _cancel_drag_over_panel(self):
+        was_dragging, self._dragging = self._dragging, False
+        if was_dragging and self._cancel_callback:
+            self._cancel_callback()
+
     def _press(self, event):
         point = self._event_xy(event)
-        if self.visible and self.bounds.contains(*point):
+        if self.visible and self.bounds.contains(*point) and not self._over_panel(point):
             self._dragging = True
             self._press_callback(*point)
         return "break"
 
     def _move(self, event):
         if self.visible and self._dragging:
-            self._move_callback(*self._event_xy(event))
+            point = self._event_xy(event)
+            if self._over_panel(point):
+                self._cancel_drag_over_panel()
+            else:
+                self._move_callback(*point)
         return "break"
 
     def _release(self, event):
         was_dragging, self._dragging = self._dragging, False
         if self.visible and was_dragging:
-            self._release_callback(*self._event_xy(event))
+            point = self._event_xy(event)
+            if self._over_panel(point):
+                if self._cancel_callback:
+                    self._cancel_callback()
+            else:
+                self._release_callback(*point)
         return "break"
 
     def _right(self, event):
         point = self._event_xy(event)
-        if self.visible and self.bounds.contains(*point) and self._right_callback:
+        if (self.visible and self.bounds.contains(*point) and self._right_callback
+                and not self._over_panel(point)):
             self._right_callback(*point)
         return "break"
 
@@ -2000,69 +2120,138 @@ def verify_screen_overlay(root) -> dict:
         raise OverlayError("Native overlay verification requires Windows.")
     api = _OverlayWindowsAPI()
     width, height = api.primary_size()
-    if width < 240 or height < 240:
+    if width < 360 or height < 300:
         raise OverlayError("The Windows smoke-test display is too small.")
+    # Keep the actual control panel visible throughout the probe. Choose an
+    # unused corner for our synthetic target/panel rather than hiding the root.
+    occupied = (control_panel_bounds(root, style_api=api)
+                if api.visible(root.winfo_id()) and not api.minimized(root.winfo_id()) else None)
+    position = None
+    for left, top in ((width - 340, 20), (width - 340, height - 280),
+                      (20, height - 280), (20, 20)):
+        if occupied is not None:
+            ox, oy, ow, oh = occupied
+            if left < ox + ow and left + 320 > ox and top < oy + oh and top + 260 > oy:
+                continue
+        position = (left, top)
+        break
+    if position is None:
+        raise OverlayError("No free display area remains for the visible-panel overlay smoke test.")
+    left, top = position
     target = tk.Toplevel(root)
-    overlay = input_surface = None
+    panel = overlay = input_surface = None
     events = []
     try:
         target.withdraw()
         target.overrideredirect(True)
         target.attributes("-topmost", True)
-        target.geometry("160x160+40+40")
+        target.geometry(f"320x260+{left}+{top}")
         target.configure(bg="#445566")
         target.state("normal")
         target.update_idletasks()
         api.raise_without_activation(target.winfo_id())
         root.update()
         target_handle = api.root_handle(target.winfo_id())
-        geometry = CaptureGeometry(60, 60, 100, 100)
-        mask = np.zeros((100, 100), dtype=bool)
-        mask[20:80, 20:80] = True
-        mask[40:60, 40:60] = False
+        geometry = CaptureGeometry(left + 20, top + 20, 280, 220)
+        panel = tk.Toplevel(root)
+        panel.withdraw()
+        panel.title("SARU panel smoke test")
+        panel.geometry(f"100x70+{left + 140}+{top + 70}")
+        button = tk.Button(panel, text="Terminate", command=lambda: events.append("terminate"))
+        button.pack(fill="both", expand=True, padx=4, pady=4)
+        panel.state("normal")
+        panel.update_idletasks()
+        keep_control_panel_above(panel, style_api=api)
+        root.update()
+        panel_handle = api.root_handle(panel.winfo_id())
+
+        def panel_points():
+            outer = control_panel_bounds(panel, style_api=api)
+            button_center = (button.winfo_rootx() + button.winfo_width() // 2,
+                             button.winfo_rooty() + button.winfo_height() // 2)
+            caption = (outer[0] + 12, outer[1] + 10)
+            if not geometry.contains(*button_center) or not geometry.contains(*caption):
+                raise OverlayError("The synthetic panel does not overlap the input test region.")
+            return button_center, caption
+
+        def check_panel_above(*surfaces):
+            if not api.visible(panel.winfo_id()) or api.minimized(panel.winfo_id()):
+                raise OverlayError("The control panel disappeared while a screen surface was shown.")
+            for surface in surfaces:
+                if not api.is_above(panel.winfo_id(), surface.window.winfo_id()):
+                    raise OverlayError("A screen surface covers the control panel.")
+            if any(api.window_at(*point) != panel_handle for point in panel_points()):
+                raise OverlayError("A screen surface intercepts the panel's button or caption.")
+
+        mask = np.zeros((geometry.height, geometry.width), dtype=bool)
+        mask[25:180, 25:220] = True
+        mask[55:80, 45:65] = False
         candidate = SimpleNamespace(id="synthetic-mask", mask=mask)
-        overlay = ScreenOverlay(root, style_api=api)
+        overlay = ScreenOverlay(root, style_api=api, control_panel=panel)
         overlay.draw_masks([candidate], geometry, {candidate.id})
-        overlay.draw_trace([(70, 70), (150, 70)])
+        overlay.draw_trace([(left + 40, top + 35), (left + 100, top + 35)])
+        foreground = api.foreground()
         overlay.show()
         root.update()
+        check_panel_above(overlay)
         styles = api.styles(overlay.window.winfo_id())
         required = api.WS_EX_LAYERED | api.WS_EX_TRANSPARENT | api.WS_EX_NOACTIVATE
         if styles & required != required:
             raise OverlayError("The visual overlay lacks its native passive styles.")
         # Include a rendered red line, a rendered green mask edge, and a hole.
-        points = [(100, 70), (80, 100), (110, 110)]
+        points = [(left + 80, top + 35), (left + 45, top + 80),
+                  (left + 74, top + 88)]
         if any(api.window_at(*point) != target_handle for point in points):
             raise OverlayError("A visual annotation intercepted input intended for the target.")
         record_input = lambda x, y: events.append((x, y))
         input_surface = InputSurface(root, geometry, record_input,
-                                     record_input, record_input, style_api=api)
+                                     record_input, record_input, style_api=api,
+                                     control_panel=panel)
         input_surface.show()
         overlay.show()  # Put visible annotations above the input catcher too.
         root.update()
+        check_panel_above(overlay, input_surface)
         input_handle = api.root_handle(input_surface.window.winfo_id())
         if any(api.window_at(*point) != input_handle for point in points):
             raise OverlayError("The ROI input surface does not catch mask-interior input.")
         input_style = api.styles(input_surface.window.winfo_id())
         if input_style & api.WS_EX_TRANSPARENT or not input_style & api.WS_EX_NOACTIVATE:
             raise OverlayError("The ROI input surface has incorrect native window styles.")
-        if api.window_at(45, 45) != target_handle:
+        if api.window_at(left + 5, top + 5) != target_handle:
             raise OverlayError("The ROI input surface extends beyond its selected bounds.")
+        original_panel_bounds = control_panel_bounds(panel, style_api=api)
+        panel.geometry(f"100x70+{left + 160}+{top + 85}")
+        root.update()
+        input_surface.show()
+        overlay.show()
+        root.update()
+        check_panel_above(overlay, input_surface)
+        if original_panel_bounds == control_panel_bounds(panel, style_api=api):
+            raise OverlayError("The synthetic control panel did not move during verification.")
+        if api.foreground() != foreground:
+            raise OverlayError("Showing a screen surface activated a window unexpectedly.")
         input_surface.hide()
         overlay.hide()
         root.update()
+        check_panel_above()
         if any(api.window_at(*point) != target_handle for point in points):
             raise OverlayError("Hiding the screen surfaces did not restore the target window.")
         if events:
             raise OverlayError("Unexpected input arrived during the no-input overlay smoke test.")
         return {"annotation_hit_transparent": True, "roi_input_intercepts": True,
                 "outside_roi_passes": True, "hidden_restores_target": True,
+                "panel_visible_during_overlay": True, "panel_above_surfaces": True,
+                "panel_button_and_caption_hit_testable": True,
+                "panel_move_supported": True, "panel_visible_after_hide": True,
+                "stacking_does_not_activate": True,
                 "desktop_events_sent": 0, "global_listeners_started": 0}
     finally:
         if input_surface is not None:
             input_surface.close()
         if overlay is not None:
             overlay.close()
+        if panel is not None:
+            panel.destroy()
         target.destroy()
 
 
@@ -2136,6 +2325,15 @@ def screen_background_changed(before, after, background):
     return float(np.mean(difference[background] > 12))
 
 
+def screen_region_overlaps_panel(region, bounds):
+    """Check the visible panel's outer rectangle without touching Tk."""
+    if bounds is None:
+        return False
+    left, top, width, height = bounds
+    return (region.left < left + width and left < region.left + region.width
+            and region.top < top + height and top < region.top + region.height)
+
+
 class ScreenPickerApp:
     """Default screen UI. ``mode`` is str; ``disabled`` is a Tk BooleanVar.
 
@@ -2162,7 +2360,8 @@ class ScreenPickerApp:
         self.closed = False
         self.scheduled = set()
         self.transition = False
-        self.hidden = False
+        self._fit_after = None
+        self._fitting = False
         self.job_kind = None
         self.active_token = None
         self.paused = False
@@ -2171,7 +2370,6 @@ class ScreenPickerApp:
         self.trace_dirty = False
         self.drawing = False
         self.released = False
-        self.manual_baseline = None
         self.manual_geometry = None
         self.panel_bounds = None
         self.geometry = self.target = self.rgb = self.reference = None
@@ -2207,34 +2405,47 @@ class ScreenPickerApp:
     def _build_ui(self, checkpoint_path):
         tk, ttk, root = self.tk, self.ttk, self.root
         root.title("SARU PICKER")
-        root.geometry("420x320")
         root.resizable(False, False)
         root.attributes("-topmost", True)
-        tk.Label(root, text="Mode", font=("Arial", 10)).pack(pady=5)
+        scale = max(1.0, float(root.tk.call("tk", "scaling")) / (96 / 72))
+        self._panel_minimum = (round(420 * scale), round(320 * scale))
+        wrap = round(395 * scale)
+        # Reserve the footer first. Its button must never receive the few
+        # leftover pixels of a fixed-height pack layout.
+        self.panel_footer = tk.Frame(root)
+        self.panel_footer.pack(side="bottom", fill="x")
+        self.terminate_button = tk.Button(self.panel_footer, text="terminate", width=10,
+                                         font=("Arial", 10), command=self.close)
+        self.terminate_button.pack(pady=10)
+        self.panel_content = tk.Frame(root)
+        self.panel_content.pack(side="top", fill="both", expand=True)
+        content = self.panel_content
+        tk.Label(content, text="Mode", font=("Arial", 10)).pack(pady=5)
         self.mode_var = tk.StringVar(value="manual")
-        modes = tk.Frame(root)
+        modes = tk.Frame(content)
         modes.pack(pady=5)
         for mode in ("manual", "semi-auto", "auto"):
             tk.Radiobutton(modes, text=mode, value=mode, variable=self.mode_var,
                            indicatoron=False, width=10, font=("Arial", 10),
                            command=lambda value=mode: self.set_mode(value)).pack(side="left", padx=5)
         self.spacing = tk.IntVar(value=13)
-        tk.Scale(root, from_=5, to=25, orient="horizontal", label="Particle spacing",
+        tk.Scale(content, from_=5, to=25, orient="horizontal", label="Particle spacing",
                  length=150, variable=self.spacing).pack(padx=10, pady=10)
         self.disabled = tk.BooleanVar(value=True)
-        tk.Checkbutton(root, text="Disable Picking", variable=self.disabled,
+        tk.Checkbutton(content, text="Disable Picking", variable=self.disabled,
                        command=self.disabled_changed).pack(pady=5)
         self.status = tk.StringVar(value="Manual Mode: Hold left mouse button to draw a shape.")
-        tk.Label(root, textvariable=self.status, font=("Arial", 8), wraplength=395,
-                 height=3).pack(pady=5)
-        self.model_controls = ttk.Frame(root, padding=(12, 0, 12, 0))
+        self.status_label = tk.Label(content, textvariable=self.status,
+                                    font=("Arial", 8), wraplength=wrap)
+        self.status_label.pack(padx=10, pady=5)
+        self.model_controls = ttk.Frame(content, padding=(12, 0, 12, 0))
         row = ttk.Frame(self.model_controls)
         row.pack(fill="x")
         ttk.Button(row, text="Select screen area", command=self.select_region).pack(side="left")
         ttk.Button(row, text="Detect", command=self.detect).pack(side="left", padx=5)
         ttk.Button(row, text="Advanced…", command=self.open_advanced).pack(side="right")
         self.region_label = tk.StringVar(value="Select the micrograph area on the screen.")
-        ttk.Label(self.model_controls, textvariable=self.region_label, wraplength=390).pack(anchor="w", pady=4)
+        ttk.Label(self.model_controls, textvariable=self.region_label, wraplength=wrap).pack(anchor="w", pady=4)
         self.semi_controls = ttk.Frame(self.model_controls)
         ttk.Button(self.semi_controls, text="Box prompt", command=self.box_prompt).pack(side="left")
         ttk.Button(self.semi_controls, text="Next alternative", command=self.next_alternative).pack(side="left", padx=5)
@@ -2245,15 +2456,40 @@ class ScreenPickerApp:
         ttk.Label(self.auto_controls, text="Wait (s)").pack(side="left")
         ttk.Spinbox(self.auto_controls, from_=1, to=60, textvariable=self.wait_seconds, width=4).pack(side="left", padx=3)
         ttk.Button(self.auto_controls, text="Start auto", command=self.start_auto).pack(side="right")
-        self.model_note = ttk.Label(self.model_controls, wraplength=390)
+        self.model_note = ttk.Label(self.model_controls, wraplength=wrap)
         self.model_note.pack(anchor="w", pady=5)
-        self.terminate_button = tk.Button(root, text="terminate", width=10, font=("Arial", 10), command=self.close)
-        self.terminate_button.pack(pady=10)
         self.checkpoint = tk.StringVar(value=str(checkpoint_path))
         self.model_type = tk.StringVar(value=getattr(self.args, "model_type", "vit_b"))
         self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
         self.grid_side = tk.IntVar(value=8)
         self.click_delay = tk.DoubleVar(value=.08)
+        self.status.trace_add("write", self._queue_panel_fit)
+        self.region_label.trace_add("write", self._queue_panel_fit)
+        self.fit_panel()
+
+    def _queue_panel_fit(self, *args):
+        if not self.closed and self._fit_after is None:
+            self._fit_after = self.root.after_idle(self.fit_panel)
+
+    def fit_panel(self):
+        """Fit actual widget requests, including scaled fonts and long status."""
+        if self.closed or self._fitting:
+            return
+        if self._fit_after is not None:
+            self.root.after_cancel(self._fit_after)
+            self._fit_after = None
+        self._fitting = True
+        try:
+            self.root.update_idletasks()
+            width = max(self._panel_minimum[0], self.root.winfo_reqwidth())
+            height = max(self._panel_minimum[1], self.root.winfo_reqheight())
+            self.root.minsize(width, height)
+            if (self.root.winfo_width(), self.root.winfo_height()) != (width, height):
+                self.root.geometry(f"{width}x{height}")
+                self.root.update_idletasks()
+            self._remember_panel()
+        finally:
+            self._fitting = False
 
     def ensure_overlay(self):
         if self.overlay is None:
@@ -2261,13 +2497,22 @@ class ScreenPickerApp:
         return self.overlay
 
     def _remember_panel(self):
-        if self.hidden or self.closed:
+        if self.closed:
             return
         try:
-            self.panel_bounds = (self.root.winfo_rootx(), self.root.winfo_rooty(),
-                                 self.root.winfo_width(), self.root.winfo_height())
+            self.panel_bounds = control_panel_bounds(self.root)
         except self.tk.TclError:
             pass
+
+    def _check_panel_clear(self, region):
+        if screen_region_overlaps_panel(region, self.panel_bounds):
+            raise ValueError("Move the SARU panel outside the selected micrograph area, then try again.")
+
+    def _capture_region(self, region):
+        # panel_bounds is an immutable snapshot updated on the Tk thread.
+        # Workers can reject occlusion without accessing any Tk widget.
+        self._check_panel_clear(region)
+        return self.desktop.screenshot(region)
 
     def _in_panel(self, x, y):
         if self.panel_bounds is None:
@@ -2329,25 +2574,21 @@ class ScreenPickerApp:
             self.input_surface = None
         self.input_kind, self.input_start = None, None
 
-    def _hide_all(self, *, keep_mouse=False):
-        if not keep_mouse:
-            self._gate_manual()
+    def _hide_overlays(self):
+        """Clear temporary screen layers; the controls always remain visible."""
+        self._gate_manual()
         self._remember_panel()
         self._close_input()
         if self.overlay is not None:
             self.overlay.hide()
-        if self.advanced is not None:
-            self.advanced.withdraw()
-        self.hidden = True
-        self.root.withdraw()
+        self._show_panel()
 
     def _show_panel(self):
-        self.hidden = False
-        # Unlike deiconify(), wm state does not request foreground activation
-        # on Windows. A restored panel must not steal focus during a stroke.
-        self.root.state("normal")
+        # Raising is nonactivating: the browser keeps keyboard focus while the
+        # panel remains visible, interactive and above our full-screen layers.
+        keep_control_panel_above(self.root)
         if self.advanced is not None:
-            self.advanced.state("normal")
+            keep_control_panel_above(self.advanced)
 
     def _idle(self):
         if self.advanced is not None:
@@ -2387,11 +2628,9 @@ class ScreenPickerApp:
         self.auto_controls.pack_forget()
         if mode == "manual":
             self.model_controls.pack_forget()
-            self.root.geometry("420x320")
             self.status.set("Manual Mode: Hold left mouse button to draw a shape.")
         else:
-            self.model_controls.pack(fill="x", before=self.terminate_button)
-            self.root.geometry("420x495")
+            self.model_controls.pack(fill="x")
             if mode == "semi-auto":
                 self.semi_controls.pack(fill="x", before=self.model_note, pady=3)
                 self.model_note.configure(text="Green outlines are proposals. Click an intended region to pick it.")
@@ -2399,6 +2638,7 @@ class ScreenPickerApp:
                 self.auto_controls.pack(fill="x", before=self.model_note, pady=3)
                 self.model_note.configure(text="Auto picks all proposals. Test semi-auto first. Space pauses; Escape stops.")
             self.status.set("Select the screen area, then detect or start auto.")
+        self.fit_panel()
 
     def disabled_changed(self):
         if self.disabled.get():
@@ -2428,33 +2668,21 @@ class ScreenPickerApp:
                 target = self.desktop.target_at(x, y)
                 if self.desktop.is_own_window(target):
                     return
-                if self.manual_window is not None and target != self.manual_window:
-                    return
-                if self.desktop.capture_target() != target:
-                    return
+                # A stroke selects its own target. The initial physical click
+                # may still be activating the browser when the hook fires.
                 self.manual_window = target
                 width, height = self.desktop.size()
                 self.manual_geometry = CaptureGeometry(0, 0, width, height)
                 self.trace, self.drawing, self.released = [(x, y)], True, False
                 self.trace_dirty = True
-                self.manual_baseline = None
-                self._hide_all(keep_mouse=True)
-                # A clean baseline is captured before any red overlay is shown.
-                self.transition = True
-                def capture_baseline():
-                    self.transition = False
-                    def work(token):
-                        token.wait_until_ready()
-                        self.desktop.ensure_target(target)
-                        return self.desktop.screenshot()
-                    self._submit("manual baseline", work)
-                self._schedule(70, capture_baseline)
+                self.ensure_overlay().draw_trace(self.trace)
+                self.overlay.show()
+                self._show_panel()
             except Exception as exc:
                 self._error(exc)
         elif self.drawing and kind in {"move", "release"}:
             try:
-                if (self._in_panel(x, y) or not self.manual_geometry.contains(x, y)
-                        or not self.desktop.is_target_at(x, y, self.manual_window)):
+                if self._in_panel(x, y) or not self.manual_geometry.contains(x, y):
                     self._cancel_trace()
                     return
                 if kind == "move":
@@ -2465,10 +2693,8 @@ class ScreenPickerApp:
                     self.trace_dirty = True
                 else:
                     self.released = True
-                    # Gate immediately, even if the baseline worker is pending.
                     self._gate_manual()
-                    if self.manual_baseline is not None:
-                        self._finish_manual()
+                    self._finish_manual()
             except Exception as exc:
                 self._error(exc)
 
@@ -2478,7 +2704,7 @@ class ScreenPickerApp:
         self.transition = False
         self.trace, self.drawing, self.released = [], False, False
         self.trace_dirty = False
-        self.manual_baseline = None
+        self.manual_window = None
         if self.overlay is not None:
             self.overlay.clear()
             self.overlay.hide()
@@ -2487,13 +2713,14 @@ class ScreenPickerApp:
 
     def _finish_manual(self):
         self._gate_manual()
-        points, reference = tuple(self.trace), self.manual_baseline
+        points = tuple(self.trace)
         target, spacing = self.manual_window, int(self.spacing.get())
         self._live_ready()
         delay = .10  # Preserve the original PyAutoGUI default pause in manual mode.
         self.trace, self.drawing, self.released = [], False, False
         self.trace_dirty = False
-        self.manual_baseline = None
+        self.manual_window = None
+        self._hide_overlays()
         if len(points) < 3:
             self._show_panel()
             if self.overlay is not None:
@@ -2501,34 +2728,22 @@ class ScreenPickerApp:
                 self.overlay.hide()
             self._sync_manual()
             return
-        self._hide_all()
-        self.transition = True
-        def begin():
-            self.transition = False
-            def work(token):
-                picks = legacy_contour_points(points, spacing, cancel=lambda: token.cancelled)
-                if not len(picks):
-                    return {"count": 0}
-                vertices = np.asarray(points, dtype=np.int64)
-                left, top = vertices.min(axis=0)
-                right, bottom = vertices.max(axis=0)
-                region = CaptureGeometry(int(left), int(top), int(right-left+1), int(bottom-top+1))
-                self.desktop.focus_target(target)
-                token.sleep(.10)
-                if self.desktop.window_under_roi(region) != target:
-                    raise RuntimeError("The contour is covered by another window.")
-                before = reference[region.top:region.top+region.height, region.left:region.left+region.width]
-                current = self.desktop.screenshot(region)
-                if screen_changed_fraction(before, current) > .03:
-                    raise RuntimeError("The micrograph moved while drawing. Draw the contour again.")
-                def click(x, y):
-                    self.desktop.ensure_target(target)
-                    self.desktop.click(x, y)
-                count = play_clicks(picks, click, region, token, delay=delay, max_clicks=10000,
-                                    progress=lambda done, total: self.events.put(("progress", token.generation, done, total)))
-                return {"count": count}
-            self._submit("manual picks", work)
-        self._schedule(70, begin)
+        def work(token):
+            picks = legacy_contour_points(points, spacing, cancel=lambda: token.cancelled)
+            if not len(picks):
+                return {"count": 0}
+            vertices = np.asarray(points, dtype=np.int64)
+            left, top = vertices.min(axis=0)
+            right, bottom = vertices.max(axis=0)
+            region = CaptureGeometry(int(left), int(top), int(right-left+1), int(bottom-top+1))
+            token.wait_until_ready()
+            # The physical stroke already selected the browser. Never raise
+            # it over the persistent panel or steal focus from another app.
+            self.desktop.bind_target(target)
+            count = play_clicks(picks, self.desktop.click, region, token, delay=delay, max_clicks=10000,
+                                progress=lambda done, total: self.events.put(("progress", token.generation, done, total)))
+            return {"count": count}
+        self._submit("manual picks", work)
 
     def select_region(self):
         try:
@@ -2536,7 +2751,7 @@ class ScreenPickerApp:
             if self.mode == "manual":
                 return
             width, height = self.desktop.size()
-            self._hide_all()
+            self._hide_overlays()
             bounds = CaptureGeometry(0, 0, width, height)
             self.input_kind = "region"
             self.ensure_overlay().clear()
@@ -2549,7 +2764,7 @@ class ScreenPickerApp:
             self._error(exc)
 
     def _input_press(self, x, y):
-        self.input_start = (x, y)
+        self.input_start = None if self._in_panel(x, y) else (x, y)
 
     def _input_move(self, x, y):
         if self.input_start is None or self.input_kind == "masks":
@@ -2564,6 +2779,9 @@ class ScreenPickerApp:
 
     def _input_release(self, x, y):
         if self.input_start is None:
+            return
+        if self._in_panel(x, y):
+            self.input_start = None
             return
         start, kind = self.input_start, self.input_kind
         if kind == "masks":
@@ -2583,7 +2801,7 @@ class ScreenPickerApp:
                               max(bounds.top, min(bounds.top+bounds.height-1, int(y)))))
         if right-left < (4 if kind == "box" else 32) or bottom-top < (4 if kind == "box" else 32):
             return
-        self._hide_all()
+        self._hide_overlays()
         if kind == "box":
             box = (left-bounds.left, top-bounds.top, right-bounds.left, bottom-bounds.top)
             self._start_detection(box=box)
@@ -2592,6 +2810,8 @@ class ScreenPickerApp:
         self.transition = True
         def complete():
             self.transition = False
+            self._remember_panel()
+            self._check_panel_clear(region)
             target = self.desktop.window_under_roi(region)
             self.geometry, self.target = region, target
             self.rgb = self.reference = None
@@ -2625,7 +2845,8 @@ class ScreenPickerApp:
         if self.geometry is None or self.target is None:
             raise ValueError("Select the micrograph screen area first.")
         config, geometry, target = self._model_config(), self.geometry, self.target
-        self._hide_all()
+        self._hide_overlays()
+        self._check_panel_clear(geometry)
         self.transition = True
         def begin():
             self.transition = False
@@ -2634,7 +2855,7 @@ class ScreenPickerApp:
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the selected screen area.")
-                rgb = self.desktop.screenshot(geometry)
+                rgb = self._capture_region(geometry)
                 if expected is not None and screen_changed_fraction(expected, rgb) > .01:
                     raise RuntimeError("The micrograph changed between automatic frames. Auto stopped.")
                 model = self._get_recognizer(config)
@@ -2642,7 +2863,7 @@ class ScreenPickerApp:
                               else model.automatic(rgb, cancel=lambda: token.cancelled))
                 token.wait_until_ready()
                 self.desktop.ensure_target(target)
-                if screen_changed_fraction(rgb, self.desktop.screenshot(geometry)) > .03:
+                if screen_changed_fraction(rgb, self._capture_region(geometry)) > .03:
                     raise RuntimeError("The micrograph moved during recognition. Detect again.")
                 return {"rgb": rgb, "candidates": candidates, "auto": auto, "prompt": box is not None}
             self._submit("recognition", work)
@@ -2663,9 +2884,7 @@ class ScreenPickerApp:
                                               self._input_move, self._input_release,
                                               on_cancel=self.stop)
             self.input_surface.show()
-        self.root.lift()
-        if self.advanced is not None:
-            self.advanced.lift()
+        self._show_panel()
 
     def _semi_click(self, x, y):
         try:
@@ -2682,7 +2901,8 @@ class ScreenPickerApp:
             self._idle()
             if self.mode != "semi-auto" or self.geometry is None:
                 raise ValueError("In semi-auto mode, select the screen area first.")
-            self._hide_all()
+            self._hide_overlays()
+            self._check_panel_clear(self.geometry)
             self.input_kind = "box"
             self.ensure_overlay().clear()
             self.overlay.draw_region(self.geometry)
@@ -2708,7 +2928,8 @@ class ScreenPickerApp:
             raise ValueError("Detect the selected screen area before picking.")
         candidates, picked = tuple(candidates), set(self.picked_points)
         spacing, frame_id = int(self.spacing.get()), self.frame_id
-        self._hide_all()
+        self._hide_overlays()
+        self._check_panel_clear(geometry)
         self.transition = True
         def begin():
             self.transition = False
@@ -2721,7 +2942,7 @@ class ScreenPickerApp:
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the micrograph.")
-                if screen_changed_fraction(reference, self.desktop.screenshot(geometry)) > .03:
+                if screen_changed_fraction(reference, self._capture_region(geometry)) > .03:
                     raise RuntimeError("The micrograph changed before picking. Detect again.")
                 background = screen_background_guard(candidates, geometry, spacing)
                 next_check = time.monotonic() + .75
@@ -2729,7 +2950,7 @@ class ScreenPickerApp:
                     nonlocal next_check
                     self.desktop.ensure_target(target)
                     if background is not None and time.monotonic() >= next_check:
-                        current = self.desktop.screenshot(geometry)
+                        current = self._capture_region(geometry)
                         if screen_background_changed(reference, current, background) > .03:
                             raise RuntimeError("The micrograph changed during picking. Detect again.")
                         next_check = time.monotonic() + .75
@@ -2741,7 +2962,7 @@ class ScreenPickerApp:
                                     max_clicks=10000, progress=progress)
                 token.sleep(.12)
                 self.desktop.ensure_target(target)
-                after = self.desktop.screenshot(geometry)
+                after = self._capture_region(geometry)
                 if background is not None and screen_background_changed(reference, after, background) > .03:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
                 return {"count": count, "ids": {c.id for c in candidates}, "reference": after,
@@ -2767,15 +2988,16 @@ class ScreenPickerApp:
     def _next_frame(self):
         geometry, target = self.geometry, self.target
         wait, history = float(self.wait_seconds.get()), tuple(self.auto_history)
-        self._hide_all()
+        self._hide_overlays()
+        self._check_panel_clear(geometry)
         def work(token):
             self.desktop.focus_target(target)
             token.wait_until_ready()
             self.desktop.press_next("down")
             token.sleep(wait)
-            first = self.desktop.screenshot(geometry)
+            first = self._capture_region(geometry)
             token.sleep(.35)
-            second = self.desktop.screenshot(geometry)
+            second = self._capture_region(geometry)
             if screen_changed_fraction(first, second) > .01:
                 raise RuntimeError("The next micrograph is still loading. Increase the wait time.")
             if any(screen_changed_fraction(previous, second) < .02 for previous in history):
@@ -2800,18 +3022,7 @@ class ScreenPickerApp:
         self.status.set(f"{kind.capitalize()}… Escape stops.")
 
     def _result(self, kind, value):
-        if kind == "manual baseline":
-            if not self.drawing:
-                return
-            self.manual_baseline = value
-            if self.released:
-                self._finish_manual()
-            else:
-                self._show_panel()
-                self.ensure_overlay().draw_trace(self.trace)
-                self.overlay.show()
-                self.trace_dirty = False
-        elif kind == "manual picks":
+        if kind == "manual picks":
             if self.overlay is not None:
                 self.overlay.clear()
                 self.overlay.hide()
@@ -2883,7 +3094,7 @@ class ScreenPickerApp:
         self.transition = False
         self.auto_remaining, self.paused = 0, False
         self.drawing = self.released = False
-        self.trace, self.manual_baseline, self.manual_window = [], None, None
+        self.trace, self.manual_window = [], None
         self.trace_dirty = False
         self._close_input()
         if self.overlay is not None:
@@ -2931,7 +3142,7 @@ class ScreenPickerApp:
             except Exception as exc:
                 SCREEN_LOG.exception("Screen result handling failed")
                 self._error(exc)
-        if self.drawing and self.manual_baseline is not None and self.trace_dirty:
+        if self.drawing and self.trace_dirty:
             try:
                 self.ensure_overlay().draw_trace(self.trace)
                 if not self.overlay.visible:
@@ -2992,6 +3203,9 @@ class ScreenPickerApp:
         if self.closed:
             return
         self.closed = True
+        if self._fit_after is not None:
+            self.root.after_cancel(self._fit_after)
+            self._fit_after = None
         self._gate_manual()
         self.runner.shutdown(wait=False)
         for identifier in tuple(self.scheduled):
@@ -3034,7 +3248,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -3156,43 +3370,162 @@ def _smoke_torchvision() -> dict[str, Any]:
             "native_nms": True}
 
 
+def _smoke_widget_layout(window, widget, description: str) -> dict[str, Any]:
+    """Reject a managed control that is hidden, shrunk, or ancestor-clipped.
+
+    Tk's packer can shrink a button to only a few visible pixels while its
+    bottom edge still fits the root. Comparing only the two bottom edges does
+    not establish that the label or complete clickable area is available.
+    """
+    size = [int(widget.winfo_width()), int(widget.winfo_height())]
+    requested = [int(widget.winfo_reqwidth()), int(widget.winfo_reqheight())]
+    if not widget.winfo_viewable():
+        raise RuntimeError(f"{description} is not visible in the floating panel.")
+    if min(size) <= 0 or any(actual < needed for actual, needed in zip(size, requested)):
+        raise RuntimeError(
+            f"{description} is clipped below its requested size: actual {size}, requested {requested}.")
+    left, top = int(widget.winfo_rootx()), int(widget.winfo_rooty())
+    right, bottom = left + size[0], top + size[1]
+    parent = widget.master
+    while parent is not None:
+        parent_left, parent_top = int(parent.winfo_rootx()), int(parent.winfo_rooty())
+        parent_right = parent_left + int(parent.winfo_width())
+        parent_bottom = parent_top + int(parent.winfo_height())
+        if (left < parent_left or top < parent_top or right > parent_right or bottom > parent_bottom):
+            raise RuntimeError(f"{description} extends outside its parent and is not fully usable.")
+        if parent is window:
+            break
+        parent = parent.master
+    if parent is not window:
+        raise RuntimeError(f"{description} is not attached to the floating panel.")
+    return {"actual": size, "requested": requested,
+            "panel_rect": [left-int(window.winfo_rootx()), top-int(window.winfo_rooty()), *size],
+            "viewable": True, "full_requested_size": True}
+
+
+def _smoke_terminate_text(window, button) -> dict[str, Any]:
+    """Check the full text line, including ascent/descent and button padding."""
+    tk_font = importlib.import_module("tkinter.font")
+    font = tk_font.Font(root=window, font=button.cget("font"))
+    lines = str(button.cget("text")).splitlines() or [""]
+    text_width = max(int(font.measure(line)) for line in lines)
+    ascent, descent = int(font.metrics("ascent")), int(font.metrics("descent"))
+    line_height = int(font.metrics("linespace"))
+    border = sum(int(window.winfo_pixels(button.cget(name)))
+                 for name in ("borderwidth", "highlightthickness"))
+    pad_x, pad_y = (int(window.winfo_pixels(button.cget(name))) for name in ("padx", "pady"))
+    usable = [int(button.winfo_width())-2*(border+pad_x),
+              int(button.winfo_height())-2*(border+pad_y)]
+    text_height = line_height * len(lines)
+    if text_width > usable[0] or text_height > usable[1]:
+        raise RuntimeError(
+            f"Terminate's text or font baseline is clipped: usable {usable}, text {[text_width, text_height]}.")
+    # The actual button retains its default centered anchor. This derived
+    # baseline records the complete font line that must fit the usable area.
+    baseline = border + pad_y + (usable[1]-text_height)//2 + ascent
+    if baseline + (len(lines)-1)*line_height + descent > int(button.winfo_height())-border-pad_y:
+        raise RuntimeError("Terminate's text descender falls outside its usable button area.")
+    return {"text_size": [text_width, text_height], "usable_text_size": usable,
+            "font_metrics": {"ascent": ascent, "descent": descent, "linespace": line_height},
+            "centered_first_baseline_from_top": baseline, "full_font_line_fits": True}
+
+
+def _smoke_panel_layout(picker, mode: str, status_case: str) -> dict[str, Any]:
+    window = picker.root
+    picker.fit_panel()
+    window.update_idletasks()
+    if window.state() != "normal" or not window.winfo_viewable():
+        raise RuntimeError(f"The {mode} floating control panel is not visible.")
+    if not window.tk.getboolean(window.attributes("-topmost")):
+        raise RuntimeError("The floating control panel is not kept above the target application.")
+    controls = []
+
+    def inspect(parent):
+        for child in parent.winfo_children():
+            # pack_forget/grid_remove intentionally hide inactive mode groups.
+            # A managed child clipped away by pack still has a manager and must
+            # fail the visibility/size checks instead of being silently skipped.
+            if not child.winfo_manager():
+                continue
+            description = f"{mode}/{status_case} {child.winfo_class()} {child}"
+            controls.append(_smoke_widget_layout(window, child, description))
+            inspect(child)
+
+    inspect(window)
+    terminate = _smoke_widget_layout(window, picker.terminate_button, f"{mode}/{status_case} Terminate")
+    terminate["text"] = _smoke_terminate_text(window, picker.terminate_button)
+    status = _smoke_widget_layout(window, picker.status_label, f"{mode}/{status_case} status")
+    return {"panel_size": [int(window.winfo_width()), int(window.winfo_height())],
+            "panel_requested_size": [int(window.winfo_reqwidth()), int(window.winfo_reqheight())],
+            "managed_controls_checked": len(controls), "all_managed_controls_fit": True,
+            "terminate": terminate, "status": status, "viewable": True, "topmost": True}
+
+
 def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
-    # Importing desktop libraries is deliberate; no listener is started and no
-    # screenshot, mouse action, or key is sent in this packaging check.
+    # These are native Windows widgets at simulated Tk font/layout scales. The
+    # Windows monitor's DPI setting is never changed. Each fresh interpreter is
+    # scaled before widgets/fonts exist, because changing Tk scaling afterwards
+    # does not reliably resize previously constructed controls.
     enable_dpi_awareness()
     tkinter = importlib.import_module("tkinter")
-    window = tkinter.Tk()
-    picker = None
-    try:
-        window.withdraw()
-        args = argparse.Namespace(checkpoint=None, device="cpu", model_type="vit_b", image=None)
-        picker = ScreenPickerApp(window, args, log_path, resolve_checkpoint(), start_listeners=False)
-        if (picker.mode != "manual" or not picker.disabled.get()
-                or picker.hotkeys is not None or picker.mouse_observer is not None
-                or picker.overlay is not None):
-            raise RuntimeError("The compact screen application did not start in passive manual mode.")
-        panel_layouts = {}
-        for mode in ("manual", "semi-auto", "auto"):
-            if picker.mode != mode:
-                picker.set_mode(mode)
+    scale_checks = []
+    panel_layouts = {}
+    overlay_checks = None
+    tk_version = None
+    long_status = ("Recognition is running on the selected screen area.\n"
+                   "Escape stops picking; F8 pauses or resumes.\n"
+                   "Keep cryoSPARC's image position and zoom fixed.")
+    for percent in (100, 125, 150, 200):
+        window = tkinter.Tk()
+        picker = None
+        original_scaling = None
+        try:
+            window.withdraw()
+            original_scaling = float(window.tk.call("tk", "scaling"))
+            requested_dpi = 96 * percent / 100
+            window.tk.call("tk", "scaling", requested_dpi / 72)
+            actual_scaling = float(window.tk.call("tk", "scaling"))
+            args = argparse.Namespace(checkpoint=None, device="cpu", model_type="vit_b", image=None)
+            picker = ScreenPickerApp(window, args, log_path, resolve_checkpoint(), start_listeners=False)
+            if (picker.mode != "manual" or not picker.disabled.get()
+                    or picker.hotkeys is not None or picker.mouse_observer is not None
+                    or picker.overlay is not None):
+                raise RuntimeError("The compact screen application did not start in passive manual mode.")
             window.state("normal")
             window.update_idletasks()
-            width, height = window.winfo_width(), window.winfo_height()
-            button_bottom = picker.terminate_button.winfo_rooty() + picker.terminate_button.winfo_height()
-            if width != 420 or (mode == "manual" and height != 320):
-                raise RuntimeError("The original compact manual panel dimensions changed.")
-            if button_bottom > window.winfo_rooty() + height:
-                raise RuntimeError(f"The {mode} controls do not fit inside the floating panel.")
-            panel_layouts[mode] = [width, height]
-        window.withdraw()
-        window.update_idletasks()
-        overlay_checks = verify_screen_overlay(window)
-        tk_version = str(window.tk.call("info", "patchlevel"))
-    finally:
-        if picker is not None:
-            picker.close()
-        else:
-            window.destroy()
+            layouts = {}
+            for mode in ("manual", "semi-auto", "auto"):
+                if picker.mode != mode:
+                    picker.set_mode(mode)
+                window.update_idletasks()
+                initial_status = picker.status.get()
+                normal = _smoke_panel_layout(picker, mode, "default")
+                picker.status.set(long_status)
+                multiline = _smoke_panel_layout(picker, mode, "multiline_status")
+                picker._hide_overlays()
+                window.update_idletasks()
+                if (window.state() != "normal" or not window.winfo_viewable()
+                        or not window.tk.getboolean(window.attributes("-topmost"))):
+                    raise RuntimeError(f"The {mode} control panel disappeared while hiding the screen overlays.")
+                layouts[mode] = {"default": normal, "multiline_status": multiline,
+                                 "panel_persists_when_overlays_hidden": True}
+                if percent == 100:
+                    panel_layouts[mode] = normal["panel_size"]
+                picker.status.set(initial_status)
+                picker.fit_panel()
+            tk_version = str(window.tk.call("info", "patchlevel"))
+            scale_checks.append({"scale_percent": percent, "requested_dpi": requested_dpi,
+                                 "native_tk_scaling_before_test": original_scaling,
+                                 "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts})
+            if overlay_checks is None:
+                overlay_checks = verify_screen_overlay(window)
+        finally:
+            if original_scaling is not None:
+                window.tk.call("tk", "scaling", original_scaling)
+            if picker is not None:
+                picker.close()
+            else:
+                window.destroy()
     pyautogui = importlib.import_module("pyautogui")
     keyboard = importlib.import_module("pynput.keyboard")
     mouse = importlib.import_module("pynput.mouse")
@@ -3201,6 +3534,8 @@ def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
     return {"tk_version": tk_version, "desktop_modules_imported": True,
             "full_application_constructed": True, "synthetic_mask_rendered": True,
             "compact_manual_default": True, "panel_layouts": panel_layouts,
+            "layout_scaling_method": "Native Windows Tk widgets; pixels-per-point set before construction to simulate 100/125/150/200% of 96 DPI. Windows monitor scaling is unchanged.",
+            "layout_scale_checks": scale_checks,
             "screen_overlay": overlay_checks,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 

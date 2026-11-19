@@ -126,6 +126,200 @@ class ReportAndConsoleTests(unittest.TestCase):
             root.setLevel(previous_level)
 
 
+def layout_widget(parent=None, *, x=0, y=0, width=100, height=30,
+                  requested=None, visible=True, manager="pack"):
+    """Measured widget fixture; requested size can exceed its allocated space."""
+    widget = Mock()
+    widget.master = parent
+    widget._children = []
+    if parent is not None:
+        parent._children.append(widget)
+    widget.winfo_children.side_effect = lambda: list(widget._children)
+    widget.winfo_width.return_value = width
+    widget.winfo_height.return_value = height
+    widget.winfo_reqwidth.return_value = width if requested is None else requested[0]
+    widget.winfo_reqheight.return_value = height if requested is None else requested[1]
+    widget.winfo_rootx.return_value = x
+    widget.winfo_rooty.return_value = y
+    widget.winfo_viewable.return_value = visible
+    widget.winfo_manager.return_value = manager
+    widget.winfo_class.return_value = "Button"
+    return widget
+
+
+class PanelLayoutValidationTests(unittest.TestCase):
+    def test_shortened_terminate_fails_even_when_bottom_edge_fits_window(self):
+        root = layout_widget(width=420, height=320)
+        footer = layout_widget(root, x=0, y=291, width=420, height=29)
+        button = layout_widget(footer, x=155, y=311, width=110, height=9,
+                               requested=(110, 29))
+        # This is the old smoke check that passed the user's clipped layout.
+        self.assertLessEqual(button.winfo_rooty() + button.winfo_height(),
+                             root.winfo_rooty() + root.winfo_height())
+        with self.assertRaisesRegex(RuntimeError, "clipped below its requested size"):
+            app._smoke_widget_layout(root, button, "manual Terminate")
+
+    def test_full_size_button_must_also_fit_every_ancestor(self):
+        root = layout_widget(width=420, height=320)
+        footer = layout_widget(root, x=0, y=290, width=420, height=30)
+        button = layout_widget(footer, x=155, y=285, width=110, height=29)
+        with self.assertRaisesRegex(RuntimeError, "extends outside its parent"):
+            app._smoke_widget_layout(root, button, "Terminate")
+
+    def test_fully_packed_button_reports_actual_and_requested_click_area(self):
+        root = layout_widget(x=-900, y=100, width=630, height=550)
+        footer = layout_widget(root, x=-900, y=585, width=630, height=65)
+        button = layout_widget(footer, x=-670, y=595, width=170, height=45,
+                               requested=(160, 40))
+        result = app._smoke_widget_layout(root, button, "Terminate")
+        self.assertEqual(result["actual"], [170, 45])
+        self.assertEqual(result["requested"], [160, 40])
+        self.assertEqual(result["panel_rect"], [230, 495, 170, 45])
+        self.assertTrue(result["full_requested_size"])
+
+    def test_text_line_and_baseline_must_fit_button_padding(self):
+        root = layout_widget()
+        root.winfo_pixels.side_effect = int
+        button = layout_widget(root, width=120, height=34)
+        settings = {"font": "Arial 10", "text": "terminate", "borderwidth": 2,
+                    "highlightthickness": 1, "padx": 4, "pady": 2}
+        button.cget.side_effect = settings.__getitem__
+        font = Mock()
+        font.measure.return_value = 80
+        font.metrics.side_effect = {"ascent": 15, "descent": 4, "linespace": 20}.__getitem__
+        with patch.object(app.importlib, "import_module", return_value=SimpleNamespace(Font=Mock(return_value=font))):
+            result = app._smoke_terminate_text(root, button)
+            self.assertEqual(result["usable_text_size"], [106, 24])
+            self.assertEqual(result["centered_first_baseline_from_top"], 22)
+            self.assertTrue(result["full_font_line_fits"])
+            # A fixed requested widget height alone cannot validate its font.
+            button.winfo_height.return_value = 27
+            with self.assertRaisesRegex(RuntimeError, "font baseline is clipped"):
+                app._smoke_terminate_text(root, button)
+
+    def test_managed_invisible_controls_fail_but_inactive_mode_groups_are_skipped(self):
+        root = layout_widget(width=500, height=500)
+        root.state.return_value = "normal"
+        root.attributes.return_value = True
+        root.tk.getboolean.side_effect = bool
+        footer = layout_widget(root, x=0, y=440, width=500, height=60)
+        button = layout_widget(footer, x=200, y=450, width=100, height=30)
+        status = layout_widget(root, x=10, y=300, width=480, height=80)
+        inactive = layout_widget(root, manager="", visible=False)
+        layout_widget(inactive, height=1, requested=(100, 40), visible=False)
+        picker = SimpleNamespace(root=root, fit_panel=Mock(), terminate_button=button, status_label=status)
+        with patch.object(app, "_smoke_terminate_text", return_value={}):
+            result = app._smoke_panel_layout(picker, "manual", "multiline_status")
+            self.assertEqual(result["managed_controls_checked"], 3)
+            picker.fit_panel.assert_called_once()
+            # Pack-managed controls can become unmapped when siblings take all
+            # available space. Do not silently omit that failure from coverage.
+            layout_widget(root, x=0, y=400, height=1, requested=(100, 30), visible=False)
+            with self.assertRaisesRegex(RuntimeError, "not visible"):
+                app._smoke_panel_layout(picker, "manual", "multiline_status")
+
+    def test_withdrawn_or_non_topmost_panel_fails(self):
+        root = layout_widget(width=420, height=320)
+        root.state.return_value = "withdrawn"
+        picker = SimpleNamespace(root=root, fit_panel=Mock())
+        with self.assertRaisesRegex(RuntimeError, "not visible"):
+            app._smoke_panel_layout(picker, "manual", "default")
+        root.state.return_value = "normal"
+        root.attributes.return_value = False
+        root.tk.getboolean.side_effect = bool
+        with self.assertRaisesRegex(RuntimeError, "not kept above"):
+            app._smoke_panel_layout(picker, "manual", "default")
+
+
+class WindowsScaleCoverageTests(unittest.TestCase):
+    def test_native_smoke_constructs_each_scale_before_widgets_and_checks_every_mode(self):
+        windows, pickers, constructions, measured = [], [], [], []
+        original_scaling = 1.5
+
+        def make_window():
+            window = Mock()
+            window._scale, window._state = original_scaling, "normal"
+            def tk_call(*args):
+                if args[:2] == ("tk", "scaling"):
+                    if len(args) == 3:
+                        window._scale = args[2]
+                    return window._scale
+                self.assertEqual(args, ("info", "patchlevel"))
+                return "8.6.14"
+            def state(value=None):
+                if value is not None:
+                    window._state = value
+                return window._state
+            window.tk.call.side_effect = tk_call
+            window.tk.getboolean.side_effect = bool
+            window.state.side_effect = state
+            window.withdraw.side_effect = lambda: state("withdrawn")
+            window.winfo_viewable.side_effect = lambda: window._state == "normal"
+            window.attributes.return_value = True
+            windows.append(window)
+            return window
+
+        def make_picker(window, args, log_path, checkpoint, *, start_listeners):
+            self.assertFalse(start_listeners)
+            constructions.append(window._scale)
+            picker = SimpleNamespace(root=window, mode="manual", hotkeys=None,
+                                     mouse_observer=None, overlay=None, disabled=Mock(),
+                                     status=Mock(), fit_panel=Mock(), _hide_overlays=Mock(), close=Mock())
+            picker.disabled.get.return_value = True
+            picker._status = "Manual drawing is ready."
+            picker.status.get.side_effect = lambda: picker._status
+            picker.status.set.side_effect = lambda value: setattr(picker, "_status", value)
+            def set_mode(mode):
+                picker.mode = mode
+                picker._status = "Select the screen area, then detect or start auto."
+            picker.set_mode = Mock(side_effect=set_mode)
+            pickers.append(picker)
+            return picker
+
+        def measure(picker, mode, status_case):
+            measured.append((picker.root._scale, mode, status_case, picker.status.get()))
+            return {"panel_size": [round(420 * picker.root._scale), 500],
+                    "terminate": {"full_requested_size": True}}
+
+        modules = {"tkinter": SimpleNamespace(Tk=make_window),
+                   "pyautogui": SimpleNamespace(click=Mock()),
+                   "pynput.keyboard": SimpleNamespace(Key=SimpleNamespace(esc=object())),
+                   "pynput.mouse": SimpleNamespace(Button=SimpleNamespace(left=object()))}
+        def verify_overlay(window):
+            self.assertEqual(window.state(), "normal")
+            self.assertTrue(window.winfo_viewable())
+            return {"checked": True}
+        with patch.object(app.importlib, "import_module", side_effect=modules.__getitem__), \
+             patch.object(app, "enable_dpi_awareness") as dpi, \
+             patch.object(app, "resolve_checkpoint", return_value=Path("model.pth")), \
+             patch.object(app, "ScreenPickerApp", side_effect=make_picker), \
+             patch.object(app, "_smoke_panel_layout", side_effect=measure), \
+             patch.object(app, "verify_screen_overlay", side_effect=verify_overlay) as overlay:
+            result = app._smoke_windows_runtime(Path("app.log"))
+        expected_scales = [96 * percent / 100 / 72 for percent in (100, 125, 150, 200)]
+        self.assertEqual(constructions, expected_scales)
+        self.assertEqual(len(measured), 4 * 3 * 2)
+        for scale in expected_scales:
+            self.assertEqual({(mode, case) for value, mode, case, _ in measured if value == scale},
+                             {(mode, case) for mode in ("manual", "semi-auto", "auto")
+                              for case in ("default", "multiline_status")})
+        self.assertTrue(all("\n" in status for _, _, case, status in measured
+                            if case == "multiline_status"))
+        self.assertEqual([item["scale_percent"] for item in result["layout_scale_checks"]],
+                         [100, 125, 150, 200])
+        self.assertIn("monitor scaling is unchanged", result["layout_scaling_method"])
+        for window, picker in zip(windows, pickers):
+            self.assertEqual(window._scale, original_scaling)
+            self.assertEqual(window.withdraw.call_count, 1)
+            self.assertEqual(picker._hide_overlays.call_count, 3)
+            picker.close.assert_called_once()
+        dpi.assert_called_once()
+        overlay.assert_called_once_with(windows[0])
+        modules["pyautogui"].click.assert_not_called()
+        self.assertEqual(result["desktop_events_sent"], 0)
+        self.assertEqual(result["global_listeners_started"], 0)
+
+
 class SmokeAndLaunchTests(unittest.TestCase):
     def test_diagnostics_do_not_load_model_and_work_without_console(self):
         with tempfile.TemporaryDirectory() as directory:

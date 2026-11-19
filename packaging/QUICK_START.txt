@@ -1,9 +1,11 @@
-SARU Picker 2.1 — Windows CPU edition
+SARU Picker 2.1.1 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
 
 cryoSPARC remains your live image viewer. Keep it on the primary monitor.
+The control panel stays visible and above the drawing/selection overlays.
+Its size adapts to Windows text scaling so terminate remains fully visible.
 
 MANUAL — original interaction
 1. Choose manual and uncheck Disable Picking.
@@ -11,10 +13,12 @@ MANUAL — original interaction
 3. Release to fill the contour with picks. Draw the next contour when finished.
 The original spacing slider (5–25 pixels, default 13), bbox-anchored hex grid,
 zero inset and approximately 0.10-second click cadence are preserved.
-Manual mode has no screen-area selection, model or separate review step.
+Manual mode has no screenshot, screen-area selection, model or separate review
+step. A stroke starts immediately and release directly starts picking.
 
 SEMI-AUTO
-Select screen area, drag around the micrograph, then Detect. Green outlines
+Move the panel outside the intended micrograph area. Select screen area,
+drag around the micrograph, then Detect. The panel remains visible throughout. Green outlines
 appear directly over cryoSPARC. Enable picking and click inside a target
 proposal. The program waits for your mouse release, hides its overlay, then
 places the picks. Box prompt and Next alternative provide guided selection.
