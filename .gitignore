@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv*/
+.build-venv*/
+.build-cache/
+build/
+dist/
+artifacts/
+models/
+*.pth
+*.pt
+*.log
+benchmark_output/
+validation_results/
+saru_output/

@@ -1,0 +1,32 @@
+SARU Picker 2 — Windows CPU edition
+
+The application includes Python, its required libraries, and the SAM ViT-B
+recognition model. After installation, launch SARU Picker from the Start menu.
+There is no separate Python installation or model download for the end user.
+
+1. Put cryoSPARC's picking view on your primary monitor.
+2. Choose "Select screen region (3 s)", activate cryoSPARC, and select the
+   micrograph area on the captured desktop.
+3. Draw a manual contour, or draw a box around an intended inner region and
+   choose "Segment prompt". Foreground and background points refine a mask.
+4. Review alternative masks and accept the intended regions. Automatic
+   proposals still need review; they are not a trained capsid classifier.
+5. Review the sampling points, enable live clicks, and choose "Pick selected
+   masks". Keep the underlying image position and zoom fixed during playback.
+
+Escape stops. F8 pauses or resumes. Click playback requires working hotkeys.
+The PyAutoGUI corner fail-safe also remains enabled.
+
+This edition includes a CPU PyTorch build. Use the Auto or CPU device setting.
+The model remains large: the earlier CPU example used about 3.1 GiB of process
+memory. Installing the software does not change recognition accuracy or remove
+the model's memory requirements.
+
+Exports contain clean captured images, selected masks, and capture/screen
+coordinates. They are not calibrated micrograph coordinates. Export accepted
+masks before playback if you want to keep them for later annotation work.
+
+Application logs are written in your user profile. Startup failures are logged
+under %LOCALAPPDATA%\SARU_Picker\startup.log.
+
+Third-party notices and model information are included in the _internal folder.

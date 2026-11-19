@@ -1,0 +1,5 @@
+# Install a matching torch/torchvision pair for your hardware FIRST.
+# The CPU pair exercised in validation is torch==2.5.1, torchvision==0.20.1.
+# This requirement uses Git; Git must be available on PATH.
+-r requirements.txt
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf

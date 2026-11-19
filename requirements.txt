@@ -1,2 +1,7 @@
-pyautogui
-pynput
+# Core GUI, bitmap sampling, and Windows desktop integration.
+# PyTorch and original SAM are installed separately; see README.md.
+numpy>=1.24,<3
+Pillow>=10,<14
+scipy>=1.10,<2
+PyAutoGUI>=0.9.54,<0.10
+pynput>=1.7.6,<2
