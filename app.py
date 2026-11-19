@@ -566,7 +566,9 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                 overlay_checks = verify_screen_overlay(window)
                 icon_checks = windows_application_icon_status(window)
                 if not all(icon_checks.values()) or not all(path.is_file() for path in application_icon_paths()):
-                    raise RuntimeError("The native application icon or bundled artwork is missing.")
+                    raise RuntimeError(f"The native application icon or bundled artwork is missing: "
+                                       f"native={icon_checks}, assets="
+                                       f"{[(str(path), path.is_file()) for path in application_icon_paths()]}")
                 repeated_contours = _smoke_repeated_screen_picks(picker)
         finally:
             if original_scaling is not None:

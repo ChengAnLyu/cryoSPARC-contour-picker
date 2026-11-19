@@ -70,7 +70,7 @@ The code fixes observed failure paths; it cannot establish the exact cause of th
 Run `python benchmarks/compare_sam.py --checkpoint sam_vit_b_01ec64.pth` to repeat the automatic and box-prompt diagnostic, and `python benchmarks/refine_example.py --checkpoint sam_vit_b_01ec64.pth` for the specified corrective prompts. Both scripts write fresh results to `benchmark_output/` and never send desktop events. They use a fixed CPU configuration for comparison; expect different timings on other machines. The checkpoint is not included.
 # Version 2.3.0 regression and geometry checks
 
-The 2.3.0 source suite contains 291 passing tests. New cases cover three
+The 2.3.0 source suite contains 294 passing tests. New cases cover three
 successive semi-auto selections with delayed pick-marker rendering, rejection
 of actual image changes, complete pick history at result/event handoff,
 cancellation at that handoff, GUI-thread release of worker callbacks, removal

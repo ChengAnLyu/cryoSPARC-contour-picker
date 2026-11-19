@@ -14,7 +14,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 import weakref
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from PIL import Image
 
@@ -145,9 +145,48 @@ class ApplicationIconContractTests(unittest.TestCase):
                  patch.dict(sys.modules, {"tkinter": SimpleNamespace(PhotoImage=photo_factory)}):
                 self.assertEqual(application_icon.application_icon_paths()[0], ico)
                 self.assertTrue(application_icon.apply_application_icon(root))
-            root.iconbitmap.assert_called_once_with(default=str(ico))
+            self.assertEqual(root.iconbitmap.call_args_list,
+                             [call(str(ico)), call(default=str(ico))])
+            self.assertEqual(root._saru_application_icon_path, str(ico))
             root.iconphoto.assert_not_called()
             photo_factory.assert_not_called()
+
+    def test_native_class_icons_are_accepted_after_custom_artwork_was_applied(self):
+        ico, _ = application_icon.application_icon_paths()
+        root = SimpleNamespace(winfo_id=lambda: 111,
+                               _saru_application_icon_path=str(ico))
+        api = SimpleNamespace(GetAncestor=Mock(return_value=222),
+                              SendMessageW=Mock(return_value=0),
+                              GetClassLongPtrW=Mock(side_effect=lambda hwnd, which: 2**40-which))
+        with patch.object(sys, "platform", "win32"), \
+             patch.object(application_icon.ctypes, "WinDLL", return_value=api, create=True):
+            self.assertEqual(application_icon.windows_application_icon_status(root),
+                             {"small_icon": True, "large_icon": True})
+        self.assertEqual(api.GetClassLongPtrW.call_args_list, [call(222, -34), call(222, -14)])
+        self.assertEqual(api.GetClassLongPtrW.restype, application_icon.ctypes.c_size_t)
+
+    def test_native_class_icons_do_not_validate_an_unconfigured_tk_window(self):
+        root = SimpleNamespace(winfo_id=lambda: 111)
+        api = SimpleNamespace(GetAncestor=Mock(return_value=222),
+                              SendMessageW=Mock(return_value=0),
+                              GetClassLongPtrW=Mock(return_value=555))
+        with patch.object(sys, "platform", "win32"), \
+             patch.object(application_icon.ctypes, "WinDLL", return_value=api, create=True):
+            self.assertEqual(application_icon.windows_application_icon_status(root),
+                             {"small_icon": False, "large_icon": False})
+
+    def test_native_explicit_icons_do_not_need_class_fallback(self):
+        ico, _ = application_icon.application_icon_paths()
+        root = SimpleNamespace(winfo_id=lambda: 111,
+                               _saru_application_icon_path=str(ico))
+        api = SimpleNamespace(GetAncestor=Mock(return_value=222),
+                              SendMessageW=Mock(return_value=2**40),
+                              GetClassLongPtrW=Mock(side_effect=AssertionError("Unexpected class lookup.")))
+        with patch.object(sys, "platform", "win32"), \
+             patch.object(application_icon.ctypes, "WinDLL", return_value=api, create=True):
+            self.assertEqual(application_icon.windows_application_icon_status(root),
+                             {"small_icon": True, "large_icon": True})
+        api.GetClassLongPtrW.assert_not_called()
 
     def test_png_fallback_releases_tk_image_on_the_calling_thread(self):
         references = []
