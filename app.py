@@ -260,6 +260,23 @@ def _smoke_terminate_text(window, button) -> dict[str, Any]:
             "centered_first_baseline_from_top": baseline, "full_font_line_fits": True}
 
 
+def _smoke_scale_label(window, slider) -> dict[str, Any]:
+    """Scale's requested size does not include its internal label's width."""
+    tk_font = importlib.import_module("tkinter.font")
+    font = tk_font.Font(root=window, font=slider.cget("font"))
+    label = str(slider.cget("label"))
+    text_width = int(font.measure(label))
+    border = sum(int(window.winfo_pixels(slider.cget(name)))
+                 for name in ("borderwidth", "highlightthickness"))
+    available_width = int(slider.winfo_width()) - 2 * border
+    if text_width > available_width:
+        raise RuntimeError(
+            f"Particle spacing caption is clipped: label {text_width}px, interior {available_width}px; "
+            f"layout={_smoke_layout_diagnostics(window, slider)}")
+    return {"text": label, "text_width": text_width,
+            "available_width": available_width, "full_label_width_fits": True}
+
+
 def _smoke_panel_layout(picker, mode: str, status_case: str) -> dict[str, Any]:
     window = picker.root
     _smoke_settle_panel(picker)
@@ -286,10 +303,12 @@ def _smoke_panel_layout(picker, mode: str, status_case: str) -> dict[str, Any]:
     terminate = _smoke_widget_layout(window, picker.terminate_button, f"{mode}/{status_case} Terminate")
     terminate["text"] = _smoke_terminate_text(window, picker.terminate_button)
     status = _smoke_widget_layout(window, picker.status_label, f"{mode}/{status_case} status")
+    spacing = _smoke_scale_label(window, picker.spacing_slider)
     return {"panel_size": [int(window.winfo_width()), int(window.winfo_height())],
             "panel_requested_size": [int(window.winfo_reqwidth()), int(window.winfo_reqheight())],
             "managed_controls_checked": len(controls), "all_managed_controls_fit": True,
-            "terminate": terminate, "status": status, "viewable": True, "topmost": True}
+            "terminate": terminate, "status": status, "spacing_caption": spacing,
+            "viewable": True, "topmost": True}
 
 
 def _smoke_panel_screenshot(window, destination: Path) -> dict[str, Any]:

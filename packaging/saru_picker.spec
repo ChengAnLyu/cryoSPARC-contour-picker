@@ -44,7 +44,7 @@ hiddenimports = collect_submodules("segment_anything") + [
     "pymsgbox", "pytweening", "mouseinfo", "pyperclip", "pyrect",
     "pynput", "pynput.keyboard", "pynput.mouse",
     "pynput.keyboard._win32", "pynput.mouse._win32", "pynput._util.win32",
-    "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox",
+    "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox", "tkinter.font",
     "PIL.ImageTk", "PIL._imagingtk", "torch", "torchvision", "torchvision._C",
     "scipy.ndimage",
 ]

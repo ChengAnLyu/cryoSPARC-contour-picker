@@ -184,8 +184,10 @@ class ScreenPickerApp:
                            indicatoron=False, width=10, font=("Arial", 10),
                            command=lambda value=mode: self.set_mode(value)).pack(side="left", padx=5)
         self.spacing = tk.IntVar(value=13)
-        tk.Scale(content, from_=5, to=25, orient="horizontal", label="Particle spacing",
-                 length=150, variable=self.spacing).pack(padx=10, pady=10)
+        self.spacing_slider = tk.Scale(content, from_=5, to=25, orient="horizontal",
+                                       label="Particle spacing", length=round(150 * scale),
+                                       variable=self.spacing)
+        self.spacing_slider.pack(padx=10, pady=10)
         self.disabled = tk.BooleanVar(value=True)
         tk.Checkbutton(content, text="Disable Picking", variable=self.disabled,
                        command=self.disabled_changed).pack(pady=5)

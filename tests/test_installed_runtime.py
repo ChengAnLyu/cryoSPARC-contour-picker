@@ -169,11 +169,12 @@ class PanelLayoutValidationTests(unittest.TestCase):
                 button.winfo_height.return_value = 30
         root.update.side_effect = dispatch
         picker = SimpleNamespace(root=root, fit_panel=Mock(side_effect=lambda: calls.append("fit")),
-                                 terminate_button=button, status_label=status)
+                                 terminate_button=button, status_label=status, spacing_slider=Mock())
         # Idle updates do not model the pending native map/resize messages.
         root.update_idletasks()
         self.assertFalse(footer.winfo_viewable())
-        with patch.object(app, "_smoke_terminate_text", return_value={}):
+        with patch.object(app, "_smoke_terminate_text", return_value={}), \
+             patch.object(app, "_smoke_scale_label", return_value={}):
             result = app._smoke_panel_layout(picker, "manual", "default")
         self.assertEqual(calls, ["update", "fit", "update"])
         self.assertTrue(result["all_managed_controls_fit"])
@@ -257,16 +258,40 @@ class PanelLayoutValidationTests(unittest.TestCase):
         status = layout_widget(root, x=10, y=300, width=480, height=80)
         inactive = layout_widget(root, manager="", visible=False)
         layout_widget(inactive, height=1, requested=(100, 40), visible=False)
-        picker = SimpleNamespace(root=root, fit_panel=Mock(), terminate_button=button, status_label=status)
-        with patch.object(app, "_smoke_terminate_text", return_value={}):
+        picker = SimpleNamespace(root=root, fit_panel=Mock(), terminate_button=button,
+                                 status_label=status, spacing_slider=Mock())
+        with patch.object(app, "_smoke_terminate_text", return_value={}), \
+             patch.object(app, "_smoke_scale_label", return_value={"checked": True}) as caption:
             result = app._smoke_panel_layout(picker, "manual", "multiline_status")
             self.assertEqual(result["managed_controls_checked"], 3)
+            self.assertEqual(result["spacing_caption"], {"checked": True})
+            caption.assert_called_once_with(root, picker.spacing_slider)
             picker.fit_panel.assert_called_once()
             # Pack-managed controls can become unmapped when siblings take all
             # available space. Do not silently omit that failure from coverage.
             layout_widget(root, x=0, y=400, height=1, requested=(100, 30), visible=False)
             with self.assertRaisesRegex(RuntimeError, "not visible"):
                 app._smoke_panel_layout(picker, "manual", "multiline_status")
+
+    def test_scale_caption_can_clip_even_when_widget_has_full_requested_size(self):
+        root = layout_widget(width=840, height=640)
+        root.winfo_pixels.side_effect = int
+        slider = layout_widget(root, width=154, height=100, requested=(154, 100))
+        settings = {"font": "TkDefaultFont", "label": "Particle spacing",
+                    "borderwidth": 1, "highlightthickness": 1}
+        slider.cget.side_effect = settings.__getitem__
+        font = Mock()
+        font.measure.return_value = 175
+        self.assertTrue(app._smoke_widget_layout(root, slider, "spacing")["full_requested_size"])
+        with patch.object(app.importlib, "import_module", return_value=SimpleNamespace(Font=Mock(return_value=font))):
+            with self.assertRaisesRegex(RuntimeError, "Particle spacing caption is clipped"):
+                app._smoke_scale_label(root, slider)
+            slider.winfo_width.return_value = 304
+            result = app._smoke_scale_label(root, slider)
+        self.assertEqual(result["text"], "Particle spacing")
+        self.assertEqual(result["text_width"], 175)
+        self.assertEqual(result["available_width"], 300)
+        self.assertTrue(result["full_label_width_fits"])
 
     def test_withdrawn_or_non_topmost_panel_fails(self):
         root = layout_widget(width=420, height=320)
