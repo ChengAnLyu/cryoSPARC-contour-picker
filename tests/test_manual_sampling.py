@@ -10,7 +10,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from execution import CancelledOperation
-from manual_sampling import legacy_contour_points
+from manual_sampling import legacy_contour_points, mask_contour_points
 
 
 def original_picks(points, spacing):
@@ -169,6 +169,85 @@ class ManualValidationTests(unittest.TestCase):
              "('torch','segment_anything','cv2','tkinter','pyautogui','pynput'))"],
             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class MaskContourGridTests(unittest.TestCase):
+    def test_mask_owns_its_bbox_phase_and_has_no_boundary_inset(self):
+        mask = np.zeros((25, 40), dtype=bool)
+        mask[7:18, 11:29] = True
+        expected = [[11, 7], [16, 7], [21, 7], [26, 7],
+                    [13, 11], [18, 11], [23, 11], [28, 11],
+                    [11, 15], [16, 15], [21, 15], [26, 15]]
+        actual = mask_contour_points(mask, 5)
+        np.testing.assert_array_equal(actual, expected)
+        self.assertEqual(actual.dtype, np.int32)
+        self.assertEqual(np.count_nonzero(mask), 11 * 18)
+
+    def test_odd_spacing_uses_manual_integer_row_height_and_offset(self):
+        mask = np.zeros((35, 40), dtype=bool)
+        mask[5:29, 3:34] = True
+        expected = [[3, 5], [16, 5], [29, 5],
+                    [9, 16], [22, 16],
+                    [3, 27], [16, 27], [29, 27]]
+        np.testing.assert_array_equal(mask_contour_points(mask, 13), expected)
+
+    def test_holes_and_empty_space_between_components_are_not_filled(self):
+        mask = np.zeros((50, 70), dtype=bool)
+        mask[3:30, 5:32] = True
+        mask[10:22, 10:25] = False
+        mask[35:48, 48:68] = True
+        actual = mask_contour_points(mask, 5)
+        self.assertTrue(np.all(mask[actual[:, 1], actual[:, 0]]))
+        self.assertTrue(np.any(actual[:, 0] >= 48))
+        self.assertFalse(np.any((actual[:, 0] >= 32) & (actual[:, 0] < 48)))
+        self.assertFalse(np.any((actual[:, 0] >= 10) & (actual[:, 0] < 25)
+                               & (actual[:, 1] >= 10) & (actual[:, 1] < 22)))
+
+    def test_moving_the_mask_moves_the_whole_lattice(self):
+        mask = np.zeros((40, 45), dtype=bool)
+        mask[4:30, 7:35] = True
+        shifted = np.pad(mask, ((9, 0), (6, 0)))
+        np.testing.assert_array_equal(mask_contour_points(shifted, 13),
+                                      mask_contour_points(mask, 13) + [6, 9])
+
+    def test_empty_mask_has_no_points_and_binary_integer_masks_are_supported(self):
+        self.assertEqual(mask_contour_points(np.zeros((20, 30), bool), 5).shape, (0, 2))
+        mask = np.zeros((25, 30), np.uint8)
+        mask[2:24, 7:28] = 1
+        np.testing.assert_array_equal(mask_contour_points(mask, np.int64(5)),
+                                      mask_contour_points(mask.astype(bool), 5))
+
+    def test_bad_masks_and_grid_settings_are_rejected(self):
+        for mask in (None, [], [0, 1], np.zeros((0, 5)), np.zeros((2, 3, 3)),
+                     [[0, 2]], [[np.nan, 1]], [["0", "1"]]):
+            with self.subTest(mask=mask), self.assertRaises(ValueError):
+                mask_contour_points(mask, 5)
+        for spacing in (0, 1, -2, 5.0, True, np.bool_(False), math.inf):
+            with self.subTest(spacing=spacing), self.assertRaises(ValueError):
+                mask_contour_points(np.ones((10, 10), bool), spacing)
+        for limit in (0, -1, 3.5, True, None):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                mask_contour_points(np.ones((10, 10), bool), 5, max_points=limit)
+
+    def test_limit_is_complete_or_error_and_exact_limit_is_allowed(self):
+        mask = np.ones((30, 40), bool)
+        expected = mask_contour_points(mask, 5)
+        np.testing.assert_array_equal(mask_contour_points(mask, 5, max_points=len(expected)), expected)
+        with self.assertRaisesRegex(ValueError, "More than"):
+            mask_contour_points(mask, 5, max_points=len(expected)-1)
+
+    def test_mask_sampling_cancels_before_returning_any_positions(self):
+        mask = np.ones((100, 200), bool)
+        with self.assertRaises(CancelledOperation):
+            mask_contour_points(mask, 5, cancel=lambda: True)
+        calls = [0]
+        def cancel_in_rows():
+            calls[0] += 1
+            return calls[0] > 5
+        with self.assertRaises(CancelledOperation):
+            mask_contour_points(mask, 5, cancel=cancel_in_rows)
+        with self.assertRaisesRegex(ValueError, "cancel"):
+            mask_contour_points(mask, 5, cancel=True)
 
 
 if __name__ == "__main__":

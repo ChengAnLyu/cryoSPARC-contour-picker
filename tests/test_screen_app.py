@@ -8,10 +8,10 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from execution import CancellationToken, CaptureGeometry, TaskResult
-from manual_sampling import legacy_contour_points
+from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskResult
+from manual_sampling import legacy_contour_points, mask_contour_points
 from recognition import make_candidate
-from screen_app import (ScreenPickerApp, screen_changed_fraction, screen_mask_at, screen_model_points,
+from screen_app import (ScreenPickerApp, screen_changed_fraction, screen_mask_at, screen_model_points, screen_model_batches,
                         screen_background_guard, screen_background_changed, screen_region_overlaps_panel)
 
 
@@ -180,7 +180,8 @@ def app_state(mode="manual"):
     app.disabled, app.spacing = Variable(False), Variable(13)
     app.status, app.region_label = Variable(""), Variable("")
     app.checkpoint, app.model_type = Variable("supplied-model.pth"), Variable("vit_b")
-    app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(.08)
+    app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(.10)
+    app.automatic_profile = Variable("capsid")
     app.frames, app.wait_seconds = Variable(1), Variable(5.0)
     app.closed = app.transition = app.paused = False
     app._fit_after = None
@@ -230,7 +231,7 @@ class ScreenGeometryTests(unittest.TestCase):
         self.assertIsNone(screen_mask_at([a, b], region, 115, 215))
         self.assertIsNone(screen_mask_at([a, b], region, 99, 204))
 
-    def test_model_union_is_unique_and_remembers_previously_clicked_points(self):
+    def test_model_contours_are_unique_and_remember_previously_clicked_points(self):
         region = CaptureGeometry(100, 200, 40, 30)
         a = make_candidate(np.ones((30, 40), bool))
         local, screen = screen_model_points([a, a], region, 5)
@@ -238,6 +239,84 @@ class ScreenGeometryTests(unittest.TestCase):
         self.assertTrue(all(region.contains(*point) for point in screen))
         kept, _ = screen_model_points([a], region, 5, picked=[tuple(local[0])])
         self.assertEqual(len(kept), len(local)-1)
+
+    def test_each_contour_keeps_its_own_manual_lattice_in_detection_order(self):
+        region = CaptureGeometry(100, 200, 80, 60)
+        first, second = np.zeros((60, 80), bool), np.zeros((60, 80), bool)
+        first[7:35, 41:68] = True
+        second[11:39, 5:30] = True
+        a, b = make_candidate(first), make_candidate(second)
+        batches = screen_model_batches([a, b], region, 13)
+        self.assertEqual([batch.candidate_id for batch in batches], [a.id, b.id])
+        np.testing.assert_array_equal(batches[0].local, mask_contour_points(first, 13))
+        np.testing.assert_array_equal(batches[1].local, mask_contour_points(second, 13))
+        np.testing.assert_array_equal(batches[0].screen, batches[0].local + [100, 200])
+        np.testing.assert_array_equal(batches[1].screen, batches[1].local + [100, 200])
+        np.testing.assert_array_equal(batches[0].local[0], [41, 7])
+        np.testing.assert_array_equal(batches[1].local[0], [5, 11])
+
+    def test_overlapping_contours_keep_order_without_repeated_exact_clicks(self):
+        region = CaptureGeometry(100, 200, 70, 60)
+        first, second = np.zeros((60, 70), bool), np.zeros((60, 70), bool)
+        first[5:36, 5:36] = True
+        second[5:36, 18:55] = True  # same row phase and x phase modulo spacing
+        a, b = make_candidate(first), make_candidate(second)
+        remembered = (5, 5)
+        batches = screen_model_batches([a, b], region, 13, picked=[remembered])
+        first_points = [tuple(point) for point in batches[0].local]
+        second_points = [tuple(point) for point in batches[1].local]
+        self.assertNotIn(remembered, first_points + second_points)
+        self.assertFalse(set(first_points) & set(second_points))
+        expected_second = [tuple(point) for point in mask_contour_points(second, 13)
+                           if tuple(point) not in set(first_points + [remembered])]
+        self.assertEqual(second_points, expected_second)
+
+    def test_different_contour_phases_cannot_make_nearly_coincident_picks(self):
+        region = CaptureGeometry(0, 0, 160, 120)
+        first, second = np.zeros((120, 160), bool), np.zeros((120, 160), bool)
+        first[20:80, 20:60], second[20:80, 34:74] = True, True
+        a, b = make_candidate(first), make_candidate(second)
+        batches = screen_model_batches([a, b], region, 13)
+        original_first = mask_contour_points(first, 13)
+        original_second = mask_contour_points(second, 13)
+        np.testing.assert_array_equal(batches[0].local, original_first)
+        self.assertGreater(len(batches[1].local), 0)
+        self.assertLess(len(batches[1].local), len(original_second))
+        retained = {tuple(point) for point in batches[1].local}
+        self.assertEqual([tuple(point) for point in batches[1].local],
+                         [tuple(point) for point in original_second if tuple(point) in retained])
+        distances = np.sqrt(np.sum((batches[0].local[:, None, :] - batches[1].local[None, :, :])**2, axis=2))
+        self.assertGreaterEqual(float(distances.min()), float(np.hypot(6, 11))-1e-6)
+        # Repeating the second contour as a later semi-auto selection applies
+        # exactly the same guard to actual positions from the first selection.
+        later = screen_model_batches([b], region, 13, picked=map(tuple, original_first))
+        np.testing.assert_array_equal(later[0].local, batches[1].local)
+
+    def test_manual_lattice_neighbor_at_equal_distance_is_retained(self):
+        region = CaptureGeometry(0, 0, 50, 50)
+        mask = np.zeros((50, 50), bool)
+        mask[31, 26] = True
+        batches = screen_model_batches([make_candidate(mask)], region, 13, picked=[(20, 20)])
+        np.testing.assert_array_equal(batches[0].local, [[26, 31]])
+
+    def test_click_limit_applies_after_filtering_already_picked_positions(self):
+        region = CaptureGeometry(0, 0, 80, 70)
+        mask = np.zeros((70, 80), bool)
+        mask[5:55, 5:65] = True
+        original = mask_contour_points(mask, 13)
+        self.assertGreater(len(original), 2)
+        batches = screen_model_batches([make_candidate(mask)], region, 13,
+                                       picked=map(tuple, original[:-2]), max_points=2)
+        np.testing.assert_array_equal(batches[0].local, original[-2:])
+
+    def test_total_contour_limit_is_validated_before_a_plan_is_returned(self):
+        region = CaptureGeometry(0, 0, 80, 40)
+        first, second = np.zeros((40, 80), bool), np.zeros((40, 80), bool)
+        first[3:35, 3:32], second[3:35, 45:74] = True, True
+        a, b = make_candidate(first), make_candidate(second)
+        per_contour = len(mask_contour_points(first, 5))
+        with self.assertRaisesRegex(ValueError, "across the contours"):
+            screen_model_batches([a, b], region, 5, max_points=per_contour)
 
     def test_background_guard_excludes_marker_region_but_detects_other_scene_changes(self):
         region = CaptureGeometry(0, 0, 100, 100)
@@ -534,6 +613,169 @@ class ScreenControllerTests(unittest.TestCase):
         self.assertTrue(app.input_surface.visible)
         self.assertTrue(app.overlay.visible)
 
+    def test_semi_release_fills_only_clicked_contour_on_its_manual_grid(self):
+        app = app_state("semi-auto")
+        first, second = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[10:40, 5:30], second[13:43, 45:75] = True, True
+        second[23:33, 52:62] = False
+        a, b = make_candidate(first), make_candidate(second)
+        app.candidates = [a, b]
+        app.input_kind = "masks"
+        app.input_surface = Surface()
+        app.input_surface.show()
+        app._input_press(187, 115)
+        self.assertEqual(app.runner.jobs, [])
+        app._input_release(187, 115)
+        app.root.run_next()
+        result = app.runner.finish()
+        expected = mask_contour_points(second, 13) + [140, 100]
+        self.assertEqual(app.desktop.clicks, [tuple(point) for point in expected])
+        self.assertEqual(result["contours"], 1)
+        with patch("screen_app.InputSurface", Surface):
+            app._result("model picks", result)
+        self.assertEqual([candidate.id for candidate in app.candidates], [a.id])
+        self.assertEqual([candidate.id for candidate in app.overlay.masks], [a.id])
+        self.assertTrue(app.overlay.visible)
+        self.assertTrue(app.input_surface.visible)
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_auto_finishes_each_contour_before_next_and_advances_only_after_all(self):
+        app = app_state("auto")
+        first, second = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[15:40, 5:25], second[15:40, 45:65] = True, True
+        a, b = make_candidate(first), make_candidate(second)
+        app.candidates, app.auto_remaining = [a, b], 2
+        app._next_frame = Mock()
+        expected = [mask_contour_points(mask, 13) + [140, 100] for mask in (first, second)]
+        app._start_model_picks(app.candidates, auto=True)
+        app.root.run_next()
+        with patch("screen_app.play_clicks", wraps=__import__("execution").play_clicks) as playback:
+            result = app.runner.finish()
+        self.assertEqual(playback.call_count, 2)
+        for call, points in zip(playback.call_args_list, expected):
+            np.testing.assert_array_equal(call.args[0], points)
+        self.assertEqual(app.desktop.clicks, [tuple(point) for points in expected for point in points])
+        self.assertEqual(result["count"], sum(map(len, expected)))
+        self.assertEqual(result["contours"], 2)
+        self.assertEqual(app.desktop.keys, [])
+        app._next_frame.assert_not_called()
+        app.poll()
+        self.assertIn("Contour 2/2", app.status.get())
+        self.assertEqual(app.candidates, [])
+        self.assertEqual(len(app.picked_points), result["count"])
+        app._result("model picks", result)
+        app._next_frame.assert_called_once_with()
+        self.assertEqual(app.auto_remaining, 1)
+
+    def test_later_invalid_contour_rejects_all_batches_before_clicking(self):
+        app = app_state("auto")
+        first = np.zeros((70, 80), bool)
+        first[15:40, 5:25] = True
+        candidates = [make_candidate(first), make_candidate(np.ones((20, 20), bool))]
+        app._start_model_picks(candidates, auto=True)
+        app.root.run_next()
+        with self.assertRaisesRegex(ValueError, "no longer matches"):
+            app.runner.finish()
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_pause_between_contours_blocks_later_contour_until_resume(self):
+        app = app_state("auto")
+        first, second = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[15:40, 5:25], second[15:40, 45:65] = True, True
+        app.candidates = [make_candidate(first), make_candidate(second)]
+        expected_first = mask_contour_points(first, 13) + [140, 100]
+        paused, result, errors = threading.Event(), [], []
+        click = app.desktop.click
+        def pause_after_first(x, y):
+            click(x, y)
+            if len(app.desktop.clicks) == len(expected_first):
+                app.active_token.pause()
+                paused.set()
+        app.desktop.click = pause_after_first
+        app._start_model_picks(app.candidates, auto=True)
+        app.root.run_next()
+        def finish():
+            try:
+                result.append(app.runner.finish())
+            except Exception as exc:
+                errors.append(exc)
+        worker = threading.Thread(target=finish)
+        worker.start()
+        try:
+            self.assertTrue(paused.wait(2))
+            self.assertEqual(app.desktop.clicks, [tuple(point) for point in expected_first])
+            self.assertTrue(worker.is_alive())
+        finally:
+            app.active_token.resume()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(result[0]["contours"], 2)
+        self.assertGreater(result[0]["count"], len(expected_first))
+
+    def test_stop_after_first_contour_records_its_completion_without_picking_next(self):
+        app = app_state("auto")
+        first, second = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[15:40, 5:25], second[15:40, 45:65] = True, True
+        a, b = make_candidate(first), make_candidate(second)
+        app.candidates, app.auto_remaining = [a, b], 2
+        expected_first = mask_contour_points(first, 13)
+        click = app.desktop.click
+        def stop_after_first(x, y):
+            click(x, y)
+            if len(app.desktop.clicks) == len(expected_first):
+                app._hotkey("stop")
+        app.desktop.click = stop_after_first
+        app._start_model_picks(app.candidates, auto=True)
+        app.root.run_next()
+        with self.assertRaises(CancelledOperation):
+            app.runner.finish()
+        app.poll()
+        self.assertEqual(app.desktop.clicks, [tuple(point) for point in expected_first + [140, 100]])
+        self.assertEqual(app.picked_points, {tuple(point) for point in expected_first})
+        self.assertEqual([candidate.id for candidate in app.candidates], [b.id])
+        self.assertTrue(app.disabled.get())
+        self.assertEqual(app.auto_remaining, 0)
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_partial_contour_stop_remembers_clicks_for_same_frame_retry(self):
+        app = app_state("semi-auto")
+        mask = np.zeros((70, 80), bool)
+        mask[10:45, 5:40] = True
+        candidate = make_candidate(mask)
+        app.candidates = [candidate]
+        click = app.desktop.click
+        def stop_early(x, y):
+            click(x, y)
+            if len(app.desktop.clicks) == 2:
+                app._hotkey("stop")
+        app.desktop.click = stop_early
+        app._start_model_picks(app.candidates)
+        app.root.run_next()
+        with self.assertRaises(CancelledOperation):
+            app.runner.finish()
+        app.poll()
+        self.assertEqual(len(app.picked_points), 2)
+        self.assertEqual([item.id for item in app.candidates], [candidate.id])
+        remaining = screen_model_batches(app.candidates, app.geometry, 13, picked=app.picked_points)
+        planned = {tuple(point) for point in remaining[0].screen}
+        self.assertFalse(planned & set(app.desktop.clicks))
+        self.assertEqual(len(planned), len(mask_contour_points(mask, 13))-2)
+
+    def test_old_frame_progress_cannot_remove_current_contours_or_record_points(self):
+        app = app_state("semi-auto")
+        candidate = make_candidate(np.ones((70, 80), bool))
+        app.candidates = [candidate]
+        app.frame_id = 2
+        app.events.put(("picked", app.runner.generation, 1, (5, 5), 1, 2, 1, 1))
+        app.events.put(("contour_progress", app.runner.generation, 1, 1, 1, 1, 2))
+        app.events.put(("contour_done", app.runner.generation, 1, candidate.id))
+        app.poll()
+        self.assertEqual(app.picked_points, set())
+        self.assertEqual([item.id for item in app.candidates], [candidate.id])
+        self.assertEqual(app.status.get(), "")
+
     def test_post_pick_background_change_never_becomes_a_new_trusted_reference(self):
         app = app_state("semi-auto")
         mask = np.zeros((70, 80), bool)
@@ -611,6 +853,109 @@ class ScreenControllerTests(unittest.TestCase):
         self.assertEqual(app.auto_remaining, 0)
         app.hotkeys.enable_space_pause.assert_called_with(False)
         self.assertEqual(app.desktop.keys, [])
+
+    def test_start_auto_reuses_exact_displayed_contours_without_redetecting(self):
+        app = app_state("auto")
+        first, second = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[15:40, 5:25], second[15:40, 45:65] = True, True
+        a, b = make_candidate(first), make_candidate(second)
+        app.candidates = [b, a]
+        app._start_detection, app._start_model_picks = Mock(), Mock()
+        app.start_auto()
+        app._start_detection.assert_not_called()
+        app._start_model_picks.assert_called_once_with([b, a], auto=True)
+        self.assertEqual(len(app.auto_history), 1)
+        np.testing.assert_array_equal(app.auto_history[0], app.reference)
+        self.assertIsNot(app.auto_history[0], app.reference)
+
+    def test_auto_reused_proposals_still_reject_a_changed_screen_before_clicking(self):
+        app = app_state("auto")
+        mask = np.zeros((70, 80), bool)
+        mask[15:40, 5:25] = True
+        app.candidates = [make_candidate(mask)]
+        app.desktop.rgb[100:170, 140:220] = 0
+        app.start_auto()
+        app.root.run_next()
+        with self.assertRaisesRegex(RuntimeError, "changed before picking"):
+            app.runner.finish()
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_auto_reenable_restores_retained_outlines_and_reports_their_count(self):
+        app = app_state("auto")
+        mask = np.zeros((70, 80), bool)
+        mask[15:40, 5:25] = True
+        candidate = make_candidate(mask)
+        app.candidates = [candidate]
+        app.stop()
+        self.assertFalse(app.overlay.visible)
+        app.disabled.set(False)
+        app.disabled_changed()
+        self.assertTrue(app.overlay.visible)
+        self.assertEqual([item.id for item in app.overlay.masks], [candidate.id])
+        self.assertIn("1 detected contour shown", app.status.get())
+        self.assertIsNone(app.input_surface, "Auto preview must not intercept clicks")
+        self.assertEqual(app.runner.jobs, [])
+
+    def test_auto_reenable_waits_for_cancelled_worker_before_restoring_outlines(self):
+        app = app_state("auto")
+        mask = np.zeros((70, 80), bool)
+        mask[15:40, 5:25] = True
+        app.candidates = [make_candidate(mask)]
+        app.stop()
+        app.runner.busy = True
+        app.disabled.set(False)
+        app.disabled_changed()
+        self.assertFalse(app.overlay.visible)
+        self.assertIn("Waiting", app.status.get())
+        app.runner.busy = False
+        app.root.run_next()
+        self.assertTrue(app.overlay.visible)
+        self.assertIn("1 detected contour shown", app.status.get())
+
+    def test_same_scene_auto_recognition_retains_actual_picks(self):
+        app = app_state("auto")
+        mask = np.zeros((70, 80), bool)
+        mask[15:40, 5:25] = True
+        candidates = [make_candidate(mask)]
+        remembered = {(5, 15), (18, 15)}
+        app.picked_points = set(remembered)
+        app._start_model_picks = Mock()
+        app._result("recognition", {"rgb": app.reference.copy(), "auto": True,
+                                     "prompt": False, "candidates": candidates})
+        self.assertEqual(app.picked_points, remembered)
+        app._start_model_picks.assert_called_once_with(candidates, auto=True)
+
+    def test_repeated_auto_on_a_fully_picked_scene_completes_without_clicks(self):
+        app = app_state("auto")
+        mask = np.zeros((70, 80), bool)
+        mask[15:40, 5:25] = True
+        candidate = make_candidate(mask)
+        app.picked_points = {tuple(point) for point in mask_contour_points(mask, 13)}
+        app.auto_remaining = 1
+        app._result("recognition", {"rgb": app.reference.copy(), "auto": True,
+                                     "prompt": False, "candidates": [candidate]})
+        app.root.run_next()
+        result = app.runner.finish()
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(result["ids"], {candidate.id})
+        self.assertTrue(result["scene_verified"])
+        app.poll()
+        self.assertEqual(app.candidates, [])
+        app._result("model picks", result)
+        self.assertEqual(app.auto_remaining, 0)
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_changed_scene_recognition_clears_previous_frame_pick_positions(self):
+        app = app_state("auto")
+        mask = np.zeros((70, 80), bool)
+        mask[15:40, 5:25] = True
+        app.picked_points = {(5, 15), (18, 15)}
+        app._start_model_picks = Mock()
+        app._result("recognition", {"rgb": np.zeros_like(app.reference), "auto": True,
+                                     "prompt": False, "candidates": [make_candidate(mask)]})
+        self.assertEqual(app.picked_points, set())
 
     def test_no_proposals_stop_auto_before_navigation(self):
         app = app_state("auto")

@@ -7,6 +7,8 @@ retain the original direct drag/release workflow and lattice placement.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+import math
 from pathlib import Path
 import queue
 import threading
@@ -16,8 +18,8 @@ import numpy as np
 
 from desktop import DesktopAdapter, GlobalHotkeys
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskRunner, play_clicks
-from manual_sampling import legacy_contour_points
-from recognition import Cancelled, RecognitionConfig, SamRecognizer, sample_hex_grid, union_masks
+from manual_sampling import legacy_contour_points, mask_contour_points
+from recognition import Cancelled, RecognitionConfig, SamRecognizer, union_masks
 from screen_overlay import (ScreenOverlay, InputSurface, ManualMouseObserver,
                             keep_control_panel_above, control_panel_bounds)
 
@@ -47,16 +49,72 @@ def screen_mask_at(candidates, geometry, x, y):
     return None
 
 
+@dataclass(frozen=True)
+class ScreenContourBatch:
+    candidate_id: str
+    local: np.ndarray
+    screen: np.ndarray
+
+
+def screen_model_batches(candidates, geometry, spacing, picked=(), cancel=None,
+                         max_points=10000):
+    """Prepare every contour before clicking, retaining detection order.
+
+    Each contour owns its grid origin. Sites too close to earlier actual or
+    planned picks are removed without moving any retained site or changing
+    comparisons within the contour. The threshold is the minimum neighboring
+    distance in the manual integer lattice. Empty batches still represent a
+    processed contour, and the point limit applies after filtering.
+    """
+    from scipy.spatial import cKDTree
+    if (isinstance(max_points, (bool, np.bool_))
+            or not isinstance(max_points, (int, np.integer)) or max_points < 1):
+        raise ValueError("max_points must be a positive integer.")
+    already = {tuple(map(int, point)) for point in picked}
+    batches, count = [], 0
+    for candidate in candidates:
+        if candidate.mask.shape != (geometry.height, geometry.width):
+            raise ValueError("A detected contour no longer matches the selected screen area.")
+        # The sampler separately bounds lattice work. Raw sites may exceed
+        # the click budget when most are removed by existing picks, so enforce
+        # that budget only after proximity filtering.
+        positions = mask_contour_points(candidate.mask, spacing,
+                                        max_points=int(candidate.mask.size), cancel=cancel)
+        if already and len(positions):
+            row_height = int(int(spacing) * math.sqrt(3) / 2)
+            minimum = min(float(spacing), math.hypot(int(spacing)//2, row_height))
+            threshold = minimum - 1e-7 * max(1.0, minimum)
+            previous = cKDTree(np.asarray(tuple(already), dtype=np.float64))
+            parts, accepted = [], 0
+            for start in range(0, len(positions), 4096):
+                if cancel is not None and cancel():
+                    raise CancelledOperation("Detected contour planning cancelled.")
+                chunk = positions[start:start+4096]
+                distances, _ = previous.query(chunk, k=1, distance_upper_bound=minimum)
+                part = chunk[distances >= threshold]
+                accepted += len(part)
+                if count + accepted > max_points:
+                    raise ValueError(f"More than {max_points:,} pick positions were requested across the contours; increase spacing or select fewer contours.")
+                parts.append(part)
+            local = np.concatenate(parts)
+        else:
+            local = positions
+        count += len(local)
+        if count > max_points:
+            raise ValueError(f"More than {max_points:,} pick positions were requested across the contours; increase spacing or select fewer contours.")
+        already.update(tuple(map(int, point)) for point in local)
+        screen = np.asarray([geometry.local_to_screen(int(x), int(y)) for x, y in local],
+                            dtype=np.int32).reshape(-1, 2)
+        batches.append(ScreenContourBatch(candidate.id, local, screen))
+    return batches
+
+
 def screen_model_points(candidates, geometry, spacing, picked=(), cancel=None):
-    """Sample the union once; model modes keep holes and avoid repeat clicks."""
-    mask = union_masks(candidates, (geometry.height, geometry.width))
-    local = sample_hex_grid(mask, spacing, inset=2, max_points=10000, cancel=cancel)
-    already = set(picked)
-    local = np.asarray([point for point in local if tuple(map(int, point)) not in already],
-                       dtype=np.int32).reshape(-1, 2)
-    screen = np.asarray([geometry.local_to_screen(int(x), int(y)) for x, y in local],
-                        dtype=np.int32).reshape(-1, 2)
-    return local, screen
+    """Return the ordered contour plans as one array for previews and callers."""
+    batches = screen_model_batches(candidates, geometry, spacing, picked, cancel)
+    if not batches:
+        return np.empty((0, 2), np.int32), np.empty((0, 2), np.int32)
+    return np.concatenate([batch.local for batch in batches]), np.concatenate([batch.screen for batch in batches])
 
 
 def screen_background_guard(candidates, geometry, spacing):
@@ -218,8 +276,9 @@ class ScreenPickerApp:
         self.checkpoint = tk.StringVar(value=str(checkpoint_path))
         self.model_type = tk.StringVar(value=getattr(self.args, "model_type", "vit_b"))
         self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
+        self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
         self.grid_side = tk.IntVar(value=8)
-        self.click_delay = tk.DoubleVar(value=.08)
+        self.click_delay = tk.DoubleVar(value=.10)
         self.status.trace_add("write", self._queue_panel_fit)
         self.region_label.trace_add("write", self._queue_panel_fit)
         self.fit_panel()
@@ -410,9 +469,28 @@ class ScreenPickerApp:
             elif self.mode == "semi-auto":
                 self._present_masks()
             else:
-                self.status.set("Auto ready. Select a screen area, then choose Start auto.")
+                self._show_auto_ready()
         except Exception as exc:
             self._error(exc)
+
+    def _show_auto_ready(self):
+        if (self.closed or self.mode != "auto" or self.disabled.get()
+                or self.auto_remaining or self.transition or self.advanced is not None):
+            return
+        if self.runner.busy:
+            # A cancelled native model call may still be returning. Keep its
+            # captures free of outlines until the worker has been collected.
+            self.status.set("Waiting for the previous operation to stop. Stored contours will return when ready.")
+            self._schedule(100, self._show_auto_ready)
+            return
+        if self.input_surface is not None and self.input_kind != "masks":
+            return
+        self._present_masks()
+        if self.candidates:
+            count = len(self.candidates)
+            self.status.set(f"Auto ready. {count} detected contour{'s' if count != 1 else ''} shown. Choose Start auto.")
+        else:
+            self.status.set("Auto ready. Select a screen area, then choose Start auto.")
 
     def _manual_input(self, epoch, kind, x, y):
         if (epoch != self._mouse_epoch or self.mode != "manual" or self.disabled.get()
@@ -581,7 +659,8 @@ class ScreenPickerApp:
 
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
-                                 device=self.device.get(), points_per_side=int(self.grid_side.get()))
+                                 device=self.device.get(), points_per_side=int(self.grid_side.get()),
+                                 automatic_profile=self.automatic_profile.get())
 
     def _get_recognizer(self, config):
         if self.recognizer is None or self.recognizer_config != config:
@@ -691,39 +770,61 @@ class ScreenPickerApp:
         def begin():
             self.transition = False
             def work(token):
-                local, screen = screen_model_points(candidates, geometry, spacing, picked,
-                                                     cancel=lambda: token.cancelled)
-                if not len(screen):
-                    raise ValueError("This region has no new pick positions at the current spacing.")
+                batches = screen_model_batches(candidates, geometry, spacing, picked,
+                                               cancel=lambda: token.cancelled)
+                if not batches:
+                    raise ValueError("There are no detected contours to pick.")
+                planned = sum(len(batch.screen) for batch in batches)
                 self.desktop.focus_target(target)
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the micrograph.")
                 if screen_changed_fraction(reference, self._capture_region(geometry)) > .03:
                     raise RuntimeError("The micrograph changed before picking. Detect again.")
-                background = screen_background_guard(candidates, geometry, spacing)
+                background = (screen_background_guard(candidates, geometry, spacing) if planned
+                              else np.ones((geometry.height, geometry.width), dtype=bool))
                 next_check = time.monotonic() + .75
-                def click(x, y):
+                def verify_scene(*, force=False):
                     nonlocal next_check
                     self.desktop.ensure_target(target)
-                    if background is not None and time.monotonic() >= next_check:
+                    if background is not None and (force or time.monotonic() >= next_check):
                         current = self._capture_region(geometry)
                         if screen_background_changed(reference, current, background) > .03:
                             raise RuntimeError("The micrograph changed during picking. Detect again.")
                         next_check = time.monotonic() + .75
+                def click(x, y):
+                    verify_scene()
                     self.desktop.click(x, y)
-                def progress(done, total):
-                    self.events.put(("picked", token.generation, frame_id,
-                                     tuple(map(int, local[done-1])), done, total))
-                count = play_clicks(screen, click, geometry, token, delay=delay,
-                                    max_clicks=10000, progress=progress)
+                count = 0
+                for index, batch in enumerate(batches, 1):
+                    token.wait_until_ready()
+                    if index > 1:
+                        # A separate play_clicks call must not remove the wait
+                        # between the previous contour's last pick and this one.
+                        if count and len(batch.screen):
+                            token.sleep(delay)
+                        verify_scene(force=True)
+                    self.events.put(("contour_progress", token.generation, frame_id,
+                                     index, len(batches), 0, len(batch.screen)))
+                    if not len(batch.screen):
+                        self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
+                        continue
+                    def progress(done, total):
+                        self.events.put(("picked", token.generation, frame_id,
+                                         tuple(map(int, batch.local[done-1])), done, total, index, len(batches)))
+                        # Record actual completion before a cancellation check
+                        # can discard the final worker result.
+                        if done == total:
+                            self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
+                    count += play_clicks(batch.screen, click, geometry, token, delay=delay,
+                                         max_clicks=10000, progress=progress)
                 token.sleep(.12)
                 self.desktop.ensure_target(target)
                 after = self._capture_region(geometry)
                 if background is not None and screen_background_changed(reference, after, background) > .03:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
-                return {"count": count, "ids": {c.id for c in candidates}, "reference": after,
-                        "auto": auto, "scene_verified": background is not None}
+                return {"count": count, "ids": {batch.candidate_id for batch in batches}, "reference": after,
+                        "auto": auto, "contours": len(batches), "scene_verified": background is not None}
             self._submit("model picks", work)
         self._schedule(90, begin)
 
@@ -738,7 +839,13 @@ class ScreenPickerApp:
                 raise ValueError("Choose 1–1000 frames and a load wait of 1–60 seconds.")
             self.auto_remaining, self.auto_history, self.paused = count, [], False
             self.hotkeys.enable_space_pause(True)
-            self._start_detection(auto=True)
+            if self.candidates and self.reference is not None:
+                # Execute the exact displayed proposals. The picking worker
+                # first compares a fresh clean capture with this reference.
+                self.auto_history = [self.reference.copy()]
+                self._start_model_picks(self.candidates, auto=True)
+            else:
+                self._start_detection(auto=True)
         except Exception as exc:
             self._error(exc)
 
@@ -787,7 +894,7 @@ class ScreenPickerApp:
             self.status.set(f"{value['count']} picks placed. Hold left mouse button to draw the next shape.")
         elif kind == "recognition":
             same_scene = self.reference is not None and screen_changed_fraction(self.reference, value["rgb"]) < .02
-            if not same_scene or value["auto"]:
+            if not same_scene:
                 self.picked_points.clear()
             self.rgb = value["rgb"]
             self.reference = self.rgb.copy()
@@ -882,8 +989,17 @@ class ScreenPickerApp:
                 elif item[0] == "picked":
                     if item[2] == self.frame_id:
                         self.picked_points.add(item[3])
-                    if item[1] == self.runner.generation:
-                        self.status.set(f"Picking: {item[4]} / {item[5]}. Escape stops.")
+                    if item[1] == self.runner.generation and item[2] == self.frame_id:
+                        self.status.set(f"Contour {item[6]}/{item[7]}: {item[4]}/{item[5]} picks. Escape stops.")
+                elif item[0] == "contour_progress":
+                    if item[1] == self.runner.generation and item[2] == self.frame_id:
+                        self.status.set(f"Contour {item[3]}/{item[4]}: {item[5]}/{item[6]} picks. Escape stops.")
+                elif item[0] == "contour_done" and item[2] == self.frame_id:
+                    # A successful final click is still real when Escape
+                    # invalidates the worker before its result is delivered.
+                    self.candidates = [candidate for candidate in self.candidates if candidate.id != item[3]]
+                    if any(candidate.id == item[3] for candidate in self.alternatives):
+                        self.alternatives = []
         except queue.Empty:
             pass
         for result in self.runner.poll_results():
@@ -937,11 +1053,12 @@ class ScreenPickerApp:
                             break
             self.ttk.Button(frame, text="Browse…", command=browse).grid(row=1, column=2, padx=4)
             for index, (label, variable, values) in enumerate((("Device", self.device, ("auto", "cpu", "cuda")),
-                                                               ("Model type", self.model_type, ("vit_b", "vit_l", "vit_h"))), 2):
+                                                               ("Model type", self.model_type, ("vit_b", "vit_l", "vit_h")),
+                                                               ("Detection profile", self.automatic_profile, ("capsid", "generic"))), 2):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
-                                                                        ("Click delay (seconds)", self.click_delay, .02, 2, .01)), 4):
+                                                                        ("Click delay (seconds)", self.click_delay, .02, 2, .01)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
             def close_settings():
@@ -951,7 +1068,9 @@ class ScreenPickerApp:
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=6, column=0, columnspan=3, pady=(10, 0))
+            self.ttk.Label(frame, text="capsid: dense interiors; generic: all SAM regions", wraplength=410).grid(
+                row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=8, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)

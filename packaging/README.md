@@ -3,7 +3,7 @@
 This directory turns the source into an installed Windows x64 application. The
 installer includes the Python interpreter, Tcl/Tk, CPU PyTorch/torchvision,
 desktop automation libraries, and the original SAM ViT-B weights. End users
-install `SARU-Picker-Setup-2.1.1-win64.exe` and open **SARU Picker** from the Start
+install `SARU-Picker-Setup-2.2.0-win64.exe` and open **SARU Picker** from the Start
 menu or desktop shortcut. The installed application does not download models.
 
 The source archive is not itself an installer. A successful Windows workflow
@@ -122,7 +122,7 @@ acceptance test until those steps have actually been completed.
 Build outputs:
 
 - `dist/SARU_Picker/`: full portable application directory.
-- `artifacts/SARU-Picker-Setup-2.1.1-win64.exe`: Windows installer.
+- `artifacts/SARU-Picker-Setup-2.2.0-win64.exe`: Windows installer.
 - `artifacts/frozen-smoke-test.json`: frozen application validation.
 - `artifacts/installed-smoke-test.json`: installation validation when requested.
 - `artifacts/build-manifest.json`: versions, source commit, and model checksum.

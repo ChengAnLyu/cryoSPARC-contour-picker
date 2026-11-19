@@ -1,16 +1,16 @@
-# SARU Picker 2.1 for Windows
+# SARU Picker 2.2 for Windows
 
-Install **SARU-Picker-Setup-2.1.1-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed.
+Install **SARU-Picker-Setup-2.2.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 ## Work directly over cryoSPARC
 
-The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer. Version 2.1.1 keeps the panel visible during drawing, detection and picking, and sizes it to fit its controls and Windows text scaling. The terminate button has a reserved footer.
+The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer. The panel stays visible during drawing, detection and picking, and sizes itself to fit its controls and Windows text scaling. The terminate button has a reserved footer. Version 2.2 preserves these UI fixes and the original manual picking path.
 
 | Mode | Screen interaction |
 | --- | --- |
 | manual | Uncheck Disable Picking, hold left mouse to trace a red contour, then release to fill it with picks. No ROI or model step. |
-| semi-auto | Select screen area, Detect, then click inside an intended green proposal to pick it. Box prompt and Next alternative support guided selection. |
-| auto | Select screen area, choose frame count and wait, enable picking, and Start auto. All proposals are accepted for the bounded run. |
+| semi-auto | Select screen area, Detect, then click and release inside one intended green contour to fill only that contour. Box prompt and Next alternative support guided selection. |
+| auto | Select screen area, optionally Detect first, choose frame count and wait, enable picking, and Start auto. It fills every displayed contour one after another before advancing frames. |
 
 Escape stops and disables picking. Space pauses/resumes an active auto run; F8 is an additional pause key. Keep cryoSPARC on the primary monitor and keep its micrograph zoom and position fixed during recognition and playback.
 
@@ -34,6 +34,6 @@ Native UI checks create their own synthetic target window. They verify that anno
 
 The installer uses a normal application folder so its model does not need to be unpacked each launch. It is built on Windows because [PyInstaller distributions are platform-specific](https://pyinstaller.org/en/stable/operating-mode.html).
 
-Packaging improves deployment. The recognition model remains original SAM and its automatic proposals still need evaluation on representative micrographs. Live capture, hotkeys and click alignment must also be checked on the user's workstation.
+The default capsid profile adds a conservative texture-based interior filter to original SAM. It is not a trained capsid classifier; faint targets, fragments, and ambiguous material still need review. Advanced settings retain a generic SAM profile for comparison. Both screen model modes use the manual spacing convention per contour and avoid crowding earlier picks. Live capture, hotkeys and click alignment must also be checked on the user's workstation.
 
 See [the main guide](README.md) for operation and [maintainer instructions](packaging/README.md) for building.

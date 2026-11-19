@@ -2,8 +2,9 @@
 
 The bounding-box phase, integer row height, alternating integer offset, and
 boundary rule are deliberately preserved from the original picking script.
-This differs from the bitmap sampler used for model masks. No screen input is
-sent here; callers must receive the complete result before starting playback.
+Model masks use the same lattice with actual bitmap membership, preserving
+holes. No screen input is sent here; callers must receive the complete result
+before starting playback.
 """
 from __future__ import annotations
 
@@ -124,6 +125,77 @@ def legacy_contour_points(points, spacing: int, max_points: int = 10_000,
         if len(xs):
             result.append(np.column_stack((xs, np.full(len(xs), y, dtype=np.int64))))
     _manual_check_cancel(cancel)
+    if not result:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.concatenate(result).astype(np.int32)
+
+
+def mask_contour_points(mask, spacing: int, max_points: int = 10_000,
+                        cancel=None) -> np.ndarray:
+    """Sample one detected contour on the manual grid, without a boundary inset.
+
+    The origin is this mask's true-pixel bounding box, not the whole screenshot
+    or a union of detections. Row height and alternate-row offset use the same
+    integer arithmetic as ``legacy_contour_points``. Membership comes from the
+    actual mask rather than a polygon: holes and empty spaces between mask
+    components remain empty, and true boundary pixels remain eligible.
+
+    Return an ``N x 2`` int32 array of image-local coordinates in row order.
+    Invalid input or excessive work raises ValueError before returning any
+    positions. Cancellation raises CancelledOperation. The mask is never
+    changed, and an all-false mask has no positions.
+    """
+    if cancel is not None and not callable(cancel):
+        raise ValueError("cancel must be callable or None.")
+    def check_cancel():
+        if cancel is not None and cancel():
+            raise CancelledOperation("Detected contour sampling cancelled.")
+    check_cancel()
+    integer_limit = int(np.iinfo(np.int32).max)
+    if (isinstance(spacing, (bool, np.bool_))
+            or not isinstance(spacing, (int, np.integer))
+            or not 2 <= spacing <= integer_limit):
+        raise ValueError("spacing must be an integer of at least 2 pixels within the screen-coordinate range.")
+    if (isinstance(max_points, (bool, np.bool_))
+            or not isinstance(max_points, (int, np.integer)) or max_points < 1):
+        raise ValueError("max_points must be a positive integer.")
+    spacing, max_points = int(spacing), int(max_points)
+    try:
+        bitmap = np.asarray(mask)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A contour mask must be a nonempty two-dimensional Boolean or 0/1 array.") from exc
+    if (bitmap.ndim != 2 or 0 in bitmap.shape
+            or any(length > integer_limit for length in bitmap.shape)
+            or bitmap.dtype.kind not in "biuf"):
+        raise ValueError("A contour mask must be a nonempty two-dimensional Boolean or 0/1 array.")
+    if bitmap.dtype != np.bool_:
+        if not np.isin(bitmap, (0, 1)).all():
+            raise ValueError("A contour mask must contain only Boolean or 0/1 values.")
+        bitmap = bitmap.astype(bool)
+    check_cancel()
+    ys = np.flatnonzero(bitmap.any(axis=1))
+    if not len(ys):
+        return np.empty((0, 2), dtype=np.int32)
+    xs = np.flatnonzero(bitmap.any(axis=0))
+    x_min, x_max, y_min, y_max = int(xs[0]), int(xs[-1]), int(ys[0]), int(ys[-1])
+    row_height = int(spacing * math.sqrt(3) / 2)
+    rows = (y_max - y_min) // row_height + 1
+    columns = (x_max - x_min) // spacing + 1
+    if rows > _MANUAL_MAX_ROWS or rows * columns > _MANUAL_MAX_GRID_SITES:
+        raise ValueError("The contour requires too many sampling checks; increase spacing or select a smaller area.")
+    result = []
+    total = 0
+    for row, y in enumerate(range(y_min, y_max + 1, row_height)):
+        check_cancel()
+        x_start = x_min + (spacing // 2 if row % 2 else 0)
+        row_xs = np.arange(x_start, x_max + 1, spacing, dtype=np.int64)
+        row_xs = row_xs[bitmap[y, row_xs]]
+        total += len(row_xs)
+        if total > max_points:
+            raise ValueError(f"More than {max_points:,} contour pick positions were requested; increase spacing or select a smaller area.")
+        if len(row_xs):
+            result.append(np.column_stack((row_xs, np.full(len(row_xs), y, dtype=np.int64))))
+    check_cancel()
     if not result:
         return np.empty((0, 2), dtype=np.int32)
     return np.concatenate(result).astype(np.int32)

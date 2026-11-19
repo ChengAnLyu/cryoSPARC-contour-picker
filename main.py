@@ -1,8 +1,249 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.1.1: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 2.2.0: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
+
+
+# ---------------- capsid.py ----------------
+
+from collections.abc import Callable, Iterable, Mapping
+import math
+from typing import Any
+
+import numpy as np
+from scipy import ndimage as ndi
+
+
+def _capsid_check(check_cancel: Callable[[], None] | None) -> None:
+    if check_cancel is not None:
+        check_cancel()
+
+
+def _capsid_texture(rgb: np.ndarray, check_cancel: Callable[[], None] | None):
+    """Return isotropic grain contrast and a conservative screenshot ROI mask.
+
+    The smaller structure-tensor eigenvalue suppresses the coherent gradient
+    along a membrane while retaining gradients in both directions inside
+    granular density. All comparisons below are relative, so a linear contrast
+    adjustment does not introduce a fixed grayscale density threshold.
+    """
+    _capsid_check(check_cancel)
+    gray = np.mean(rgb, axis=2, dtype=np.float32) / 255.0
+    # Pure white margins, UI colour and scale bars must not become grain cues.
+    # Rejecting these pixels is distinct from treating dark pixels as capsids.
+    chroma = np.max(rgb, axis=2).astype(np.int16) - np.min(rgb, axis=2)
+    # Restrict the exclusion to nearly uniform white UI; bright/dark grain
+    # pixels inside a capsid are legitimate data and must remain available.
+    white_ui = ndi.uniform_filter(gray, size=7) > .97
+    valid = (chroma < 8) & ~white_ui
+    valid = ndi.binary_erosion(valid, iterations=3, border_value=1)
+    _capsid_check(check_cancel)
+    smooth = ndi.gaussian_filter(gray, 1.5)
+    gy, gx = np.gradient(smooth)
+    # A narrow orientation window avoids mistaking a curved membrane for
+    # isotropic grain simply because its tangent changes across the window.
+    xx = ndi.gaussian_filter(gx * gx, 4)
+    _capsid_check(check_cancel)
+    xy = ndi.gaussian_filter(gx * gy, 4)
+    yy = ndi.gaussian_filter(gy * gy, 4)
+    discriminant = np.sqrt(np.maximum((xx - yy) ** 2 + 4 * xy * xy, 0))
+    minor = np.sqrt(np.maximum((xx + yy - discriminant) * .5, 0))
+    coherence = discriminant / (xx + yy + 1e-9)
+    texture = ndi.gaussian_filter(minor * np.clip(1 - coherence, 0, 1), 4)
+    _capsid_check(check_cancel)
+    return texture, valid
+
+
+def _capsid_bbox(mask: np.ndarray) -> list[int]:
+    yy, xx = np.nonzero(mask)
+    return [int(xx.min()), int(yy.min()), int(xx.max() - xx.min() + 1),
+            int(yy.max() - yy.min() + 1)]
+
+
+def _capsid_field_bounds(valid: np.ndarray) -> tuple[int, int, int, int]:
+    """Locate the grayscale field, allowing screenshot margins around it."""
+    columns = np.mean(valid, axis=0)
+    rows = np.mean(valid, axis=1)
+    xx = np.flatnonzero(columns >= max(.1, float(columns.max()) * .5))
+    yy = np.flatnonzero(rows >= max(.1, float(rows.max()) * .5))
+    if not len(xx) or not len(yy):
+        return 0, 0, valid.shape[1] - 1, valid.shape[0] - 1
+    return int(xx[0]), int(yy[0]), int(xx[-1]), int(yy[-1])
+
+
+def _capsid_screen_sides(mask: np.ndarray, bounds: tuple[int, int, int, int]) -> int:
+    x0, y0, x1, y1 = bounds
+    horizontal_min = max(3, (x1 - x0 + 1) * .02)
+    vertical_min = max(3, (y1 - y0 + 1) * .02)
+    return sum((
+        np.count_nonzero(mask[y0:min(y0 + 3, y1 + 1), x0:x1 + 1]) >= horizontal_min,
+        np.count_nonzero(mask[max(y0, y1 - 2):y1 + 1, x0:x1 + 1]) >= horizontal_min,
+        np.count_nonzero(mask[y0:y1 + 1, x0:min(x0 + 3, x1 + 1)]) >= vertical_min,
+        np.count_nonzero(mask[y0:y1 + 1, max(x0, x1 - 2):x1 + 1]) >= vertical_min,
+    ))
+
+
+def filter_capsid_proposals(
+    rgb: np.ndarray,
+    raw_proposals: Iterable[Mapping[str, Any]],
+    *,
+    check_cancel: Callable[[], None] | None = None,
+    min_area_ratio: float = .002,
+    max_area_ratio: float = .40,
+    min_local_texture_ratio: float = 1.18,
+    min_global_texture_ratio: float = 1.10,
+    max_candidates: int = 24,
+) -> list[dict[str, Any]]:
+    """Select dense interiors of permissive SAM proposals, in evidence order.
+
+    ``raw_proposals`` use SAM's ``segmentation`` dictionary field. Returned
+    records have new masks/areas/bboxes, ``capsid_score`` (an uncalibrated rank),
+    and numerical ``capsid_evidence``. The inherited SAM quality numbers are
+    moved into evidence: they do not estimate the modified core masks' IoU.
+
+    Use permissive SAM proposal thresholds before this function (currently
+    .50 predicted IoU / .75 stability); filtering strict generic masks first
+    can remove the inner core before the content checks ever see it.
+
+    The work is bounded to 128 area-eligible proposals and 24 returned regions
+    by default. Cancellation is checked between feature and proposal passes.
+    """
+    rgb = np.asarray(rgb)
+    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+        raise ValueError("Capsid proposals require an H x W x 3 uint8 RGB image.")
+    if min(rgb.shape[:2]) < 4:
+        return []
+    if not (0 <= min_area_ratio < max_area_ratio <= 1):
+        raise ValueError("Capsid area ratios must satisfy 0 <= min < max <= 1.")
+    if max_candidates <= 0:
+        return []
+    _capsid_check(check_cancel)
+    shape = rgb.shape[:2]
+    pixels = int(np.prod(shape))
+    min_area = max(64, math.ceil(min_area_ratio * pixels))
+    max_area = max_area_ratio * pixels
+    proposals = []
+    for proposal in raw_proposals:
+        _capsid_check(check_cancel)
+        mask = np.asarray(proposal["segmentation"], dtype=bool)
+        if mask.shape != shape:
+            raise ValueError("A SAM proposal has a different size from the screenshot.")
+        area = int(np.count_nonzero(mask))
+        if min_area <= area <= max_area:
+            proposals.append((proposal, mask, area))
+    if not proposals:
+        return []
+    # Small isolated fragments must not hide larger cores just by arriving
+    # first. Bound the expensive per-region passes using proposal objectness.
+    proposals.sort(key=lambda entry: float(entry[0].get("predicted_iou") or 0), reverse=True)
+    proposals = proposals[:128]
+    texture, valid = _capsid_texture(rgb, check_cancel)
+    if np.count_nonzero(valid) < min_area:
+        return []
+    global_median = float(np.median(texture[valid]))
+    if global_median < 1e-7:
+        return []
+    field_bounds = _capsid_field_bounds(valid)
+    refined = []
+    for proposal, mask, area in proposals:
+        _capsid_check(check_cancel)
+        screen_sides = _capsid_screen_sides(mask & valid, field_bounds)
+        # Background/carbon partitions commonly follow three screen sides.
+        # Keep one- or two-sided cropped objects; a very tight crop can need
+        # the existing box-prompt mode instead of automatic classification.
+        if screen_sides >= 3:
+            continue
+        # Keep the acquisition/screen edge open for partially visible capsids.
+        inset = max(2, min(6, round(math.sqrt(area / math.pi) * .045)))
+        interior = ndi.binary_erosion(mask, iterations=inset, border_value=1) & valid
+        annulus = (ndi.binary_dilation(mask, iterations=20)
+                   & ~ndi.binary_dilation(mask, iterations=3) & valid)
+        if np.count_nonzero(interior) < min_area or np.count_nonzero(annulus) < 50:
+            continue
+        outside = float(np.median(texture[annulus]))
+        upper_inside = float(np.quantile(texture[interior], .85))
+        upper_outside = float(np.quantile(texture[annulus], .85))
+        upper_ratio = upper_inside / max(upper_outside, 1e-7)
+        # Compare like quantiles before selecting a bright tail. Without this
+        # check even an empty, textured background has a selected upper tail.
+        # Unlike an envelope-median gate, a minority dense core can pass.
+        if upper_ratio < 1.08:
+            continue
+        _capsid_check(check_cancel)
+        # Separate the robust upper interior signal from the local background
+        # at their contrast midpoint. A threshold barely above background
+        # would otherwise retain a diffuse halo around a dense core.
+        threshold = max(outside * 1.08,
+                        (outside + upper_inside) * .5,
+                        global_median * 1.02)
+        support = interior & (texture > threshold)
+        support = ndi.binary_closing(support, iterations=4, border_value=1) & interior
+        # Do not fill low-texture holes or excluded pixels: the examples leave
+        # dense dark contaminants unpicked, and original SAM holes must remain.
+        support &= mask & valid
+        labels, count = ndi.label(support)
+        component_min = max(min_area, math.ceil(area * .10))
+        for label in range(1, count + 1):
+            _capsid_check(check_cancel)
+            component = labels == label
+            component_area = int(np.count_nonzero(component))
+            if component_area < component_min:
+                continue
+            # Score the candidate core itself. A real capsid can occupy a
+            # minority of a large envelope, so the envelope-wide median is
+            # not a valid prerequisite for finding it.
+            inside = float(np.median(texture[component]))
+            local_ratio = inside / max(outside, 1e-7)
+            global_ratio = inside / global_median
+            if local_ratio < min_local_texture_ratio or global_ratio < min_global_texture_ratio:
+                continue
+            # Density score is explicitly not a probability or SAM IoU.
+            density_rank = min(local_ratio, 3.0) * min(global_ratio, 3.0)
+            _, _, proposal_width, proposal_height = _capsid_bbox(mask)
+            elongation = max(proposal_width, proposal_height) / max(1, min(proposal_width, proposal_height))
+            # A soft ordering cue, never a polygonality/roundness exclusion.
+            # It prevents a long merged screen-edge region from hiding a
+            # compact dense core already present among nested SAM proposals.
+            rank = density_rank * math.sqrt(component_area) / max(1.0, elongation)
+            result = dict(proposal)
+            evidence = {
+                "local_texture_ratio": local_ratio,
+                "global_texture_ratio": global_ratio,
+                "texture_threshold": threshold,
+                "upper_texture_ratio": upper_ratio,
+                "screen_sides": int(screen_sides),
+                "proposal_area": area,
+                "core_area": component_area,
+                "proposal_predicted_iou": proposal.get("predicted_iou"),
+                "proposal_stability_score": proposal.get("stability_score"),
+                "is_calibrated_probability": False,
+            }
+            result.update(segmentation=component, area=component_area,
+                          bbox=_capsid_bbox(component), predicted_iou=None,
+                          stability_score=None, capsid_score=float(rank),
+                          capsid_evidence=evidence,
+                          source="capsid texture core (review)")
+            refined.append(result)
+    # Resolve duplicate/nested proposals only after the content check. Favour
+    # supported target extent over a tiny, very dark patch nested inside it.
+    refined.sort(key=lambda record: record["capsid_score"], reverse=True)
+    selected = []
+    for record in refined:
+        _capsid_check(check_cancel)
+        mask, area = record["segmentation"], record["area"]
+        duplicate = False
+        for previous in selected:
+            overlap = int(np.count_nonzero(mask & previous["segmentation"]))
+            if overlap / min(area, previous["area"]) >= .80:
+                duplicate = True
+                break
+        if not duplicate:
+            selected.append(record)
+            if len(selected) >= max_candidates:
+                break
+    return selected
+
 
 
 # ---------------- recognition.py ----------------
@@ -18,6 +259,7 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw
+
 
 CancelCheck = Callable[[], bool] | None
 
@@ -51,12 +293,15 @@ class RecognitionConfig:
     exclude_border: bool = False
     overlap_threshold: float = 0.80
     prefer_smaller: bool = True
+    automatic_profile: str = "capsid"
 
     def __post_init__(self) -> None:
         if self.model_type not in {"vit_b", "vit_l", "vit_h"}:
             raise ValueError("model_type must be vit_b, vit_l, or vit_h.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda.")
+        if self.automatic_profile not in {"capsid", "generic"}:
+            raise ValueError("automatic_profile must be capsid or generic.")
         for name in ("cpu_threads", "points_per_side"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -152,7 +397,8 @@ def _image_key(rgb: np.ndarray) -> str:
 
 
 def filter_candidates(candidates: Iterable[Candidate], config: RecognitionConfig,
-                      cancel: CancelCheck = None) -> list[Candidate]:
+                      cancel: CancelCheck = None, *,
+                      suppress_duplicates: bool = True) -> list[Candidate]:
     """Geometric filtering only: this does not classify inner capsids.
 
     Duplicate suppression uses intersection / smaller-mask area.  With
@@ -181,6 +427,11 @@ def filter_candidates(candidates: Iterable[Candidate], config: RecognitionConfig
         if border_occupancy / int(border.sum()) > config.max_border_fraction:
             continue
         survivors.append(candidate)
+
+    if not suppress_duplicates:
+        # The capsid path has already resolved nested proposals by image
+        # evidence. Do not run the generic smallest-mask preference again.
+        return sorted(survivors, key=lambda c: (c.bbox[1], c.bbox[0], c.id))
 
     def quality(candidate: Candidate) -> float:
         return candidate.predicted_iou if candidate.predicted_iou is not None else -1.0
@@ -224,6 +475,7 @@ class SamRecognizer:
         self._predictor_image_key: str | None = None
         self._automatic_image_key: str | None = None
         self._automatic_result: list[Candidate] | None = None
+        self.last_detection: dict | None = None
         self._active_cancel: CancelCheck = None
         self.device: str | None = None
 
@@ -281,8 +533,13 @@ class SamRecognizer:
                 model=model,
                 points_per_side=self.config.points_per_side,
                 points_per_batch=self.config.points_per_batch or (32 if device == "cuda" else 8),
-                pred_iou_thresh=self.config.pred_iou_thresh,
-                stability_score_thresh=self.config.stability_score_thresh,
+                # The capsid pass needs inner candidates that generic SAM's
+                # stability gate can omit. Domain filtering follows inference;
+                # these permissive proposal thresholds are not acceptance scores.
+                pred_iou_thresh=(0.50 if self.config.automatic_profile == "capsid"
+                                 else self.config.pred_iou_thresh),
+                stability_score_thresh=(0.75 if self.config.automatic_profile == "capsid"
+                                       else self.config.stability_score_thresh),
                 box_nms_thresh=0.7,
                 crop_n_layers=0,
                 min_mask_region_area=0,  # Preserve holes and disconnected regions.
@@ -376,7 +633,12 @@ class SamRecognizer:
 
     def automatic(self, rgb: np.ndarray | Image.Image,
                   cancel: CancelCheck = None) -> list[Candidate]:
-        """Generate unclassified region proposals on a sparse grid for review."""
+        """Generate reviewable regions using the configured automatic profile.
+
+        The capsid profile refines permissive SAM proposals with local texture
+        evidence. It is a conservative image heuristic, not a trained capsid
+        classifier. Generic mode retains the previous proposal pipeline.
+        """
         rgb = validate_rgb(rgb)
         _check_cancel(cancel)
         key = _image_key(rgb)
@@ -388,19 +650,44 @@ class SamRecognizer:
             with self._torch.inference_mode():
                 raw = self._generator.generate(rgb)
             _check_cancel(cancel)
+            for item in raw:
+                _check_cancel(cancel)
+                mask = _validate_mask(item["segmentation"])
+                if mask.shape != rgb.shape[:2]:
+                    raise RecognitionError("SAM returned a mask with the wrong image dimensions.")
+            raw_count = len(raw)
+            is_capsid = self.config.automatic_profile == "capsid"
+            if is_capsid:
+                raw = filter_capsid_proposals(
+                    rgb, raw, check_cancel=lambda: _check_cancel(cancel),
+                    min_area_ratio=self.config.min_area_ratio,
+                    max_area_ratio=min(self.config.max_area_ratio, .40))
             candidates = []
+            evidence = {}
             for item in raw:
                 _check_cancel(cancel)
                 mask = np.asarray(item["segmentation"])
                 if mask.shape != rgb.shape[:2]:
                     raise RecognitionError("SAM returned a mask with the wrong image dimensions.")
                 if np.any(mask):
-                    candidates.append(make_candidate(
+                    candidate = make_candidate(
                         mask, predicted_iou=item.get("predicted_iou"),
                         stability_score=item.get("stability_score"),
-                        source="automatic proposal", image_key=key))
-            result = filter_candidates(candidates, self.config, cancel)
+                        source=item.get("source", "automatic proposal"), image_key=key)
+                    candidates.append(candidate)
+                    if item.get("capsid_evidence") is not None:
+                        evidence[candidate.id] = dict(item["capsid_evidence"])
+            result = filter_candidates(candidates, self.config, cancel,
+                                       suppress_duplicates=not is_capsid)
             _check_cancel(cancel)
+            self.last_detection = {
+                "profile": self.config.automatic_profile,
+                "sam_proposals": raw_count,
+                "selected_contours": len(result),
+                "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
+                "note": ("Image-based dense-core filter; not a trained or calibrated capsid classifier."
+                         if is_capsid else "Unclassified generic SAM proposals."),
+            }
             self._automatic_image_key, self._automatic_result = key, result
             return list(result)
         except (Cancelled, RecognitionError):
@@ -420,6 +707,7 @@ class SamRecognizer:
         self._model = self._predictor = self._generator = None
         self._predictor_image_key = self._automatic_image_key = None
         self._automatic_result = None
+        self.last_detection = None
         self._torch, self.device = None, None
         gc.collect()
         if torch is not None and device == "cuda":
@@ -1510,6 +1798,77 @@ def legacy_contour_points(points, spacing: int, max_points: int = 10_000,
     return np.concatenate(result).astype(np.int32)
 
 
+def mask_contour_points(mask, spacing: int, max_points: int = 10_000,
+                        cancel=None) -> np.ndarray:
+    """Sample one detected contour on the manual grid, without a boundary inset.
+
+    The origin is this mask's true-pixel bounding box, not the whole screenshot
+    or a union of detections. Row height and alternate-row offset use the same
+    integer arithmetic as ``legacy_contour_points``. Membership comes from the
+    actual mask rather than a polygon: holes and empty spaces between mask
+    components remain empty, and true boundary pixels remain eligible.
+
+    Return an ``N x 2`` int32 array of image-local coordinates in row order.
+    Invalid input or excessive work raises ValueError before returning any
+    positions. Cancellation raises CancelledOperation. The mask is never
+    changed, and an all-false mask has no positions.
+    """
+    if cancel is not None and not callable(cancel):
+        raise ValueError("cancel must be callable or None.")
+    def check_cancel():
+        if cancel is not None and cancel():
+            raise CancelledOperation("Detected contour sampling cancelled.")
+    check_cancel()
+    integer_limit = int(np.iinfo(np.int32).max)
+    if (isinstance(spacing, (bool, np.bool_))
+            or not isinstance(spacing, (int, np.integer))
+            or not 2 <= spacing <= integer_limit):
+        raise ValueError("spacing must be an integer of at least 2 pixels within the screen-coordinate range.")
+    if (isinstance(max_points, (bool, np.bool_))
+            or not isinstance(max_points, (int, np.integer)) or max_points < 1):
+        raise ValueError("max_points must be a positive integer.")
+    spacing, max_points = int(spacing), int(max_points)
+    try:
+        bitmap = np.asarray(mask)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A contour mask must be a nonempty two-dimensional Boolean or 0/1 array.") from exc
+    if (bitmap.ndim != 2 or 0 in bitmap.shape
+            or any(length > integer_limit for length in bitmap.shape)
+            or bitmap.dtype.kind not in "biuf"):
+        raise ValueError("A contour mask must be a nonempty two-dimensional Boolean or 0/1 array.")
+    if bitmap.dtype != np.bool_:
+        if not np.isin(bitmap, (0, 1)).all():
+            raise ValueError("A contour mask must contain only Boolean or 0/1 values.")
+        bitmap = bitmap.astype(bool)
+    check_cancel()
+    ys = np.flatnonzero(bitmap.any(axis=1))
+    if not len(ys):
+        return np.empty((0, 2), dtype=np.int32)
+    xs = np.flatnonzero(bitmap.any(axis=0))
+    x_min, x_max, y_min, y_max = int(xs[0]), int(xs[-1]), int(ys[0]), int(ys[-1])
+    row_height = int(spacing * math.sqrt(3) / 2)
+    rows = (y_max - y_min) // row_height + 1
+    columns = (x_max - x_min) // spacing + 1
+    if rows > _MANUAL_MAX_ROWS or rows * columns > _MANUAL_MAX_GRID_SITES:
+        raise ValueError("The contour requires too many sampling checks; increase spacing or select a smaller area.")
+    result = []
+    total = 0
+    for row, y in enumerate(range(y_min, y_max + 1, row_height)):
+        check_cancel()
+        x_start = x_min + (spacing // 2 if row % 2 else 0)
+        row_xs = np.arange(x_start, x_max + 1, spacing, dtype=np.int64)
+        row_xs = row_xs[bitmap[y, row_xs]]
+        total += len(row_xs)
+        if total > max_points:
+            raise ValueError(f"More than {max_points:,} contour pick positions were requested; increase spacing or select a smaller area.")
+        if len(row_xs):
+            result.append(np.column_stack((row_xs, np.full(len(row_xs), y, dtype=np.int64))))
+    check_cancel()
+    if not result:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.concatenate(result).astype(np.int32)
+
+
 # ---------------- screen_overlay.py ----------------
 
 
@@ -2343,6 +2702,8 @@ def verify_screen_overlay(root) -> dict:
 # ---------------- screen_app.py ----------------
 
 import logging
+from dataclasses import dataclass
+import math
 from pathlib import Path
 import queue
 import threading
@@ -2377,16 +2738,72 @@ def screen_mask_at(candidates, geometry, x, y):
     return None
 
 
+@dataclass(frozen=True)
+class ScreenContourBatch:
+    candidate_id: str
+    local: np.ndarray
+    screen: np.ndarray
+
+
+def screen_model_batches(candidates, geometry, spacing, picked=(), cancel=None,
+                         max_points=10000):
+    """Prepare every contour before clicking, retaining detection order.
+
+    Each contour owns its grid origin. Sites too close to earlier actual or
+    planned picks are removed without moving any retained site or changing
+    comparisons within the contour. The threshold is the minimum neighboring
+    distance in the manual integer lattice. Empty batches still represent a
+    processed contour, and the point limit applies after filtering.
+    """
+    from scipy.spatial import cKDTree
+    if (isinstance(max_points, (bool, np.bool_))
+            or not isinstance(max_points, (int, np.integer)) or max_points < 1):
+        raise ValueError("max_points must be a positive integer.")
+    already = {tuple(map(int, point)) for point in picked}
+    batches, count = [], 0
+    for candidate in candidates:
+        if candidate.mask.shape != (geometry.height, geometry.width):
+            raise ValueError("A detected contour no longer matches the selected screen area.")
+        # The sampler separately bounds lattice work. Raw sites may exceed
+        # the click budget when most are removed by existing picks, so enforce
+        # that budget only after proximity filtering.
+        positions = mask_contour_points(candidate.mask, spacing,
+                                        max_points=int(candidate.mask.size), cancel=cancel)
+        if already and len(positions):
+            row_height = int(int(spacing) * math.sqrt(3) / 2)
+            minimum = min(float(spacing), math.hypot(int(spacing)//2, row_height))
+            threshold = minimum - 1e-7 * max(1.0, minimum)
+            previous = cKDTree(np.asarray(tuple(already), dtype=np.float64))
+            parts, accepted = [], 0
+            for start in range(0, len(positions), 4096):
+                if cancel is not None and cancel():
+                    raise CancelledOperation("Detected contour planning cancelled.")
+                chunk = positions[start:start+4096]
+                distances, _ = previous.query(chunk, k=1, distance_upper_bound=minimum)
+                part = chunk[distances >= threshold]
+                accepted += len(part)
+                if count + accepted > max_points:
+                    raise ValueError(f"More than {max_points:,} pick positions were requested across the contours; increase spacing or select fewer contours.")
+                parts.append(part)
+            local = np.concatenate(parts)
+        else:
+            local = positions
+        count += len(local)
+        if count > max_points:
+            raise ValueError(f"More than {max_points:,} pick positions were requested across the contours; increase spacing or select fewer contours.")
+        already.update(tuple(map(int, point)) for point in local)
+        screen = np.asarray([geometry.local_to_screen(int(x), int(y)) for x, y in local],
+                            dtype=np.int32).reshape(-1, 2)
+        batches.append(ScreenContourBatch(candidate.id, local, screen))
+    return batches
+
+
 def screen_model_points(candidates, geometry, spacing, picked=(), cancel=None):
-    """Sample the union once; model modes keep holes and avoid repeat clicks."""
-    mask = union_masks(candidates, (geometry.height, geometry.width))
-    local = sample_hex_grid(mask, spacing, inset=2, max_points=10000, cancel=cancel)
-    already = set(picked)
-    local = np.asarray([point for point in local if tuple(map(int, point)) not in already],
-                       dtype=np.int32).reshape(-1, 2)
-    screen = np.asarray([geometry.local_to_screen(int(x), int(y)) for x, y in local],
-                        dtype=np.int32).reshape(-1, 2)
-    return local, screen
+    """Return the ordered contour plans as one array for previews and callers."""
+    batches = screen_model_batches(candidates, geometry, spacing, picked, cancel)
+    if not batches:
+        return np.empty((0, 2), np.int32), np.empty((0, 2), np.int32)
+    return np.concatenate([batch.local for batch in batches]), np.concatenate([batch.screen for batch in batches])
 
 
 def screen_background_guard(candidates, geometry, spacing):
@@ -2548,8 +2965,9 @@ class ScreenPickerApp:
         self.checkpoint = tk.StringVar(value=str(checkpoint_path))
         self.model_type = tk.StringVar(value=getattr(self.args, "model_type", "vit_b"))
         self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
+        self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
         self.grid_side = tk.IntVar(value=8)
-        self.click_delay = tk.DoubleVar(value=.08)
+        self.click_delay = tk.DoubleVar(value=.10)
         self.status.trace_add("write", self._queue_panel_fit)
         self.region_label.trace_add("write", self._queue_panel_fit)
         self.fit_panel()
@@ -2740,9 +3158,28 @@ class ScreenPickerApp:
             elif self.mode == "semi-auto":
                 self._present_masks()
             else:
-                self.status.set("Auto ready. Select a screen area, then choose Start auto.")
+                self._show_auto_ready()
         except Exception as exc:
             self._error(exc)
+
+    def _show_auto_ready(self):
+        if (self.closed or self.mode != "auto" or self.disabled.get()
+                or self.auto_remaining or self.transition or self.advanced is not None):
+            return
+        if self.runner.busy:
+            # A cancelled native model call may still be returning. Keep its
+            # captures free of outlines until the worker has been collected.
+            self.status.set("Waiting for the previous operation to stop. Stored contours will return when ready.")
+            self._schedule(100, self._show_auto_ready)
+            return
+        if self.input_surface is not None and self.input_kind != "masks":
+            return
+        self._present_masks()
+        if self.candidates:
+            count = len(self.candidates)
+            self.status.set(f"Auto ready. {count} detected contour{'s' if count != 1 else ''} shown. Choose Start auto.")
+        else:
+            self.status.set("Auto ready. Select a screen area, then choose Start auto.")
 
     def _manual_input(self, epoch, kind, x, y):
         if (epoch != self._mouse_epoch or self.mode != "manual" or self.disabled.get()
@@ -2911,7 +3348,8 @@ class ScreenPickerApp:
 
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
-                                 device=self.device.get(), points_per_side=int(self.grid_side.get()))
+                                 device=self.device.get(), points_per_side=int(self.grid_side.get()),
+                                 automatic_profile=self.automatic_profile.get())
 
     def _get_recognizer(self, config):
         if self.recognizer is None or self.recognizer_config != config:
@@ -3021,39 +3459,61 @@ class ScreenPickerApp:
         def begin():
             self.transition = False
             def work(token):
-                local, screen = screen_model_points(candidates, geometry, spacing, picked,
-                                                     cancel=lambda: token.cancelled)
-                if not len(screen):
-                    raise ValueError("This region has no new pick positions at the current spacing.")
+                batches = screen_model_batches(candidates, geometry, spacing, picked,
+                                               cancel=lambda: token.cancelled)
+                if not batches:
+                    raise ValueError("There are no detected contours to pick.")
+                planned = sum(len(batch.screen) for batch in batches)
                 self.desktop.focus_target(target)
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the micrograph.")
                 if screen_changed_fraction(reference, self._capture_region(geometry)) > .03:
                     raise RuntimeError("The micrograph changed before picking. Detect again.")
-                background = screen_background_guard(candidates, geometry, spacing)
+                background = (screen_background_guard(candidates, geometry, spacing) if planned
+                              else np.ones((geometry.height, geometry.width), dtype=bool))
                 next_check = time.monotonic() + .75
-                def click(x, y):
+                def verify_scene(*, force=False):
                     nonlocal next_check
                     self.desktop.ensure_target(target)
-                    if background is not None and time.monotonic() >= next_check:
+                    if background is not None and (force or time.monotonic() >= next_check):
                         current = self._capture_region(geometry)
                         if screen_background_changed(reference, current, background) > .03:
                             raise RuntimeError("The micrograph changed during picking. Detect again.")
                         next_check = time.monotonic() + .75
+                def click(x, y):
+                    verify_scene()
                     self.desktop.click(x, y)
-                def progress(done, total):
-                    self.events.put(("picked", token.generation, frame_id,
-                                     tuple(map(int, local[done-1])), done, total))
-                count = play_clicks(screen, click, geometry, token, delay=delay,
-                                    max_clicks=10000, progress=progress)
+                count = 0
+                for index, batch in enumerate(batches, 1):
+                    token.wait_until_ready()
+                    if index > 1:
+                        # A separate play_clicks call must not remove the wait
+                        # between the previous contour's last pick and this one.
+                        if count and len(batch.screen):
+                            token.sleep(delay)
+                        verify_scene(force=True)
+                    self.events.put(("contour_progress", token.generation, frame_id,
+                                     index, len(batches), 0, len(batch.screen)))
+                    if not len(batch.screen):
+                        self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
+                        continue
+                    def progress(done, total):
+                        self.events.put(("picked", token.generation, frame_id,
+                                         tuple(map(int, batch.local[done-1])), done, total, index, len(batches)))
+                        # Record actual completion before a cancellation check
+                        # can discard the final worker result.
+                        if done == total:
+                            self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
+                    count += play_clicks(batch.screen, click, geometry, token, delay=delay,
+                                         max_clicks=10000, progress=progress)
                 token.sleep(.12)
                 self.desktop.ensure_target(target)
                 after = self._capture_region(geometry)
                 if background is not None and screen_background_changed(reference, after, background) > .03:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
-                return {"count": count, "ids": {c.id for c in candidates}, "reference": after,
-                        "auto": auto, "scene_verified": background is not None}
+                return {"count": count, "ids": {batch.candidate_id for batch in batches}, "reference": after,
+                        "auto": auto, "contours": len(batches), "scene_verified": background is not None}
             self._submit("model picks", work)
         self._schedule(90, begin)
 
@@ -3068,7 +3528,13 @@ class ScreenPickerApp:
                 raise ValueError("Choose 1–1000 frames and a load wait of 1–60 seconds.")
             self.auto_remaining, self.auto_history, self.paused = count, [], False
             self.hotkeys.enable_space_pause(True)
-            self._start_detection(auto=True)
+            if self.candidates and self.reference is not None:
+                # Execute the exact displayed proposals. The picking worker
+                # first compares a fresh clean capture with this reference.
+                self.auto_history = [self.reference.copy()]
+                self._start_model_picks(self.candidates, auto=True)
+            else:
+                self._start_detection(auto=True)
         except Exception as exc:
             self._error(exc)
 
@@ -3117,7 +3583,7 @@ class ScreenPickerApp:
             self.status.set(f"{value['count']} picks placed. Hold left mouse button to draw the next shape.")
         elif kind == "recognition":
             same_scene = self.reference is not None and screen_changed_fraction(self.reference, value["rgb"]) < .02
-            if not same_scene or value["auto"]:
+            if not same_scene:
                 self.picked_points.clear()
             self.rgb = value["rgb"]
             self.reference = self.rgb.copy()
@@ -3212,8 +3678,17 @@ class ScreenPickerApp:
                 elif item[0] == "picked":
                     if item[2] == self.frame_id:
                         self.picked_points.add(item[3])
-                    if item[1] == self.runner.generation:
-                        self.status.set(f"Picking: {item[4]} / {item[5]}. Escape stops.")
+                    if item[1] == self.runner.generation and item[2] == self.frame_id:
+                        self.status.set(f"Contour {item[6]}/{item[7]}: {item[4]}/{item[5]} picks. Escape stops.")
+                elif item[0] == "contour_progress":
+                    if item[1] == self.runner.generation and item[2] == self.frame_id:
+                        self.status.set(f"Contour {item[3]}/{item[4]}: {item[5]}/{item[6]} picks. Escape stops.")
+                elif item[0] == "contour_done" and item[2] == self.frame_id:
+                    # A successful final click is still real when Escape
+                    # invalidates the worker before its result is delivered.
+                    self.candidates = [candidate for candidate in self.candidates if candidate.id != item[3]]
+                    if any(candidate.id == item[3] for candidate in self.alternatives):
+                        self.alternatives = []
         except queue.Empty:
             pass
         for result in self.runner.poll_results():
@@ -3267,11 +3742,12 @@ class ScreenPickerApp:
                             break
             self.ttk.Button(frame, text="Browse…", command=browse).grid(row=1, column=2, padx=4)
             for index, (label, variable, values) in enumerate((("Device", self.device, ("auto", "cpu", "cuda")),
-                                                               ("Model type", self.model_type, ("vit_b", "vit_l", "vit_h"))), 2):
+                                                               ("Model type", self.model_type, ("vit_b", "vit_l", "vit_h")),
+                                                               ("Detection profile", self.automatic_profile, ("capsid", "generic"))), 2):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
-                                                                        ("Click delay (seconds)", self.click_delay, .02, 2, .01)), 4):
+                                                                        ("Click delay (seconds)", self.click_delay, .02, 2, .01)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
             def close_settings():
@@ -3281,7 +3757,9 @@ class ScreenPickerApp:
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=6, column=0, columnspan=3, pady=(10, 0))
+            self.ttk.Label(frame, text="capsid: dense interiors; generic: all SAM regions", wraplength=410).grid(
+                row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=8, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)
@@ -3334,8 +3812,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -3435,6 +3914,21 @@ def _smoke_image_processing() -> dict[str, Any]:
     points = sample_hex_grid(mask, 3, inset=1)
     if not len(points) or not mask[points[:, 1], points[:, 0]].all():
         raise RuntimeError("Bitmap sampling failed its inclusion check.")
+    # Exercise the actual model-mode planner and its compiled spatial index
+    # in the frozen binary without sending any desktop input.
+    batches = screen_model_batches([make_candidate(mask), make_candidate(mask.copy())],
+                                   CaptureGeometry(40, 50, 24, 16), 3)
+    if not len(batches[0].local) or len(batches[1].local):
+        raise RuntimeError("Per-contour duplicate filtering failed.")
+    if not mask[batches[0].local[:, 1], batches[0].local[:, 0]].all():
+        raise RuntimeError("Per-contour points escaped the mask.")
+    # A uniform scene must not become a capsid merely because SAM proposed a
+    # region. This exercises the new SciPy image-processing runtime as well.
+    blank = np.full((64, 96, 3), 125, np.uint8)
+    proposal = np.zeros((64, 96), dtype=bool)
+    proposal[20:44, 24:72] = True
+    if filter_capsid_proposals(blank, [{"segmentation": proposal}]):
+        raise RuntimeError("Uniform-image capsid rejection failed.")
     buffer = io.BytesIO()
     Image.fromarray(np.zeros((8, 12, 3), dtype=np.uint8)).save(buffer, format="PNG")
     buffer.seek(0)
@@ -3442,7 +3936,10 @@ def _smoke_image_processing() -> dict[str, Any]:
         decoded.load()
         if decoded.size != (12, 8):
             raise RuntimeError("Pillow PNG decoding returned the wrong dimensions.")
-    return {"grid_points": int(len(points)), "png_roundtrip": True}
+    return {"grid_points": int(len(points)), "png_roundtrip": True,
+            "per_contour_grid_points": int(len(batches[0].local)),
+            "cross_contour_duplicate_guard": True,
+            "capsid_uniform_scene_rejected": True}
 
 
 def _smoke_torchvision() -> dict[str, Any]:
@@ -4115,7 +4612,8 @@ class PickerApp:
 
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
-                                 device=self.device.get(), points_per_side=int(self.grid_side.get()))
+                                 device=self.device.get(), points_per_side=int(self.grid_side.get()),
+                                 automatic_profile=getattr(self.args, "automatic_profile", "capsid"))
 
     def _get_recognizer(self, config):
         # Called only by the serialized worker.
@@ -4735,6 +5233,8 @@ def build_parser():
     parser.add_argument("--box", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--point", nargs=3, action="append", type=float, metavar=("X", "Y", "LABEL"), help="Repeatable foreground(1)/background(0) prompt.")
     parser.add_argument("--points-per-side", type=int, default=8)
+    parser.add_argument("--automatic-profile", choices=("capsid", "generic"), default="capsid",
+                        help="Automatic recognition profile; generic retains unclassified SAM proposals.")
     parser.add_argument("--spacing", type=int, default=13)
     parser.add_argument("--inset", type=float, default=2)
     parser.add_argument("--output", type=Path, help="Headless segmentation output directory; defaults to writable user data when installed.")
@@ -4760,7 +5260,7 @@ def _run_application(args, *, console_available: bool) -> int:
             output = args.output or (user_state_directory() / "exports" / "saru_output"
                                     if getattr(sys, "frozen", False) else Path("saru_output"))
             config = RecognitionConfig(str(checkpoint), model_type=args.model_type, device=args.device,
-                                       points_per_side=args.points_per_side)
+                                       points_per_side=args.points_per_side, automatic_profile=args.automatic_profile)
             rgb = load_rgb_file(args.segment_image)
             recognizer = SamRecognizer(config)
             try:
@@ -4778,6 +5278,7 @@ def _run_application(args, *, console_available: bool) -> int:
                 elapsed = time.perf_counter() - started
                 export_review(output, rgb, candidates, selected, points, None,
                               {"config": asdict(config), "elapsed_seconds": elapsed,
+                               "recognition": recognizer.last_detection,
                                "review_status": "unreviewed CLI outputs; no desktop clicks were sent"})
                 report = {"status": "ok", "mode": "segment-image", "version": APP_VERSION,
                           "candidates": len(candidates), "grid_points": len(points),

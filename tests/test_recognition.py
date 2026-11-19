@@ -166,8 +166,8 @@ class FakePredictor:
         return masks, np.array([.9, .8, .7]), None
 
 
-def fake_loaded_recognizer():
-    recognizer = SamRecognizer(RecognitionConfig("unused"))
+def fake_loaded_recognizer(profile="generic"):
+    recognizer = SamRecognizer(RecognitionConfig("unused", automatic_profile=profile))
     recognizer._torch = types.SimpleNamespace(inference_mode=contextlib.nullcontext)
     recognizer._predictor = FakePredictor()
     return recognizer
@@ -228,6 +228,10 @@ class PromptTests(unittest.TestCase):
 
 
 class ModelLoadingTests(unittest.TestCase):
+    def test_automatic_profile_rejects_unknown_names(self):
+        with self.assertRaisesRegex(ValueError, "automatic_profile"):
+            RecognitionConfig("unused", automatic_profile="unknown")
+
     def test_module_import_does_not_import_gui_or_torch(self):
         code = ("import sys; import recognition; "
                 "assert not {'torch', 'tkinter', 'pyautogui', 'pynput'} & set(sys.modules)")
@@ -271,6 +275,8 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(calls["generator"]["points_per_side"], 8)
         self.assertEqual(calls["generator"]["points_per_batch"], 8)
         self.assertEqual(calls["generator"]["min_mask_region_area"], 0)
+        self.assertEqual(calls["generator"]["pred_iou_thresh"], .50)
+        self.assertEqual(calls["generator"]["stability_score_thresh"], .75)
         recognizer._active_cancel = lambda: True
         with self.assertRaises(Cancelled):
             recognizer._generator._process_batch(None)
@@ -300,6 +306,58 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertEqual(first[0].id, second[0].id)
         with self.assertRaises(Cancelled):
             recognizer.automatic(image, cancel=lambda: True)
+
+    def test_capsid_content_filter_sees_inner_and_outer_before_nested_suppression(self):
+        recognizer = fake_loaded_recognizer("capsid")
+        outer = np.zeros((60, 80), bool)
+        outer[8:52, 10:70] = True
+        inner = np.zeros_like(outer)
+        inner[16:44, 24:56] = True
+        raw = [{"segmentation": mask, "predicted_iou": score, "stability_score": .8}
+               for mask, score in ((outer, .99), (inner, .86))]
+        recognizer._generator = types.SimpleNamespace(generate=lambda image: raw)
+        observations = []
+        def choose_core(rgb, proposals, **kwargs):
+            observations.append(proposals)
+            kwargs["check_cancel"]()
+            return [{"segmentation": inner, "predicted_iou": None,
+                     "stability_score": None, "source": "capsid texture core (review)",
+                     "capsid_evidence": {"proposal_predicted_iou": .86,
+                                         "is_calibrated_probability": False}}]
+        image = np.full((60, 80, 3), 125, np.uint8)
+        with patch("recognition.filter_capsid_proposals", side_effect=choose_core):
+            first = recognizer.automatic(image)
+            second = recognizer.automatic(image.copy())
+        self.assertEqual(len(observations), 1)
+        self.assertIs(observations[0], raw)
+        np.testing.assert_array_equal(first[0].mask, inner)
+        self.assertIsNone(first[0].predicted_iou)
+        self.assertIsNone(first[0].stability_score)
+        self.assertEqual(second[0].id, first[0].id)
+        self.assertEqual(recognizer.last_detection["sam_proposals"], 2)
+        self.assertEqual(recognizer.last_detection["selected_contours"], 1)
+        self.assertFalse(recognizer.last_detection["capsid_evidence"][first[0].id]["is_calibrated_probability"])
+
+    def test_capsid_filter_cancellation_does_not_publish_or_cache_partial_results(self):
+        recognizer = fake_loaded_recognizer("capsid")
+        mask = np.zeros((30, 30), bool)
+        mask[4:12, 4:12] = True
+        recognizer._generator = types.SimpleNamespace(generate=lambda rgb: [{"segmentation": mask}])
+        with patch("recognition.filter_capsid_proposals", side_effect=Cancelled("stop")):
+            with self.assertRaises(Cancelled):
+                recognizer.automatic(np.full((30, 30, 3), 125, np.uint8))
+        self.assertIsNone(recognizer._automatic_result)
+        self.assertIsNone(recognizer._automatic_image_key)
+        self.assertIsNone(recognizer.last_detection)
+        self.assertIsNone(recognizer._active_cancel)
+
+    def test_bad_raw_mask_shape_is_rejected_before_capsid_processing(self):
+        recognizer = fake_loaded_recognizer("capsid")
+        recognizer._generator = types.SimpleNamespace(generate=lambda rgb: [{"segmentation": np.ones((5, 5), bool)}])
+        with patch("recognition.filter_capsid_proposals") as process:
+            with self.assertRaisesRegex(RecognitionError, "dimensions"):
+                recognizer.automatic(np.zeros((30, 30, 3), np.uint8))
+            process.assert_not_called()
 
     def test_rgb_validation_requires_explicit_uint8_rgb_shape(self):
         for image in (np.zeros((20, 20), np.uint8), np.zeros((20, 20, 4), np.uint8),

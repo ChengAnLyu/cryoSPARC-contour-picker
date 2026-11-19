@@ -1,4 +1,4 @@
-SARU Picker 2.1.1 — Windows CPU edition
+SARU Picker 2.2.0 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -20,15 +20,26 @@ SEMI-AUTO
 Move the panel outside the intended micrograph area. Select screen area,
 drag around the micrograph, then Detect. The panel remains visible throughout. Green outlines
 appear directly over cryoSPARC. Enable picking and click inside a target
-proposal. The program waits for your mouse release, hides its overlay, then
-places the picks. Box prompt and Next alternative provide guided selection.
+contour. The program waits for your mouse release, hides its annotation layer,
+then fills only that contour. The panel stays visible and the remaining outlines
+return. Box prompt and Next alternative provide guided selection.
+Each contour has its own manual-style spacing grid, zero inset and default
+0.10-second click interval. Previously placed or nearby picks are not repeated.
 
 AUTO
 Select the screen area, set Frames and Wait (s), enable picking and Start auto.
-The app accepts every proposal in that bounded run. For additional frames it
-uses Down, waits, and checks that a new stable image appeared. Original SAM
-has not been trained here to identify the intended inner capsid; evaluate
-proposals in semi-auto before running automatic picking.
+The app fills every contour one after another, showing contour/pick progress.
+If Detect already displayed contours, Start auto reuses that exact set after
+checking the screen still matches. Otherwise it detects first. For additional
+frames it finishes every contour, then uses Down, waits, and checks that a new
+stable image appeared. Same-scene detection retains previous pick locations.
+
+DETECTION
+The default capsid profile filters SAM proposals for dense granular interiors
+and reduces broad background/membrane selections. It is an image-based
+heuristic, not a newly trained capsid model, and can miss faint cores/fragments.
+Review the contours in semi-auto before running automatic picking.
+Advanced > Detection profile > generic restores unclassified SAM proposals.
 
 Escape stops and disables picking. Space pauses/resumes active auto; F8 is an
 additional pause key. Disable Picking removes the input-catching overlay.
@@ -36,7 +47,8 @@ Keep micrograph zoom and position fixed; select/detect again after changes.
 
 Advanced model settings are available in semi-auto/auto. This edition is CPU
 only, so use Auto or CPU device selection. Recognition still needs the model's
-memory and computation. Packaging does not improve its biological accuracy.
+memory and computation. The included checkpoint is unchanged; no extra model
+download is required for the capsid profile.
 
 Logs: %LOCALAPPDATA%\SARU_Picker
 Third-party notices and model information: installed _internal folder

@@ -1,12 +1,12 @@
-# SARU Picker 2.1
+# SARU Picker 2.2
 
 SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the image viewer, with its existing layout and controls. A compact, always-on-top **SARU PICKER** panel selects manual, semi-auto, or auto mode.
 
 ## Windows application
 
-The CPU installer is named **SARU-Picker-Setup-2.1.1-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+The CPU installer is named **SARU-Picker-Setup-2.2.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
 
-Version 2.1.1 fixes clipped controls, keeps the panel visible throughout screen operations, and restores immediate manual drawing without screenshot validation. The optional snapshot editor remains available with `--review`.
+Version 2.2.0 preserves the stable floating panel and original manual interaction. It adds a conservative **capsid interior** detection profile and makes model picking follow the manual grid separately inside each contour. Auto completes one contour before the next. The optional snapshot editor remains available with `--review`.
 
 ## Manual mode — original interaction
 
@@ -24,18 +24,18 @@ Manual pick placement preserves the original contour bounding-box origin, intege
 1. Choose **semi-auto**.
 2. Use **Select screen area** and drag around the micrograph on the actual screen. Keep browser toolbars and other controls outside this area.
 3. Choose **Detect**. The model reads a clean screenshot internally and draws green proposal outlines over cryoSPARC.
-4. Uncheck **Disable Picking** when ready. Click inside an intended green region. After the mouse button is released, the overlay hides and the app places the picks directly into cryoSPARC.
+4. Uncheck **Disable Picking** when ready. Click inside an intended green region. After the mouse button is released, only that contour is filled with picks directly in cryoSPARC. The panel stays visible.
 5. Select another proposal, or run **Detect** again on the current view.
 
 Use **Box prompt** to drag a tight box around an intended region directly on screen. **Next alternative** cycles the model's alternatives; click the displayed region to pick it. Prompting does not require a separate image editor.
 
-The model uses the selected screen area, replacing the original hardcoded MICRO_REGION. Mask-interior selection respects holes and disconnected components. Model modes sample the union of accepted masks with a two-pixel inset and avoid repeating grid positions already picked in the same capture.
+The model uses the selected screen area, replacing the original hardcoded MICRO_REGION. Mask-interior selection respects holes and disconnected components. Each contour uses its own bounding-box origin, integer row spacing, alternating offset, zero inset, and a default 0.10-second click interval, matching the manual spacing convention. Bitmap membership determines the detected boundary. Later contours retain their own lattice and omit sites too close to previously planned or actual picks; overlapping regions do not receive nearly coincident picks.
 
 ## Auto mode
 
-Choose **auto**, select the screen area, set **Frames** and **Wait (s)**, uncheck **Disable Picking**, and choose **Start auto**. One frame is the default. For additional frames, the app picks the current proposals, sends **Down** to the captured cryoSPARC window, waits, and checks that a new stable image appeared.
+Choose **auto**, select the screen area, set **Frames** and **Wait (s)**, uncheck **Disable Picking**, and choose **Start auto**. If Detect has already displayed contours, Start auto uses that exact ordered set after checking that the image still matches. Otherwise it detects first. It finishes contour 1, then contour 2, and so on, with per-contour progress. One frame is the default. For additional frames, the app finishes all current contours, sends **Down** to the captured cryoSPARC window, waits, and checks that a new stable image appeared.
 
-Auto mode accepts all model proposals. Original SAM has not been trained here to recognize the intended inner capsid region. Check representative images in semi-auto mode before using an automatic run.
+Auto mode picks every displayed contour. The default capsid profile is an image-based filter on SAM proposals, **not a newly trained or validated capsid classifier**. It can miss faint cores and fragments and can still include unwanted material. Check representative images in semi-auto mode before an automatic run. Re-detecting the same scene retains the recorded pick positions; a verified new frame clears them.
 
 The app stops on errors, empty proposals, changed or repeated images, lost target focus, or insufficient stable background to verify remaining masks. Image-change checks are heuristics, not image registration. Keep the image zoom and position fixed during recognition and picking.
 
@@ -53,9 +53,11 @@ Live control currently supports the primary Windows monitor. Moving the microgra
 
 ## Model settings
 
-**Advanced…** in model modes exposes checkpoint selection, model type, CPU/CUDA device selection, automatic proposal grid density, and model-mode click delay. The installer supplies the checkpoint automatically and contains CPU PyTorch. A source installation can use a compatible CUDA PyTorch build.
+**Advanced…** in model modes exposes checkpoint selection, model type, CPU/CUDA device selection, detection profile, automatic proposal grid density, and model-mode click delay. The installer supplies the checkpoint automatically and contains CPU PyTorch. A source installation can use a compatible CUDA PyTorch build.
 
-The model and image embeddings are reused where possible. Packaging and the restored screen workflow do not train the recognition model or establish biological recognition accuracy.
+The default **capsid** profile starts with permissive SAM proposals, then compares granular interior texture with the nearby background and the rest of the selected image. It refines supported interiors and resolves duplicate regions after those content checks. Broad background, membranes without dense interiors, and small unsupported fragments are therefore less likely to survive solely because they received a high SAM quality score. Polygon shape and complete membrane enclosure are not mandatory, so irregular and partly visible targets remain eligible. These are explicit image heuristics, not learned biological labels. **generic** retains the earlier unclassified SAM proposal route for comparison.
+
+Modified core masks do not inherit the original proposal's predicted IoU or stability: those numbers do not describe the new boundary. Headless exports retain the original proposal evidence separately. The profile uses the existing checkpoint and does not require another model download or a second image encoding. Model, prompt embeddings, and identical-image automatic results are reused where possible. See the [recognition roadmap](RECOGNITION_ROADMAP.md) for the supervised-model plan and evaluation requirements.
 
 ## Running from source
 
@@ -80,6 +82,8 @@ Headless segmentation remains available, with no desktop input:
 ```powershell
 python main.py --segment-image my_micrograph.png --checkpoint sam_vit_b_01ec64.pth --device cpu --box 195 120 370 265 --output result
 ```
+
+Without a box or point, headless segmentation uses the capsid profile. Add `--automatic-profile generic` for the earlier proposal pipeline. CLI and optional offline review exports retain their explicit spacing/inset controls; the live screen modes use the per-contour manual convention described above.
 
 Exports are bitmap masks and capture/screen pixel coordinates, not calibrated micrograph coordinates or direct cryoSPARC .cs imports.
 

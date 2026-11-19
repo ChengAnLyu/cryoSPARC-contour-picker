@@ -18,6 +18,8 @@ from typing import Callable, Iterable, Sequence
 import numpy as np
 from PIL import Image, ImageDraw
 
+from capsid import filter_capsid_proposals
+
 CancelCheck = Callable[[], bool] | None
 
 
@@ -50,12 +52,15 @@ class RecognitionConfig:
     exclude_border: bool = False
     overlap_threshold: float = 0.80
     prefer_smaller: bool = True
+    automatic_profile: str = "capsid"
 
     def __post_init__(self) -> None:
         if self.model_type not in {"vit_b", "vit_l", "vit_h"}:
             raise ValueError("model_type must be vit_b, vit_l, or vit_h.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda.")
+        if self.automatic_profile not in {"capsid", "generic"}:
+            raise ValueError("automatic_profile must be capsid or generic.")
         for name in ("cpu_threads", "points_per_side"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -151,7 +156,8 @@ def _image_key(rgb: np.ndarray) -> str:
 
 
 def filter_candidates(candidates: Iterable[Candidate], config: RecognitionConfig,
-                      cancel: CancelCheck = None) -> list[Candidate]:
+                      cancel: CancelCheck = None, *,
+                      suppress_duplicates: bool = True) -> list[Candidate]:
     """Geometric filtering only: this does not classify inner capsids.
 
     Duplicate suppression uses intersection / smaller-mask area.  With
@@ -180,6 +186,11 @@ def filter_candidates(candidates: Iterable[Candidate], config: RecognitionConfig
         if border_occupancy / int(border.sum()) > config.max_border_fraction:
             continue
         survivors.append(candidate)
+
+    if not suppress_duplicates:
+        # The capsid path has already resolved nested proposals by image
+        # evidence. Do not run the generic smallest-mask preference again.
+        return sorted(survivors, key=lambda c: (c.bbox[1], c.bbox[0], c.id))
 
     def quality(candidate: Candidate) -> float:
         return candidate.predicted_iou if candidate.predicted_iou is not None else -1.0
@@ -223,6 +234,7 @@ class SamRecognizer:
         self._predictor_image_key: str | None = None
         self._automatic_image_key: str | None = None
         self._automatic_result: list[Candidate] | None = None
+        self.last_detection: dict | None = None
         self._active_cancel: CancelCheck = None
         self.device: str | None = None
 
@@ -280,8 +292,13 @@ class SamRecognizer:
                 model=model,
                 points_per_side=self.config.points_per_side,
                 points_per_batch=self.config.points_per_batch or (32 if device == "cuda" else 8),
-                pred_iou_thresh=self.config.pred_iou_thresh,
-                stability_score_thresh=self.config.stability_score_thresh,
+                # The capsid pass needs inner candidates that generic SAM's
+                # stability gate can omit. Domain filtering follows inference;
+                # these permissive proposal thresholds are not acceptance scores.
+                pred_iou_thresh=(0.50 if self.config.automatic_profile == "capsid"
+                                 else self.config.pred_iou_thresh),
+                stability_score_thresh=(0.75 if self.config.automatic_profile == "capsid"
+                                       else self.config.stability_score_thresh),
                 box_nms_thresh=0.7,
                 crop_n_layers=0,
                 min_mask_region_area=0,  # Preserve holes and disconnected regions.
@@ -375,7 +392,12 @@ class SamRecognizer:
 
     def automatic(self, rgb: np.ndarray | Image.Image,
                   cancel: CancelCheck = None) -> list[Candidate]:
-        """Generate unclassified region proposals on a sparse grid for review."""
+        """Generate reviewable regions using the configured automatic profile.
+
+        The capsid profile refines permissive SAM proposals with local texture
+        evidence. It is a conservative image heuristic, not a trained capsid
+        classifier. Generic mode retains the previous proposal pipeline.
+        """
         rgb = validate_rgb(rgb)
         _check_cancel(cancel)
         key = _image_key(rgb)
@@ -387,19 +409,44 @@ class SamRecognizer:
             with self._torch.inference_mode():
                 raw = self._generator.generate(rgb)
             _check_cancel(cancel)
+            for item in raw:
+                _check_cancel(cancel)
+                mask = _validate_mask(item["segmentation"])
+                if mask.shape != rgb.shape[:2]:
+                    raise RecognitionError("SAM returned a mask with the wrong image dimensions.")
+            raw_count = len(raw)
+            is_capsid = self.config.automatic_profile == "capsid"
+            if is_capsid:
+                raw = filter_capsid_proposals(
+                    rgb, raw, check_cancel=lambda: _check_cancel(cancel),
+                    min_area_ratio=self.config.min_area_ratio,
+                    max_area_ratio=min(self.config.max_area_ratio, .40))
             candidates = []
+            evidence = {}
             for item in raw:
                 _check_cancel(cancel)
                 mask = np.asarray(item["segmentation"])
                 if mask.shape != rgb.shape[:2]:
                     raise RecognitionError("SAM returned a mask with the wrong image dimensions.")
                 if np.any(mask):
-                    candidates.append(make_candidate(
+                    candidate = make_candidate(
                         mask, predicted_iou=item.get("predicted_iou"),
                         stability_score=item.get("stability_score"),
-                        source="automatic proposal", image_key=key))
-            result = filter_candidates(candidates, self.config, cancel)
+                        source=item.get("source", "automatic proposal"), image_key=key)
+                    candidates.append(candidate)
+                    if item.get("capsid_evidence") is not None:
+                        evidence[candidate.id] = dict(item["capsid_evidence"])
+            result = filter_candidates(candidates, self.config, cancel,
+                                       suppress_duplicates=not is_capsid)
             _check_cancel(cancel)
+            self.last_detection = {
+                "profile": self.config.automatic_profile,
+                "sam_proposals": raw_count,
+                "selected_contours": len(result),
+                "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
+                "note": ("Image-based dense-core filter; not a trained or calibrated capsid classifier."
+                         if is_capsid else "Unclassified generic SAM proposals."),
+            }
             self._automatic_image_key, self._automatic_result = key, result
             return list(result)
         except (Cancelled, RecognitionError):
@@ -419,6 +466,7 @@ class SamRecognizer:
         self._model = self._predictor = self._generator = None
         self._predictor_image_key = self._automatic_image_key = None
         self._automatic_result = None
+        self.last_detection = None
         self._torch, self.device = None, None
         gc.collect()
         if torch is not None and device == "cuda":

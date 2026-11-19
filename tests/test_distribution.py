@@ -33,6 +33,13 @@ points=module.sample_hex_grid(mask, 3)
 assert len(points)>0
 assert mask[points[:,1],points[:,0]].all()
 assert module.CaptureGeometry(40,50,30,20).local_to_screen(4,6)==(44,56)
+blank=np.full((64,96,3),125,np.uint8)
+proposal=np.zeros((64,96),bool)
+proposal[20:44,24:72]=True
+assert module.filter_capsid_proposals(blank,[{'segmentation':proposal}])==[]
+diagnostic=module._smoke_image_processing()
+assert diagnostic['cross_contour_duplicate_guard']
+assert diagnostic['capsid_uniform_scene_rejected']
 """
             result = subprocess.run([sys.executable, "-c", code, str(path)],
                                     capture_output=True, text=True, timeout=20)

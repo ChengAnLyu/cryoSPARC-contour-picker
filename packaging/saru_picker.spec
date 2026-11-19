@@ -46,7 +46,7 @@ hiddenimports = collect_submodules("segment_anything") + [
     "pynput.keyboard._win32", "pynput.mouse._win32", "pynput._util.win32",
     "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox", "tkinter.font",
     "PIL.ImageTk", "PIL._imagingtk", "torch", "torchvision", "torchvision._C",
-    "scipy.ndimage",
+    "scipy.ndimage", "scipy.spatial",
 ]
 
 a = Analysis(

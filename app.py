@@ -27,6 +27,8 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 
+from capsid import filter_capsid_proposals
+
 from recognition import (
     Candidate, RecognitionConfig, RecognitionError, Cancelled, SamRecognizer,
     make_candidate, polygon_mask, union_masks, sample_hex_grid, validate_rgb,
@@ -36,11 +38,11 @@ from execution import (
     WorkerBusyError, play_clicks,
 )
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
-from screen_app import ScreenPickerApp
+from screen_app import ScreenPickerApp, screen_model_batches
 from screen_overlay import control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -140,6 +142,21 @@ def _smoke_image_processing() -> dict[str, Any]:
     points = sample_hex_grid(mask, 3, inset=1)
     if not len(points) or not mask[points[:, 1], points[:, 0]].all():
         raise RuntimeError("Bitmap sampling failed its inclusion check.")
+    # Exercise the actual model-mode planner and its compiled spatial index
+    # in the frozen binary without sending any desktop input.
+    batches = screen_model_batches([make_candidate(mask), make_candidate(mask.copy())],
+                                   CaptureGeometry(40, 50, 24, 16), 3)
+    if not len(batches[0].local) or len(batches[1].local):
+        raise RuntimeError("Per-contour duplicate filtering failed.")
+    if not mask[batches[0].local[:, 1], batches[0].local[:, 0]].all():
+        raise RuntimeError("Per-contour points escaped the mask.")
+    # A uniform scene must not become a capsid merely because SAM proposed a
+    # region. This exercises the new SciPy image-processing runtime as well.
+    blank = np.full((64, 96, 3), 125, np.uint8)
+    proposal = np.zeros((64, 96), dtype=bool)
+    proposal[20:44, 24:72] = True
+    if filter_capsid_proposals(blank, [{"segmentation": proposal}]):
+        raise RuntimeError("Uniform-image capsid rejection failed.")
     buffer = io.BytesIO()
     Image.fromarray(np.zeros((8, 12, 3), dtype=np.uint8)).save(buffer, format="PNG")
     buffer.seek(0)
@@ -147,7 +164,10 @@ def _smoke_image_processing() -> dict[str, Any]:
         decoded.load()
         if decoded.size != (12, 8):
             raise RuntimeError("Pillow PNG decoding returned the wrong dimensions.")
-    return {"grid_points": int(len(points)), "png_roundtrip": True}
+    return {"grid_points": int(len(points)), "png_roundtrip": True,
+            "per_contour_grid_points": int(len(batches[0].local)),
+            "cross_contour_duplicate_guard": True,
+            "capsid_uniform_scene_rejected": True}
 
 
 def _smoke_torchvision() -> dict[str, Any]:
@@ -820,7 +840,8 @@ class PickerApp:
 
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
-                                 device=self.device.get(), points_per_side=int(self.grid_side.get()))
+                                 device=self.device.get(), points_per_side=int(self.grid_side.get()),
+                                 automatic_profile=getattr(self.args, "automatic_profile", "capsid"))
 
     def _get_recognizer(self, config):
         # Called only by the serialized worker.
@@ -1440,6 +1461,8 @@ def build_parser():
     parser.add_argument("--box", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--point", nargs=3, action="append", type=float, metavar=("X", "Y", "LABEL"), help="Repeatable foreground(1)/background(0) prompt.")
     parser.add_argument("--points-per-side", type=int, default=8)
+    parser.add_argument("--automatic-profile", choices=("capsid", "generic"), default="capsid",
+                        help="Automatic recognition profile; generic retains unclassified SAM proposals.")
     parser.add_argument("--spacing", type=int, default=13)
     parser.add_argument("--inset", type=float, default=2)
     parser.add_argument("--output", type=Path, help="Headless segmentation output directory; defaults to writable user data when installed.")
@@ -1465,7 +1488,7 @@ def _run_application(args, *, console_available: bool) -> int:
             output = args.output or (user_state_directory() / "exports" / "saru_output"
                                     if getattr(sys, "frozen", False) else Path("saru_output"))
             config = RecognitionConfig(str(checkpoint), model_type=args.model_type, device=args.device,
-                                       points_per_side=args.points_per_side)
+                                       points_per_side=args.points_per_side, automatic_profile=args.automatic_profile)
             rgb = load_rgb_file(args.segment_image)
             recognizer = SamRecognizer(config)
             try:
@@ -1483,6 +1506,7 @@ def _run_application(args, *, console_available: bool) -> int:
                 elapsed = time.perf_counter() - started
                 export_review(output, rgb, candidates, selected, points, None,
                               {"config": asdict(config), "elapsed_seconds": elapsed,
+                               "recognition": recognizer.last_detection,
                                "review_status": "unreviewed CLI outputs; no desktop clicks were sent"})
                 report = {"status": "ok", "mode": "segment-image", "version": APP_VERSION,
                           "candidates": len(candidates), "grid_points": len(points),
