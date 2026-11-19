@@ -383,6 +383,8 @@ class WindowsScaleCoverageTests(unittest.TestCase):
              patch.object(app, "resolve_checkpoint", return_value=Path("model.pth")), \
              patch.object(app, "ScreenPickerApp", side_effect=make_picker), \
              patch.object(app, "_smoke_panel_layout", side_effect=measure), \
+             patch.object(app, "windows_application_icon_status", return_value={"small_icon": True, "large_icon": True}), \
+             patch.object(app, "_smoke_repeated_screen_picks", return_value={"contours_completed": 3}) as repeated, \
              patch.object(app, "verify_screen_overlay", side_effect=verify_overlay) as overlay:
             result = app._smoke_windows_runtime(Path("app.log"))
         expected_scales = [96 * percent / 100 / 72 for percent in (100, 125, 150, 200)]
@@ -404,6 +406,8 @@ class WindowsScaleCoverageTests(unittest.TestCase):
             picker.close.assert_called_once()
         dpi.assert_called_once()
         overlay.assert_called_once_with(windows[0])
+        repeated.assert_called_once_with(pickers[0])
+        self.assertEqual(result["repeated_semi_auto_contours"]["contours_completed"], 3)
         modules["pyautogui"].click.assert_not_called()
         self.assertEqual(result["desktop_events_sent"], 0)
         self.assertEqual(result["global_listeners_started"], 0)

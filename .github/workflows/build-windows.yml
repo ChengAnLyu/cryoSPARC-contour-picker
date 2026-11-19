@@ -8,6 +8,7 @@ on:
     paths:
       - '*.py'
       - 'tests/**'
+      - 'assets/**'
       - 'packaging/**'
       - 'requirements*.txt'
       - '.github/workflows/build-windows.yml'
@@ -61,6 +62,7 @@ jobs:
             artifacts/build-manifest.json
             artifacts/frozen-smoke-test.json
             artifacts/installed-smoke-test.json
+            artifacts/icon-install-verification.json
             artifacts/installer-smoke.log
           if-no-files-found: error
           compression-level: 0

@@ -203,6 +203,10 @@ class TaskRunner:
         self._busy = False
         self._closed = False
         self._active_token: CancellationToken | None = None
+        # The submitting/polling thread owns the final reference to callbacks.
+        # A screen callback may close over Tk objects, whose destructors must
+        # never run when the worker starts the next operation.
+        self._active_function: Callable | None = None
         self._thread = threading.Thread(
             target=self._worker, name="saru-worker", daemon=True
         )
@@ -241,6 +245,7 @@ class TaskRunner:
             if token.generation != self._generation or token.cancelled:
                 raise ValueError("Task token is cancelled or belongs to a stale generation.")
             self._active_token = token
+            self._active_function = fn
             self._busy = True
             self._jobs.put_nowait((token, fn))
             return token
@@ -249,13 +254,24 @@ class TaskRunner:
         """Collect completed work; call this from the GUI's event loop."""
         results = []
         while True:
-            try:
-                result = self._results.get_nowait()
-            except queue.Empty:
-                break
             with self._lock:
+                try:
+                    result = self._results.get_nowait()
+                except queue.Empty:
+                    if self._closed and not self._thread.is_alive():
+                        # Shutdown can win before a queued callback starts.
+                        # Drain those callback references on this thread too.
+                        while True:
+                            try:
+                                self._jobs.get_nowait()
+                            except queue.Empty:
+                                break
+                        self._active_function = self._active_token = None
+                        self._busy = False
+                    break
                 if self._active_token is result.token:
                     self._active_token = None
+                    self._active_function = None
                     self._busy = False
                 if result.token.generation == self._generation and not self._closed:
                     results.append(result)
@@ -278,7 +294,10 @@ class TaskRunner:
             pass
         if wait and threading.current_thread() is not self._thread:
             self._thread.join(timeout)
-        return not self._thread.is_alive()
+        stopped = not self._thread.is_alive()
+        if stopped:
+            self.poll_results()
+        return stopped
 
     def _worker(self) -> None:
         while True:
@@ -289,6 +308,7 @@ class TaskRunner:
             if item is None:
                 return
             token, fn = item
+            value = None
             try:
                 token.wait_until_ready()
                 value = fn(token)
@@ -299,8 +319,25 @@ class TaskRunner:
             except Exception as exc:
                 trace = traceback.format_exc()
                 EXECUTION_LOGGER.exception("Picker operation failed; the operation was stopped.")
+                # Keep the useful formatted stack, not live worker frames and
+                # their GUI-capturing closures. Exception chains need the same
+                # treatment or a later collection can still own those frames.
+                pending, visited = [exc], set()
+                while pending:
+                    failure = pending.pop()
+                    if id(failure) in visited:
+                        continue
+                    visited.add(id(failure))
+                    pending.extend(part for part in (failure.__cause__, failure.__context__) if part is not None)
+                    failure.__traceback__ = None
+                del pending, visited, failure
                 result = TaskResult(token=token, error=exc, traceback_text=trace)
-            self._results.put_nowait(result)
+            with self._lock:
+                self._results.put_nowait(result)
+                # poll_results takes this same lock. By the time it can drop
+                # the owning references, this thread holds no old callback,
+                # return value or exception result while awaiting the next job.
+                del item, fn, value, result, token
 
 
 def play_clicks(

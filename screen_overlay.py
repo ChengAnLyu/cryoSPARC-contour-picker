@@ -460,6 +460,18 @@ class InputSurface(_ScreenSurface):
         self._dragging = False
         super().hide()
 
+    def close(self):
+        self._check_thread()
+        try:
+            super().close()
+        finally:
+            # A contour selection destroys its catcher from inside a release
+            # callback. Do not let that retired object keep the controller
+            # alive or dispatch a queued cancellation to the next catcher.
+            self._dragging = False
+            self._press_callback = self._move_callback = self._release_callback = None
+            self._right_callback = self._cancel_callback = None
+
     def _event_xy(self, event):
         # Do not use canvas-local x/y or Tk scaling: coordinates are screen pixels.
         return _screen_xy(event.x_root, event.y_root)

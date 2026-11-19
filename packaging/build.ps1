@@ -30,7 +30,7 @@ $BuildDirectory = Join-Path $ProjectRoot "build"
 $ArtifactDirectory = Join-Path $ProjectRoot "artifacts"
 $VenvDirectory = Join-Path $ProjectRoot ".build-venv"
 $VenvPython = Join-Path $VenvDirectory "Scripts\python.exe"
-$AppVersion = "2.2.0"
+$AppVersion = "2.3.0"
 $Manifest = Get-Content (Join-Path $PSScriptRoot "model-manifest.json") -Raw | ConvertFrom-Json
 
 function Invoke-Checked {
@@ -100,10 +100,34 @@ function Assert-BundledLibraries {
         }
     }
     Assert-Checkpoint (Join-Path $Distribution "_internal\models\$($Manifest.filename)")
+    if (-not (Test-Path -LiteralPath (Join-Path $Distribution "SARU Icon Helper.exe") -PathType Leaf)) {
+        throw "The independent icon installation helper is missing from the distribution."
+    }
+}
+
+function Invoke-IconHelper {
+    param([string]$Helper, [string]$Target, [string]$Icon, [string]$Report)
+    if (Test-Path -LiteralPath $Report) { Remove-Item -LiteralPath $Report }
+    $Arguments = "--target `"$Target`" --icon `"$Icon`" --report `"$Report`""
+    $Process = Start-Process -FilePath $Helper -ArgumentList $Arguments -PassThru
+    if (-not $Process.WaitForExit(120000)) {
+        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+        throw "The icon installation helper timed out."
+    }
+    $Process.Refresh()
+    if ($Process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Report -PathType Leaf)) {
+        throw "The icon installation helper failed or produced no report: $Report"
+    }
+    $Result = Get-Content -LiteralPath $Report -Raw | ConvertFrom-Json
+    $ExpectedHash = (Get-FileHash -LiteralPath $Icon -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($Result.status -ne "ok" -or -not $Result.overlay_preserved -or $Result.source_ico_sha256 -ne $ExpectedHash) {
+        throw "The icon installation helper report failed its image/archive checks: $Report"
+    }
 }
 
 Push-Location $ProjectRoot
 $PreviousModel = $env:SARU_MODEL_FILE
+$IconSidecarTested = $false
 try {
     New-Item -ItemType Directory -Path $BuildDirectory, $ArtifactDirectory -Force | Out-Null
     Invoke-Checked $PythonExe @("-c", "import struct,sys; assert sys.platform == 'win32' and sys.version_info[:2] == (3,12) and struct.calcsize('P') == 8, 'Python 3.12 x64 is required'")
@@ -147,7 +171,18 @@ try {
 
     $Distribution = Join-Path $ProjectRoot "dist\SARU_Picker"
     $Executable = Join-Path $Distribution "SARU Picker.exe"
+    # Keep the tiny stdlib helper independent of the application's large
+    # onedir bundle. Its own onefile runtime cannot replace base_library.zip
+    # or any DLL in the main application's _internal directory.
+    $IconHelperBuild = Join-Path $BuildDirectory "icon-helper"
+    Invoke-Checked $VenvPython @("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed", "--noupx", "--name", "SARU Icon Helper", "--icon", (Join-Path $ProjectRoot "assets\app-icon.ico"), "--distpath", (Join-Path $IconHelperBuild "dist"), "--workpath", (Join-Path $IconHelperBuild "work"), "--specpath", (Join-Path $IconHelperBuild "spec"), "packaging\install_icon.py")
+    $IconHelper = Join-Path $Distribution "SARU Icon Helper.exe"
+    Copy-Item -LiteralPath (Join-Path $IconHelperBuild "dist\SARU Icon Helper.exe") -Destination $IconHelper -Force
     Assert-BundledLibraries $Distribution
+    # Test the real onefile helper and then execute its patched application.
+    # This catches accidental loss of the appended PyInstaller archive even
+    # when the Windows resource update itself reports success.
+    Invoke-IconHelper $IconHelper $Executable (Join-Path $Distribution "_internal\assets\app-icon.ico") (Join-Path $ArtifactDirectory "frozen-icon-install.json")
     Invoke-SmokeTest $Executable (Join-Path $ArtifactDirectory "frozen-smoke-test.json")
 
     if (-not $SkipInstaller) {
@@ -177,15 +212,30 @@ try {
             }
             $InstallDirectory = Join-Path ([IO.Path]::GetTempPath()) ("SARU Picker Smoke " + [guid]::NewGuid().ToString("N"))
             $InstallLog = Join-Path $ArtifactDirectory "installer-smoke.log"
+            # Exercise the sidecar override using generated, nonprivate test
+            # artwork. The public installer remains paired with generic art;
+            # no user's image is needed in the repository or on the runner.
+            $IconFixtureDirectory = Join-Path $BuildDirectory ("icon-installer-test-" + [guid]::NewGuid().ToString("N"))
+            New-Item -ItemType Directory -Path $IconFixtureDirectory -Force | Out-Null
+            $FixtureInstaller = Join-Path $IconFixtureDirectory (Split-Path -Leaf $Installer)
+            Copy-Item -LiteralPath $Installer -Destination $FixtureInstaller
+            Invoke-Checked $VenvPython @("packaging\verify_icon_installation.py", "make-fixture", "--directory", $IconFixtureDirectory, "--baseline-directory", (Join-Path $ProjectRoot "assets"), "--report", (Join-Path $ArtifactDirectory "icon-fixture.json"))
+            $InstallIconReport = Join-Path $env:LOCALAPPDATA "SARU_Picker\icon-install.json"
+            if (Test-Path -LiteralPath $InstallIconReport) { Remove-Item -LiteralPath $InstallIconReport }
             $Installed = $false
             try {
                 $InstallArguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$InstallDirectory`" /LOG=`"$InstallLog`""
-                $InstallProcess = Start-Process -FilePath $Installer -ArgumentList $InstallArguments -Wait -PassThru
+                $InstallProcess = Start-Process -FilePath $FixtureInstaller -ArgumentList $InstallArguments -Wait -PassThru
                 if ($InstallProcess.ExitCode -ne 0) { throw "Installer failed (exit $($InstallProcess.ExitCode))." }
                 $Installed = $true
                 Assert-BundledLibraries $InstallDirectory
                 Invoke-SmokeTest (Join-Path $InstallDirectory "SARU Picker.exe") (Join-Path $ArtifactDirectory "installed-smoke-test.json")
+                Invoke-Checked $VenvPython @("packaging\verify_icon_installation.py", "verify", "--install-directory", $InstallDirectory, "--fixture-directory", $IconFixtureDirectory, "--helper-report", $InstallIconReport, "--runtime-report", (Join-Path $ArtifactDirectory "installed-smoke-test.json"), "--report", (Join-Path $ArtifactDirectory "icon-install-verification.json"))
+                $IconSidecarTested = $true
             } finally {
+                if (Test-Path -LiteralPath $InstallIconReport -PathType Leaf) {
+                    Copy-Item -LiteralPath $InstallIconReport -Destination (Join-Path $ArtifactDirectory "icon-helper-install.json") -Force
+                }
                 $Uninstaller = Join-Path $InstallDirectory "unins000.exe"
                 if (Test-Path -LiteralPath $Uninstaller) {
                     $UninstallProcess = Start-Process -FilePath $Uninstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -PassThru
@@ -193,6 +243,9 @@ try {
                     if (Test-Path -LiteralPath (Join-Path $InstallDirectory "SARU Picker.exe")) { throw "Uninstaller left the application executable behind." }
                 } elseif ($Installed) {
                     throw "Installed application has no uninstaller."
+                }
+                if (Test-Path -LiteralPath $IconFixtureDirectory) {
+                    Remove-Item -LiteralPath $IconFixtureDirectory -Recurse -Force
                 }
             }
         }
@@ -207,6 +260,8 @@ try {
         model = $Manifest
         dependencies = @($DependencyList | ConvertFrom-Json)
         installer_tested = [bool]$TestInstaller
+        icon_sidecar_installation_tested = $IconSidecarTested
+        icon_helper_bytes = (Get-Item -LiteralPath $IconHelper).Length
     }
     $BuildMetadata | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $ArtifactDirectory "build-manifest.json") -Encoding UTF8
     $Checksums = @(Get-ChildItem -LiteralPath $ArtifactDirectory -Filter "*.exe" | ForEach-Object {

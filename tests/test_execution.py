@@ -225,8 +225,68 @@ class RunnerTests(unittest.TestCase):
             result = self.collect()[0]
         self.assertIs(result.error, failure)
         self.assertIn("expected model failure", result.traceback_text)
+        self.assertIsNone(result.error.__traceback__)
         self.runner.submit(lambda token: 12)
         self.assertEqual(self.collect()[0].value, 12)
+
+    def test_finished_callback_is_released_on_polling_thread_before_next_job(self):
+        destroyed = []
+        caller = threading.get_ident()
+
+        class OwnedByGui:
+            def __del__(self):
+                destroyed.append(threading.get_ident())
+
+        def make_work():
+            owner = OwnedByGui()
+            return lambda token: bool(owner)
+
+        self.runner.submit(make_work())
+        self.assertTrue(self.collect()[0].value)
+        self.assertEqual(destroyed, [caller])
+        self.runner.submit(lambda token: "next contour")
+        self.assertEqual(self.collect()[0].value, "next contour")
+        self.assertEqual(destroyed, [caller])
+
+    def test_invalidated_callback_is_also_released_by_polling_thread(self):
+        destroyed, entered, release = [], threading.Event(), threading.Event()
+
+        class OwnedByGui:
+            def __del__(self):
+                destroyed.append(threading.get_ident())
+
+        def make_work():
+            owner = OwnedByGui()
+            def work(token):
+                entered.set()
+                release.wait(1)
+                return bool(owner)
+            return work
+
+        self.runner.submit(make_work())
+        self.assertTrue(entered.wait(1))
+        self.runner.invalidate()
+        release.set()
+        self.assertEqual(self.collect(), [])
+        self.assertEqual(destroyed, [threading.get_ident()])
+
+    def test_failed_callback_does_not_leave_live_worker_tracebacks(self):
+        def inner():
+            raise ValueError("inner failure")
+
+        def work(token):
+            try:
+                inner()
+            except ValueError as exc:
+                raise RuntimeError("outer failure") from exc
+
+        with self.assertLogs("execution", level="ERROR"):
+            self.runner.submit(work)
+            result = self.collect()[0]
+        self.assertIn("inner failure", result.traceback_text)
+        self.assertIn("outer failure", result.traceback_text)
+        self.assertIsNone(result.error.__traceback__)
+        self.assertIsNone(result.error.__cause__.__traceback__)
 
     def test_cancelled_same_generation_reports_cancellation(self):
         token = CancellationToken(self.runner.generation)

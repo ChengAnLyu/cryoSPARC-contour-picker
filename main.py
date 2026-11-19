@@ -1,8 +1,111 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.2.0: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 2.3.0: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
+
+
+# ---------------- application_icon.py ----------------
+
+
+import ctypes
+import logging
+from pathlib import Path
+import sys
+
+
+APPLICATION_ICON_LOG = logging.getLogger(__name__)
+APPLICATION_USER_MODEL_ID = "SARU.Picker.Desktop"
+
+
+def application_icon_paths() -> tuple[Path, Path]:
+    """Locate artwork alongside source code or in PyInstaller's data folder."""
+    if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).resolve().parent
+    return base / "assets" / "app-icon.ico", base / "assets" / "app-icon.png"
+
+
+def configure_application_identity() -> bool:
+    """Give source and installed Windows launches the same taskbar identity.
+
+    Invoke before creating the first Tk window. Failure to set this optional
+    Windows hint must not prevent particle picking from starting.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        setter = shell32.SetCurrentProcessExplicitAppUserModelID
+        setter.argtypes = [ctypes.c_wchar_p]
+        setter.restype = ctypes.c_long
+        result = setter(APPLICATION_USER_MODEL_ID)
+        if result != 0:
+            raise OSError(f"SetCurrentProcessExplicitAppUserModelID returned {result:#x}.")
+        return True
+    except Exception:
+        APPLICATION_ICON_LOG.warning("Could not set the Windows taskbar identity.", exc_info=True)
+        return False
+
+
+def apply_application_icon(root) -> bool:
+    """Set this window's icon and the default for its future child windows.
+
+    A plain copied standalone script may not include assets. That remains a
+    supported launch: missing artwork does not interrupt the application.
+    The Windows packaging contract, in contrast, requires both icon assets.
+    """
+    ico, png = application_icon_paths()
+    if sys.platform == "win32" and ico.is_file():
+        try:
+            root.iconbitmap(default=str(ico))
+            return True
+        except Exception:
+            APPLICATION_ICON_LOG.warning("Could not set the ICO window icon; trying PNG.", exc_info=True)
+    if not png.is_file():
+        APPLICATION_ICON_LOG.warning("Application icon assets are unavailable in %s.", png.parent)
+        return False
+    try:
+        import tkinter as tk
+
+        photo = tk.PhotoImage(master=root, file=str(png))
+        try:
+            # Tk snapshots the pixels here; no retained PhotoImage is needed.
+            # Its destructor therefore runs now, on this same GUI thread.
+            root.iconphoto(True, photo)
+        finally:
+            del photo
+        return True
+    except Exception:
+        APPLICATION_ICON_LOG.warning("Could not set the application window icon.", exc_info=True)
+        return False
+
+
+def windows_application_icon_status(root) -> dict[str, bool]:
+    """Read the real titlebar/taskbar icon handles for Windows smoke checks.
+
+    This intentionally checks the native top-level wrapper rather than Tk's
+    child drawing window. No icon is changed and no window is activated.
+    """
+    if sys.platform != "win32":
+        raise RuntimeError("Native application icon inspection requires Windows.")
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    child = root.winfo_id()
+    handle = user32.GetAncestor(child, 2) or child  # GA_ROOT
+    # WM_GETICON: ICON_SMALL=0, ICON_BIG=1, ICON_SMALL2=2.
+    return {
+        "small_icon": bool(user32.SendMessageW(handle, 0x007F, 0, 0)
+                           or user32.SendMessageW(handle, 0x007F, 2, 0)),
+        "large_icon": bool(user32.SendMessageW(handle, 0x007F, 1, 0)),
+    }
 
 
 # ---------------- capsid.py ----------------
@@ -82,6 +185,325 @@ def _capsid_screen_sides(mask: np.ndarray, bounds: tuple[int, int, int, int]) ->
         np.count_nonzero(mask[y0:y1 + 1, x0:min(x0 + 3, x1 + 1)]) >= vertical_min,
         np.count_nonzero(mask[y0:y1 + 1, max(x0, x1 - 2):x1 + 1]) >= vertical_min,
     ))
+
+
+def _capsid_boundary_rings(mask: np.ndarray, check_cancel=None) -> list[np.ndarray]:
+    """Trace cell edges, including the image edge, in image coordinates.
+
+    A foreground pixel (x, y) occupies [x, x+1] x [y, y+1]. The right-turn
+    rule keeps diagonal contacts separate. This avoids introducing a hull
+    across concavities or joining distinct regions at a shared corner.
+    """
+    padded = np.pad(mask, 1)
+    edge_sets = (
+        mask & ~padded[:-2, 1:-1], mask & ~padded[1:-1, 2:],
+        mask & ~padded[2:, 1:-1], mask & ~padded[1:-1, :-2],
+    )
+    if sum(np.count_nonzero(edges) for edges in edge_sets) > 50_000:
+        return []  # Bound pathological/noisy boundaries; caller keeps mask.
+    outgoing = {}
+    for direction, edges in enumerate(edge_sets):
+        yy, xx = np.nonzero(edges)
+        for x, y in zip(xx.tolist(), yy.tolist()):
+            if direction == 0:
+                start, end = (x, y), (x + 1, y)
+            elif direction == 1:
+                start, end = (x + 1, y), (x + 1, y + 1)
+            elif direction == 2:
+                start, end = (x + 1, y + 1), (x, y + 1)
+            else:
+                start, end = (x, y + 1), (x, y)
+            outgoing.setdefault(start, {})[direction] = end
+        _capsid_check(check_cancel)
+    rings = []
+    while outgoing:
+        _capsid_check(check_cancel)
+        start = next(iter(outgoing))
+        current = start
+        direction = next(iter(outgoing[start]))
+        ring = []
+        while True:
+            ring.append(current)
+            choices = outgoing[current]
+            end = choices.pop(direction)
+            if not choices:
+                del outgoing[current]
+            current = end
+            if current == start:
+                break
+            choices = outgoing.get(current, {})
+            direction = next((d for d in ((direction + 1) % 4, direction,
+                                          (direction + 3) % 4, (direction + 2) % 4)
+                              if d in choices), None)
+            if direction is None:
+                return []
+        points = np.asarray(ring, dtype=np.float64)
+        # Removing collinear cell-edge vertices is exact, and makes later
+        # simplification much cheaper than processing every boundary pixel.
+        before = points - np.roll(points, 1, axis=0)
+        after = np.roll(points, -1, axis=0) - points
+        corners = before[:, 0] * after[:, 1] != before[:, 1] * after[:, 0]
+        rings.append(points[corners])
+    return rings
+
+
+def _capsid_simplify_open(points: np.ndarray, tolerance: float) -> np.ndarray:
+    """Iterative Ramer-Douglas-Peucker simplification, with segment distances."""
+    keep = np.zeros(len(points), dtype=bool)
+    keep[[0, -1]] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        first, last = stack.pop()
+        if last <= first + 1:
+            continue
+        vector = points[last] - points[first]
+        length_squared = float(vector @ vector)
+        offsets = points[first + 1:last] - points[first]
+        if length_squared:
+            fractions = np.clip(offsets @ vector / length_squared, 0, 1)
+            offsets = offsets - fractions[:, None] * vector
+        distances = np.einsum("ij,ij->i", offsets, offsets)
+        farthest = int(np.argmax(distances))
+        if distances[farthest] > tolerance * tolerance:
+            split = first + 1 + farthest
+            keep[split] = True
+            stack.extend(((first, split), (split, last)))
+    return points[keep]
+
+
+def _capsid_simplify_ring(points: np.ndarray, tolerance: float, fixed=None) -> np.ndarray:
+    if len(points) <= 4:
+        return points
+    # Two separated anchors avoid the closed-polyline zero-length-baseline
+    # problem. A ring is simplified on both sides of these fixed anchors.
+    first = int(np.argmax(np.sum((points - points[0]) ** 2, axis=1)))
+    opposite = int(np.argmax(np.sum((points - points[first]) ** 2, axis=1)))
+    anchors = np.unique([first, opposite, *(np.flatnonzero(fixed) if fixed is not None else [])])
+    simplified = []
+    for start, end in zip(anchors, np.roll(anchors, -1)):
+        indices = (np.arange(start, end + 1) if end > start else
+                   np.concatenate((np.arange(start, len(points)), np.arange(end + 1))))
+        simplified.append(_capsid_simplify_open(points[indices], tolerance)[:-1])
+    return np.vstack(simplified)
+
+
+def _capsid_convex_hull(points: np.ndarray) -> np.ndarray:
+    """Monotone-chain hull used only when bounded shape checks permit it."""
+    vertices = sorted(set(map(tuple, points)))
+    if len(vertices) <= 2:
+        return np.asarray(vertices, dtype=np.float64)
+    def cross(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    lower, upper = [], []
+    for point in vertices:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    for point in reversed(vertices):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    return np.asarray(lower[:-1] + upper[:-1], dtype=np.float64)
+
+
+def _capsid_simple_polygon(points: np.ndarray) -> bool:
+    """Reject degenerate/self-crossing RDP outputs before rasterization."""
+    count = len(points)
+    if count < 3 or count > 512:
+        return False
+    for index in range(count):
+        a, b = points[index], points[(index + 1) % count]
+        c = points[index + 2:count - (1 if index == 0 else 0)]
+        if not len(c):
+            continue
+        d = points[(np.arange(index + 2, index + 2 + len(c)) + 1) % count]
+        ab = b - a
+        ac, ad = c - a, d - a
+        cd = d - c
+        ca, cb = a - c, b - c
+        cross_ac = ab[0] * ac[:, 1] - ab[1] * ac[:, 0]
+        cross_ad = ab[0] * ad[:, 1] - ab[1] * ad[:, 0]
+        cross_ca = cd[:, 0] * ca[:, 1] - cd[:, 1] * ca[:, 0]
+        cross_cb = cd[:, 0] * cb[:, 1] - cd[:, 1] * cb[:, 0]
+        overlapping_boxes = (
+            np.maximum(np.minimum(a[0], b[0]), np.minimum(c[:, 0], d[:, 0]))
+            <= np.minimum(np.maximum(a[0], b[0]), np.maximum(c[:, 0], d[:, 0]))
+        ) & (
+            np.maximum(np.minimum(a[1], b[1]), np.minimum(c[:, 1], d[:, 1]))
+            <= np.minimum(np.maximum(a[1], b[1]), np.maximum(c[:, 1], d[:, 1]))
+        )
+        if np.any(overlapping_boxes & (cross_ac * cross_ad <= 0)
+                  & (cross_ca * cross_cb <= 0)):
+            return False
+    return True
+
+
+def _capsid_raster_polygon(points: np.ndarray, shape, check_cancel=None) -> np.ndarray:
+    """Rasterize at pixel centres with half-open scanline intersections.
+
+    The returned bitmap is the single source for overlay, hit testing and
+    picking. Drawing a polygon over a different sampling mask would be unsafe.
+    """
+    result = np.zeros(shape, dtype=bool)
+    edges = np.roll(points, -1, axis=0) - points
+    low_y = np.minimum(points[:, 1], points[:, 1] + edges[:, 1])
+    high_y = np.maximum(points[:, 1], points[:, 1] + edges[:, 1])
+    first = max(0, int(math.ceil(float(low_y.min()) - .5)))
+    last = min(shape[0], int(math.ceil(float(high_y.max()) - .5)))
+    for y in range(first, last):
+        if y % 64 == 0:
+            _capsid_check(check_cancel)
+        active = (low_y <= y + .5) & (y + .5 < high_y)
+        x = points[active, 0] + ((y + .5 - points[active, 1])
+                                * edges[active, 0] / edges[active, 1])
+        x.sort()
+        for left, right in zip(x[::2], x[1::2]):
+            begin = max(0, int(math.ceil(float(left) - .5)))
+            end = min(shape[1], int(math.ceil(float(right) - .5)))
+            result[y, begin:end] = True
+    return result
+
+
+def polygonal_capsid_mask(mask: np.ndarray, *, allowed_mask=None,
+                         check_cancel=None) -> tuple[np.ndarray, dict[str, Any]]:
+    """Fit bounded polygonal outer contours while retaining internal exclusions.
+
+    Each connected component is fitted separately. A near-convex component
+    may receive a simpler hull-derived polygon if its filled support occupies
+    at least 80% of that polygon, it adds at most 25% area, and outward growth
+    stays within a bounded 4--24 pixel band. Otherwise RDP fits a concave
+    polygon with at most 10% area added. Both paths retain at least 90% of the
+    original support and preserve connectivity. Tiny threshold pinholes may
+    be filled (each <=0.5% of the core, capped at 64 pixels; total <=2%).
+    Larger holes and all forbidden pixels stay unpickable. Very thin or
+    degenerate shapes fall back to their original outer boundary.
+
+    This regularizes an existing proposal; it does not supply new biological
+    recognition evidence or repair a wrongly selected membrane/background.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2 or min(mask.shape, default=0) == 0:
+        raise ValueError("Polygon fitting requires a nonempty two-dimensional mask.")
+    if allowed_mask is None:
+        allowed = np.ones(mask.shape, dtype=bool)
+    else:
+        allowed = np.asarray(allowed_mask, dtype=bool)
+        if allowed.shape != mask.shape:
+            raise ValueError("Polygon constraints must match the mask dimensions.")
+    source = mask & allowed
+    labels, count = ndi.label(source)
+    result = np.zeros(mask.shape, dtype=bool)
+    details = {"method": "bounded polygon simplification", "components": [],
+               "original_area": int(source.sum()), "polygon_area": 0,
+               "hard_exclusions_preserved": True,
+               "all_internal_exclusions_preserved": True}
+    for label, bounds in enumerate(ndi.find_objects(labels), 1):
+        _capsid_check(check_cancel)
+        if bounds is None:
+            continue
+        # Work only on the component bounding box. This also keeps the native
+        # image border exact for truncated capsids without closing it inwards.
+        component = labels[bounds] == label
+        constraint = allowed[bounds].copy()
+        if count > 1:
+            # Neither fit may bridge a gap to another connected component,
+            # including one just outside this component's tight bounding box.
+            halo_bounds = tuple(slice(max(0, part.start - 1),
+                                      min(limit, part.stop + 1))
+                                for part, limit in zip(bounds, mask.shape))
+            halo = labels[halo_bounds]
+            other = (halo != 0) & (halo != label)
+            excluded = ndi.binary_dilation(other)
+            inner = tuple(slice(part.start - halo_part.start,
+                                part.stop - halo_part.start)
+                          for part, halo_part in zip(bounds, halo_bounds))
+            constraint &= ~excluded[inner]
+        area = int(component.sum())
+        filled = ndi.binary_fill_holes(component)
+        holes = filled & ~component
+        # Fine texture thresholding can puncture a capsid with grain-sized
+        # holes. Remove only tiny holes entirely within the allowed parent;
+        # a SAM exclusion, coloured screen mark, or larger dark patch is not
+        # reclassified as capsid merely to make the polygon look cleaner.
+        hole_labels, _ = ndi.label(holes)
+        sizes = np.bincount(hole_labels.ravel())
+        hole_limit = max(1, min(64, math.floor(area * .005)))
+        budget = math.floor(area * .02)
+        filled_hole_pixels = 0
+        forbidden_holes = np.bincount(hole_labels[~constraint], minlength=len(sizes)) > 0
+        eligible = np.flatnonzero((sizes > 0) & (sizes <= hole_limit) & ~forbidden_holes)
+        eligible = eligible[eligible != 0]
+        eligible = eligible[np.argsort(sizes[eligible], kind="stable")]
+        fill_holes = np.zeros(len(sizes), dtype=bool)
+        for index, hole_id in enumerate(eligible):
+            if index % 256 == 0:
+                _capsid_check(check_cancel)
+            size = int(sizes[hole_id])
+            if size > budget:
+                break
+            fill_holes[hole_id] = True
+            filled_hole_pixels += size
+            budget -= size
+        holes &= ~fill_holes[hole_labels]
+        rings = _capsid_boundary_rings(filled, check_cancel)
+        fitted = filled & ~holes
+        metadata = {"applied": False, "strategy": "original mask", "vertices": 0,
+                    "tolerance_pixels": 0.0,
+                    "filled_pinhole_pixels": filled_hole_pixels,
+                    "preserved_hole_pixels": int(holes.sum())}
+        if filled_hole_pixels:
+            details["all_internal_exclusions_preserved"] = False
+        if len(rings) == 1 and len(rings[0]) >= 3:
+            boundary = rings[0]
+            def fixed_border_vertices(vertices):
+                return ((bounds[1].start == 0) & (vertices[:, 0] == 0)
+                        | (bounds[1].stop == mask.shape[1]) & (vertices[:, 0] == component.shape[1])
+                        | (bounds[0].start == 0) & (vertices[:, 1] == 0)
+                        | (bounds[0].stop == mask.shape[0]) & (vertices[:, 1] == component.shape[0]))
+
+            # Many threshold notches are grain variation inside one polygonal
+            # core. Prefer a simpler capsid-like hull only when its extent is
+            # already mostly supported. Do not convexify deep notches, merged
+            # branches, separate components, or missing forbidden regions.
+            hull = _capsid_convex_hull(boundary)
+            hull_tolerance = max(1.5, min(8., math.sqrt(area) * .04))
+            polygon = _capsid_simplify_ring(hull, hull_tolerance, fixed_border_vertices(hull))
+            if _capsid_simple_polygon(polygon):
+                hull_mask = _capsid_raster_polygon(polygon, component.shape, check_cancel)
+                candidate = hull_mask & constraint & ~holes
+                retained = int(np.count_nonzero(candidate & component))
+                added = int(np.count_nonzero(candidate & ~component))
+                if (retained >= .90 * area and added <= .25 * area
+                        and int(np.count_nonzero(hull_mask & filled)) >= .80 * int(hull_mask.sum())):
+                    distances = ndi.distance_transform_edt(~filled)
+                    added_pixels = candidate & ~component
+                    growth = float(distances[added_pixels].max()) if added else 0.0
+                    if growth <= max(4., min(24., math.sqrt(area) * .20)) and ndi.label(candidate)[1] == 1:
+                        fitted = candidate
+                        metadata.update(applied=True, strategy="near-convex polygon",
+                                        vertices=len(polygon), tolerance_pixels=float(hull_tolerance),
+                                        maximum_outward_growth_pixels=growth)
+            tolerance = max(2., min(10., math.sqrt(area) * .06))
+            fixed = fixed_border_vertices(boundary)
+            for attempt in range(0 if metadata["applied"] else 5):
+                _capsid_check(check_cancel)
+                polygon = _capsid_simplify_ring(rings[0], tolerance, fixed)
+                if _capsid_simple_polygon(polygon):
+                    candidate = _capsid_raster_polygon(polygon, component.shape, check_cancel)
+                    candidate &= constraint & ~holes
+                    retained = int(np.count_nonzero(candidate & component))
+                    added = int(np.count_nonzero(candidate & ~component))
+                    _, pieces = ndi.label(candidate)
+                    if retained >= .90 * area and added <= .10 * area and pieces == 1:
+                        fitted = candidate
+                        metadata.update(applied=True, strategy="concave polygon", vertices=len(polygon),
+                                        tolerance_pixels=float(tolerance))
+                        break
+                tolerance *= .5
+        result[bounds] |= fitted
+        details["components"].append(metadata)
+    details["polygon_area"] = int(result.sum())
+    return result, details
 
 
 def filter_capsid_proposals(
@@ -223,6 +645,7 @@ def filter_capsid_proposals(
                           bbox=_capsid_bbox(component), predicted_iou=None,
                           stability_score=None, capsid_score=float(rank),
                           capsid_evidence=evidence,
+                          _capsid_parent_mask=mask, _capsid_inset=inset,
                           source="capsid texture core (review)")
             refined.append(result)
     # Resolve duplicate/nested proposals only after the content check. Favour
@@ -242,6 +665,19 @@ def filter_capsid_proposals(
             selected.append(record)
             if len(selected) >= max_candidates:
                 break
+    # Fit only the final proposals. Texture scoring and duplicate selection
+    # remain based on the observed density; polygon shape is not evidence of
+    # a capsid. Avoid repeating this work for all nested SAM alternatives.
+    for record in selected:
+        _capsid_check(check_cancel)
+        parent = record.pop("_capsid_parent_mask")
+        inset = record.pop("_capsid_inset")
+        allowed = ndi.binary_erosion(parent, iterations=inset, border_value=1) & valid
+        fitted, polygon_evidence = polygonal_capsid_mask(
+            record["segmentation"], allowed_mask=allowed, check_cancel=check_cancel)
+        record.update(segmentation=fitted, area=int(fitted.sum()), bbox=_capsid_bbox(fitted),
+                      source="capsid polygon (review)")
+        record["capsid_evidence"]["polygon"] = polygon_evidence
     return selected
 
 
@@ -685,7 +1121,8 @@ class SamRecognizer:
                 "sam_proposals": raw_count,
                 "selected_contours": len(result),
                 "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
-                "note": ("Image-based dense-core filter; not a trained or calibrated capsid classifier."
+                "note": ("Dense-core filter with bounded polygonal boundaries; "
+                         "not a trained or calibrated capsid classifier."
                          if is_capsid else "Unclassified generic SAM proposals."),
             }
             self._automatic_image_key, self._automatic_result = key, result
@@ -1014,6 +1451,10 @@ class TaskRunner:
         self._busy = False
         self._closed = False
         self._active_token: CancellationToken | None = None
+        # The submitting/polling thread owns the final reference to callbacks.
+        # A screen callback may close over Tk objects, whose destructors must
+        # never run when the worker starts the next operation.
+        self._active_function: Callable | None = None
         self._thread = threading.Thread(
             target=self._worker, name="saru-worker", daemon=True
         )
@@ -1052,6 +1493,7 @@ class TaskRunner:
             if token.generation != self._generation or token.cancelled:
                 raise ValueError("Task token is cancelled or belongs to a stale generation.")
             self._active_token = token
+            self._active_function = fn
             self._busy = True
             self._jobs.put_nowait((token, fn))
             return token
@@ -1060,13 +1502,24 @@ class TaskRunner:
         """Collect completed work; call this from the GUI's event loop."""
         results = []
         while True:
-            try:
-                result = self._results.get_nowait()
-            except queue.Empty:
-                break
             with self._lock:
+                try:
+                    result = self._results.get_nowait()
+                except queue.Empty:
+                    if self._closed and not self._thread.is_alive():
+                        # Shutdown can win before a queued callback starts.
+                        # Drain those callback references on this thread too.
+                        while True:
+                            try:
+                                self._jobs.get_nowait()
+                            except queue.Empty:
+                                break
+                        self._active_function = self._active_token = None
+                        self._busy = False
+                    break
                 if self._active_token is result.token:
                     self._active_token = None
+                    self._active_function = None
                     self._busy = False
                 if result.token.generation == self._generation and not self._closed:
                     results.append(result)
@@ -1089,7 +1542,10 @@ class TaskRunner:
             pass
         if wait and threading.current_thread() is not self._thread:
             self._thread.join(timeout)
-        return not self._thread.is_alive()
+        stopped = not self._thread.is_alive()
+        if stopped:
+            self.poll_results()
+        return stopped
 
     def _worker(self) -> None:
         while True:
@@ -1100,6 +1556,7 @@ class TaskRunner:
             if item is None:
                 return
             token, fn = item
+            value = None
             try:
                 token.wait_until_ready()
                 value = fn(token)
@@ -1110,8 +1567,25 @@ class TaskRunner:
             except Exception as exc:
                 trace = traceback.format_exc()
                 EXECUTION_LOGGER.exception("Picker operation failed; the operation was stopped.")
+                # Keep the useful formatted stack, not live worker frames and
+                # their GUI-capturing closures. Exception chains need the same
+                # treatment or a later collection can still own those frames.
+                pending, visited = [exc], set()
+                while pending:
+                    failure = pending.pop()
+                    if id(failure) in visited:
+                        continue
+                    visited.add(id(failure))
+                    pending.extend(part for part in (failure.__cause__, failure.__context__) if part is not None)
+                    failure.__traceback__ = None
+                del pending, visited, failure
                 result = TaskResult(token=token, error=exc, traceback_text=trace)
-            self._results.put_nowait(result)
+            with self._lock:
+                self._results.put_nowait(result)
+                # poll_results takes this same lock. By the time it can drop
+                # the owning references, this thread holds no old callback,
+                # return value or exception result while awaiting the next job.
+                del item, fn, value, result, token
 
 
 def play_clicks(
@@ -2311,6 +2785,18 @@ class InputSurface(_ScreenSurface):
         self._dragging = False
         super().hide()
 
+    def close(self):
+        self._check_thread()
+        try:
+            super().close()
+        finally:
+            # A contour selection destroys its catcher from inside a release
+            # callback. Do not let that retired object keep the controller
+            # alive or dispatch a queued cancellation to the next catcher.
+            self._dragging = False
+            self._press_callback = self._move_callback = self._release_callback = None
+            self._right_callback = self._cancel_callback = None
+
     def _event_xy(self, event):
         # Do not use canvas-local x/y or Tk scaling: coordinates are screen pixels.
         return _screen_xy(event.x_root, event.y_root)
@@ -2745,6 +3231,25 @@ class ScreenContourBatch:
     screen: np.ndarray
 
 
+def _screen_picked_points(picked, geometry):
+    """Validate actual ROI-local pick positions before building native arrays."""
+    result = set()
+    for point in picked:
+        try:
+            x, y = point
+            if any(isinstance(value, (bool, np.bool_)) for value in (x, y)):
+                raise ValueError
+            x, y = float(x), float(y)
+            if (not math.isfinite(x) or not math.isfinite(y)
+                    or not x.is_integer() or not y.is_integer()
+                    or not 0 <= x < geometry.width or not 0 <= y < geometry.height):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Previously placed picks must be integer positions inside the selected screen area.") from exc
+        result.add((int(x), int(y)))
+    return result
+
+
 def screen_model_batches(candidates, geometry, spacing, picked=(), cancel=None,
                          max_points=10000):
     """Prepare every contour before clicking, retaining detection order.
@@ -2759,7 +3264,7 @@ def screen_model_batches(candidates, geometry, spacing, picked=(), cancel=None,
     if (isinstance(max_points, (bool, np.bool_))
             or not isinstance(max_points, (int, np.integer)) or max_points < 1):
         raise ValueError("max_points must be a positive integer.")
-    already = {tuple(map(int, point)) for point in picked}
+    already = _screen_picked_points(picked, geometry)
     batches, count = [], 0
     for candidate in candidates:
         if candidate.mask.shape != (geometry.height, geometry.width):
@@ -2806,14 +3311,21 @@ def screen_model_points(candidates, geometry, spacing, picked=(), cancel=None):
     return np.concatenate([batch.local for batch in batches]), np.concatenate([batch.screen for batch in batches])
 
 
-def screen_background_guard(candidates, geometry, spacing):
+def screen_background_guard(candidates, geometry, spacing, picked=()):
     """Pixels outside selected regions and expected pick-marker margins.
 
     This is a conservative scene-change heuristic, not image registration.
+    Earlier actual picks are also excluded: cryoSPARC may finish painting their
+    markers after the first contour has completed. Their delayed appearance
+    must not be mistaken for a moved micrograph on the next contour.
     A tiny or empty remainder cannot establish that old proposals still align.
     """
     from scipy.ndimage import distance_transform_edt
     selected = union_masks(candidates, (geometry.height, geometry.width))
+    for x, y in _screen_picked_points(picked, geometry):
+        selected[y, x] = True
+    if not np.any(selected):
+        return np.ones(selected.shape, dtype=bool)
     background = distance_transform_edt(~selected) > max(8, int(spacing))
     if np.count_nonzero(background) < max(64, int(.02 * background.size)):
         return None
@@ -2849,6 +3361,7 @@ class ScreenPickerApp:
         self.tk, self.ttk = tk, ttk
         self.filedialog, self.messagebox = filedialog, messagebox
         self.root, self.args, self.log_path = root, args, Path(log_path)
+        apply_application_icon(root)
         self.desktop, self.runner = DesktopAdapter(), TaskRunner()
         self.events = queue.Queue()
         self.overlay = self.input_surface = self.advanced = None
@@ -2863,6 +3376,9 @@ class ScreenPickerApp:
         self.scheduled = set()
         self.transition = False
         self._fit_after = None
+        self._poll_after = None
+        self._shutdown_after = None
+        self._variable_traces = []
         self._fitting = False
         self.job_kind = None
         self.active_token = None
@@ -2902,7 +3418,7 @@ class ScreenPickerApp:
                     self.mouse_observer.stop()
                 self.hotkeys = self.mouse_observer = None
                 self.status.set(f"Screen input unavailable: {exc}")
-        self.root.after(30, self.poll)
+        self._poll_after = self.root.after(30, self.poll)
 
     def _build_ui(self, checkpoint_path):
         tk, ttk, root = self.tk, self.ttk, self.root
@@ -2968,8 +3484,9 @@ class ScreenPickerApp:
         self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
         self.grid_side = tk.IntVar(value=8)
         self.click_delay = tk.DoubleVar(value=.10)
-        self.status.trace_add("write", self._queue_panel_fit)
-        self.region_label.trace_add("write", self._queue_panel_fit)
+        for variable in (self.status, self.region_label):
+            identifier = variable.trace_add("write", self._queue_panel_fit)
+            self._variable_traces.append((variable, identifier))
         self.fit_panel()
 
     def _queue_panel_fit(self, *args):
@@ -3453,6 +3970,8 @@ class ScreenPickerApp:
             raise ValueError("Detect the selected screen area before picking.")
         candidates, picked = tuple(candidates), set(self.picked_points)
         spacing, frame_id = int(self.spacing.get()), self.frame_id
+        SCREEN_LOG.info("Starting model picks: frame=%s contours=%s previous_picks=%s auto=%s ids=%s",
+                        frame_id, len(candidates), len(picked), auto, [candidate.id for candidate in candidates])
         self._hide_overlays()
         self._check_panel_clear(geometry)
         self.transition = True
@@ -3468,10 +3987,12 @@ class ScreenPickerApp:
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the micrograph.")
-                if screen_changed_fraction(reference, self._capture_region(geometry)) > .03:
+                alignment = screen_background_guard((), geometry, spacing, picked)
+                if alignment is None:
+                    raise RuntimeError("Too little unchanged background to verify the remaining contours. Select a larger area and Detect again.")
+                if screen_background_changed(reference, self._capture_region(geometry), alignment) > .03:
                     raise RuntimeError("The micrograph changed before picking. Detect again.")
-                background = (screen_background_guard(candidates, geometry, spacing) if planned
-                              else np.ones((geometry.height, geometry.width), dtype=bool))
+                background = screen_background_guard(candidates if planned else (), geometry, spacing, picked)
                 next_check = time.monotonic() + .75
                 def verify_scene(*, force=False):
                     nonlocal next_check
@@ -3484,7 +4005,7 @@ class ScreenPickerApp:
                 def click(x, y):
                     verify_scene()
                     self.desktop.click(x, y)
-                count = 0
+                count, completed_local = 0, []
                 for index, batch in enumerate(batches, 1):
                     token.wait_until_ready()
                     if index > 1:
@@ -3499,21 +4020,26 @@ class ScreenPickerApp:
                         self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
                         continue
                     def progress(done, total):
+                        actual = tuple(map(int, batch.local[done-1]))
+                        completed_local.append(actual)
                         self.events.put(("picked", token.generation, frame_id,
-                                         tuple(map(int, batch.local[done-1])), done, total, index, len(batches)))
+                                         actual, done, total, index, len(batches)))
                         # Record actual completion before a cancellation check
                         # can discard the final worker result.
                         if done == total:
                             self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
                     count += play_clicks(batch.screen, click, geometry, token, delay=delay,
                                          max_clicks=10000, progress=progress)
+                    SCREEN_LOG.info("Completed model contour: frame=%s contour=%s/%s id=%s picks=%s",
+                                    frame_id, index, len(batches), batch.candidate_id, len(batch.screen))
                 token.sleep(.12)
                 self.desktop.ensure_target(target)
                 after = self._capture_region(geometry)
                 if background is not None and screen_background_changed(reference, after, background) > .03:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
                 return {"count": count, "ids": {batch.candidate_id for batch in batches}, "reference": after,
-                        "auto": auto, "contours": len(batches), "scene_verified": background is not None}
+                        "auto": auto, "contours": len(batches), "scene_verified": background is not None,
+                        "frame_id": frame_id, "picked": tuple(completed_local)}
             self._submit("model picks", work)
         self._schedule(90, begin)
 
@@ -3604,6 +4130,12 @@ class ScreenPickerApp:
                 else:
                     self.status.set("No proposals. Try a tight Box prompt around a target.")
         elif kind == "model picks":
+            if value.get("frame_id", self.frame_id) != self.frame_id:
+                return
+            # Progress events can trail a completed result or exceed a poll's
+            # event budget. Commit actual clicks before making the next
+            # contour selectable; its planner must see the complete history.
+            self.picked_points.update(value.get("picked", ()))
             if not value.get("scene_verified", True):
                 self.stop(message=f"{value['count']} picks placed. Too little unchanged background to verify alignment; select a larger area and Detect again.")
                 self.candidates, self.alternatives = [], []
@@ -3661,8 +4193,32 @@ class ScreenPickerApp:
         self.status.set(message or "Picking disabled. Uncheck Disable Picking when ready.")
 
     def poll(self):
+        """Keep queue processing alive after a recoverable callback failure."""
+        identifier = getattr(self, "_poll_after", None)
+        self._poll_after = None
+        if identifier is not None:
+            self.root.after_cancel(identifier)
         if self.closed:
             return
+        try:
+            self._poll_once()
+        except Exception as exc:
+            SCREEN_LOG.exception("Screen event processing failed; stopping the active operation")
+            try:
+                self._error(exc)
+            except Exception:
+                # Cancellation must survive even a failed native window update.
+                self.runner.invalidate()
+                SCREEN_LOG.exception("Screen error recovery could not update the panel")
+        finally:
+            if not self.closed:
+                self._poll_after = self.root.after(30, self.poll)
+
+    def _poll_once(self):
+        # A collected completion guarantees that all its progress events have
+        # already been queued. Collect before draining so the final event
+        # cannot arrive between an empty-queue check and enabling selection.
+        completed_results = self.runner.poll_results()
         try:
             for _ in range(4000):
                 item = self.events.get_nowait()
@@ -3691,7 +4247,12 @@ class ScreenPickerApp:
                         self.alternatives = []
         except queue.Empty:
             pass
-        for result in self.runner.poll_results():
+        for result in completed_results:
+            # Escape may invalidate this completion while its earlier progress
+            # is being processed. Real clicks stay recorded; stale UI state
+            # must not be presented again.
+            if result.token.generation != self.runner.generation:
+                continue
             kind = self.job_kind
             self.active_token = None
             if result.error is not None or result.cancelled:
@@ -3713,7 +4274,6 @@ class ScreenPickerApp:
             except Exception as exc:
                 self._error(exc)
         self._sync_manual()
-        self.root.after(30, self.poll)
 
     def open_advanced(self):
         try:
@@ -3768,11 +4328,23 @@ class ScreenPickerApp:
         if self.closed:
             return
         self.closed = True
+        # Variable traces own Tcl commands separately from root.bind/after.
+        # root.destroy alone does not delete those commands, which otherwise
+        # keep bound controller callbacks and the interpreter graph alive.
+        traces, self._variable_traces = getattr(self, "_variable_traces", []), []
+        for variable, identifier in traces:
+            try:
+                variable.trace_remove("write", identifier)
+            except self.tk.TclError:
+                SCREEN_LOG.warning("A panel variable trace was already unavailable during shutdown.")
+        if getattr(self, "_poll_after", None) is not None:
+            self.root.after_cancel(self._poll_after)
+            self._poll_after = None
         if self._fit_after is not None:
             self.root.after_cancel(self._fit_after)
             self._fit_after = None
         self._gate_manual()
-        self.runner.shutdown(wait=False)
+        stopped = self.runner.shutdown(wait=False)
         for identifier in tuple(self.scheduled):
             self.root.after_cancel(identifier)
         self.scheduled.clear()
@@ -3785,7 +4357,22 @@ class ScreenPickerApp:
             self.overlay.close()
         if self.advanced is not None:
             self.advanced.destroy()
-        self.root.destroy()
+            self.advanced = None
+        if stopped:
+            self.root.destroy()
+        else:
+            # A native model pass cannot be interrupted. Keep its interpreter
+            # alive until callbacks/results can be released on the GUI thread.
+            self.status.set("Stopping the active operation… the window will close when it has stopped.")
+            self._shutdown_after = self.root.after(30, self._finish_close)
+
+    def _finish_close(self):
+        self._shutdown_after = None
+        self.runner.poll_results()
+        if self.runner.shutdown(wait=False):
+            self.root.destroy()
+        else:
+            self._shutdown_after = self.root.after(30, self._finish_close)
 
 
 # ---------------- app.py ----------------
@@ -3814,7 +4401,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -3929,6 +4516,16 @@ def _smoke_image_processing() -> dict[str, Any]:
     proposal[20:44, 24:72] = True
     if filter_capsid_proposals(blank, [{"segmentation": proposal}]):
         raise RuntimeError("Uniform-image capsid rejection failed.")
+    core = np.zeros((80, 100), dtype=bool)
+    core[10:70, 10:90] = True
+    core[10:18, 40:50] = False
+    core[35:39, 25:29] = False
+    allowed = np.ones_like(core)
+    allowed[35:39, 25:29] = False
+    polygon, evidence = polygonal_capsid_mask(core, allowed_mask=allowed)
+    if (not evidence["components"][0]["applied"] or np.any(polygon & ~allowed)
+            or not polygon[12, 44] or np.any(polygon[35:39, 25:29])):
+        raise RuntimeError("Polygon fitting or its excluded-area constraint failed.")
     buffer = io.BytesIO()
     Image.fromarray(np.zeros((8, 12, 3), dtype=np.uint8)).save(buffer, format="PNG")
     buffer.seek(0)
@@ -3939,7 +4536,9 @@ def _smoke_image_processing() -> dict[str, Any]:
     return {"grid_points": int(len(points)), "png_roundtrip": True,
             "per_contour_grid_points": int(len(batches[0].local)),
             "cross_contour_duplicate_guard": True,
-            "capsid_uniform_scene_rejected": True}
+            "capsid_uniform_scene_rejected": True,
+            "capsid_polygon_fitting": True,
+            "polygon_exclusions_preserved": True}
 
 
 def _smoke_torchvision() -> dict[str, Any]:
@@ -4113,16 +4712,164 @@ def _smoke_panel_screenshot(window, destination: Path) -> dict[str, Any]:
     return {"path": str(destination), "native_outer_bbox": list(bbox)}
 
 
+def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
+    """Exercise real Tk surfaces and the real worker with an in-memory desktop.
+
+    Events are delivered only to our own Tk canvas. The desktop adapter below
+    cannot focus another application or send system input. This catches the
+    lifecycle between separate semi-auto jobs in source and frozen builds.
+    """
+    import threading
+
+    root = picker.root
+    previous_mode = picker.mode
+    previous_desktop, previous_hotkeys, previous_mouse = (picker.desktop, picker.hotkeys,
+                                                         picker.mouse_observer)
+    picker.set_mode("semi-auto")
+    _smoke_settle_panel(picker)
+    width, height = root.winfo_screenwidth(), root.winfo_screenheight()
+    occupied = control_panel_bounds(root)
+    geometry = next((CaptureGeometry(x, y, 240, 160)
+                     for x, y in ((width-260, 30), (width-260, height-190),
+                                  (20, height-190), (20, 30))
+                     if x >= 0 and y >= 0
+                     and not screen_region_overlaps_panel(CaptureGeometry(x, y, 240, 160), occupied)), None)
+    if geometry is None:
+        raise RuntimeError("No free screen area for the repeated-contour UI check.")
+
+    class Hooks:
+        def enable_space_pause(self, enabled):
+            pass
+        def stop(self):
+            pass
+
+    class MemoryDesktop:
+        def __init__(self):
+            yy, xx = np.mgrid[:geometry.height, :geometry.width]
+            grey = (80 + (xx * 3 + yy * 7) % 100).astype(np.uint8)
+            self.rgb = np.repeat(grey[..., None], 3, axis=2)
+            self.clicks = []
+            self.thread_ids = set()
+        def focus_target(self, target):
+            self.ensure_target(target)
+        def ensure_target(self, target):
+            if target != 12345:
+                raise RuntimeError("Unexpected synthetic picking target.")
+        def window_under_roi(self, region):
+            if region != geometry:
+                raise RuntimeError("Unexpected synthetic capture area.")
+            return 12345
+        def _layers_hidden(self):
+            if ((picker.overlay is not None and picker.overlay.visible)
+                    or (picker.input_surface is not None and picker.input_surface.visible)):
+                raise RuntimeError("A screen layer remained visible during picking/capture.")
+        def screenshot(self, region):
+            self.window_under_roi(region)
+            self._layers_hidden()
+            return self.rgb.copy()
+        def click(self, x, y):
+            self._layers_hidden()
+            if not geometry.contains(x, y):
+                raise RuntimeError("A generated test pick escaped the screen area.")
+            self.thread_ids.add(threading.get_ident())
+            self.clicks.append((x, y))
+        def paint_delayed_markers(self):
+            image = Image.fromarray(self.rgb)
+            draw = ImageDraw.Draw(image)
+            for x, y in self.clicks:
+                x, y = x-geometry.left, y-geometry.top
+                draw.ellipse((x-10, y-10, x+10, y+10), outline=(40, 240, 60), width=4)
+            self.rgb = np.array(image)
+
+    desktop = MemoryDesktop()
+    candidates = []
+    for left in (12, 89, 166):
+        mask = polygon_mask([(left+9, 30), (left+43, 30), (left+54, 48),
+                             (left+49, 94), (left+10, 101), (left, 73)],
+                            (geometry.height, geometry.width))
+        candidates.append(make_candidate(mask, source="synthetic lifecycle check"))
+    completed = []
+    delayed_fraction = 0.0
+    try:
+        picker.desktop, picker.hotkeys, picker.mouse_observer = desktop, Hooks(), Hooks()
+        picker.geometry, picker.target = geometry, 12345
+        picker.rgb = desktop.rgb.copy()
+        picker.reference = desktop.rgb.copy()
+        picker.frame_id += 1
+        picker.candidates = candidates.copy()
+        picker.picked_points.clear()
+        picker.spacing.set(20)
+        picker.click_delay.set(.02)
+        picker.disabled.set(False)
+        picker._present_masks()
+        root.update()
+        for index, candidate in enumerate(candidates):
+            surface = picker.input_surface
+            if surface is None or not surface.visible:
+                raise RuntimeError(f"Clickable overlay missing before contour {index+1}.")
+            ys, xs = np.nonzero(candidate.mask)
+            mid = len(xs)//2
+            local_x, local_y = int(xs[mid]), int(ys[mid])
+            x, y = geometry.local_to_screen(local_x, local_y)
+            surface.canvas.event_generate("<ButtonPress-1>", x=local_x, y=local_y,
+                                          rootx=x, rooty=y)
+            surface.canvas.event_generate("<ButtonRelease-1>", x=local_x, y=local_y,
+                                          rootx=x, rooty=y)
+            if not (picker.transition or picker.runner.busy):
+                raise RuntimeError(f"Contour {index+1} did not start: {picker.status.get()}")
+            deadline = time.monotonic() + 15
+            while picker.transition or picker.runner.busy:
+                root.update()
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"Contour {index+1} did not finish: {picker.status.get()}")
+                time.sleep(.005)
+            root.update()
+            if picker.disabled.get() or any(c.id == candidate.id for c in picker.candidates):
+                raise RuntimeError(f"Contour {index+1} failed: {picker.status.get()}")
+            if root.state() != "normal" or not root.winfo_viewable():
+                raise RuntimeError(f"Control panel disappeared after contour {index+1}.")
+            if index < len(candidates)-1 and (picker.input_surface is None or not picker.input_surface.visible):
+                raise RuntimeError(f"Next contour was not selectable after contour {index+1}.")
+            completed.append(len(desktop.clicks))
+            if index == 0:
+                desktop.paint_delayed_markers()
+                delayed_fraction = screen_changed_fraction(picker.reference, desktop.rgb)
+                if delayed_fraction <= .03:
+                    raise RuntimeError("Delayed-marker fixture did not cross the former drift threshold.")
+        if len(desktop.clicks) != len(set(desktop.clicks)) or not desktop.clicks:
+            raise RuntimeError("Repeated contours produced duplicate or empty test picks.")
+        if desktop.thread_ids == {threading.get_ident()} or len(desktop.thread_ids) != 1:
+            raise RuntimeError("Picking did not use the serialized background worker.")
+        return {"contours_completed": len(completed), "cumulative_pick_counts": completed,
+                "delayed_marker_changed_fraction": delayed_fraction,
+                "separate_worker_jobs": True, "real_tk_input_events": True,
+                "remaining_contours_selectable": True, "panel_visible_throughout": True,
+                "unique_test_picks": len(desktop.clicks), "desktop_events_sent": 0,
+                "note": "Real controller/worker/Windows overlays; in-memory target and click sink, not cryoSPARC."}
+    finally:
+        picker.stop()
+        if not picker.runner.shutdown(wait=True, timeout=5):
+            raise RuntimeError("Repeated-contour test worker did not terminate.")
+        picker.runner.poll_results()
+        picker.runner = TaskRunner()
+        picker.desktop, picker.hotkeys, picker.mouse_observer = (previous_desktop,
+                                                               previous_hotkeys, previous_mouse)
+        picker.set_mode(previous_mode)
+
+
 def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None) -> dict[str, Any]:
     # These are native Windows widgets at simulated Tk font/layout scales. The
     # Windows monitor's DPI setting is never changed. Each fresh interpreter is
     # scaled before widgets/fonts exist, because changing Tk scaling afterwards
     # does not reliably resize previously constructed controls.
     enable_dpi_awareness()
+    configure_application_identity()
     tkinter = importlib.import_module("tkinter")
     scale_checks = []
     panel_layouts = {}
     overlay_checks = None
+    repeated_contours = None
+    icon_checks = None
     tk_version = None
     long_status = ("Recognition is running on the selected screen area.\n"
                    "Escape stops picking; F8 pauses or resumes.\n"
@@ -4173,10 +4920,20 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                                  "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts})
             if overlay_checks is None:
                 overlay_checks = verify_screen_overlay(window)
+                icon_checks = windows_application_icon_status(window)
+                if not all(icon_checks.values()) or not all(path.is_file() for path in application_icon_paths()):
+                    raise RuntimeError("The native application icon or bundled artwork is missing.")
+                repeated_contours = _smoke_repeated_screen_picks(picker)
         finally:
             if original_scaling is not None:
                 window.tk.call("tk", "scaling", original_scaling)
             if picker is not None:
+                # Each simulated scale owns a fresh Tcl interpreter. Finish
+                # its idle worker before creating the next root; production
+                # close remains asynchronous while native work is active.
+                runner = getattr(picker, "runner", None)
+                if runner is not None and not runner.shutdown(wait=True, timeout=5):
+                    raise RuntimeError("Native UI check worker did not stop before interpreter teardown.")
                 picker.close()
             else:
                 window.destroy()
@@ -4191,6 +4948,8 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
             "layout_scaling_method": "Native Windows Tk widgets; pixels-per-point set before construction to simulate 100/125/150/200% of 96 DPI. Windows monitor scaling is unchanged.",
             "layout_scale_checks": scale_checks,
             "screen_overlay": overlay_checks,
+            "application_icon": icon_checks,
+            "repeated_semi_auto_contours": repeated_contours,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 
 
@@ -4377,6 +5136,7 @@ class PickerApp:
         self.tk, self.ttk = tk, ttk
         self.filedialog, self.messagebox = filedialog, messagebox
         self.root, self.args, self.log_path = root, args, log_path
+        apply_application_icon(root)
         self.runner = TaskRunner()
         self.events: queue.Queue = queue.Queue()
         self.desktop = DesktopAdapter()
@@ -5248,6 +6008,8 @@ def _run_application(args, *, console_available: bool) -> int:
     interactive = not (args.diagnostics or args.smoke_test or args.segment_image)
     try:
         log_path = setup_logging(include_console=console_available)
+        APP_LOG.info("Starting SARU Picker %s; platform=%s frozen=%s", APP_VERSION,
+                     sys.platform, bool(getattr(sys, "frozen", False)))
         checkpoint = resolve_checkpoint(args.checkpoint)
         if args.diagnostics or args.smoke_test:
             report = (run_smoke_test(checkpoint, log_path) if args.smoke_test
@@ -5290,6 +6052,7 @@ def _run_application(args, *, console_available: bool) -> int:
                 recognizer.close()
             return 0
         enable_dpi_awareness()
+        configure_application_identity()
         import tkinter as tk
         root = tk.Tk()
         if args.review or args.image:

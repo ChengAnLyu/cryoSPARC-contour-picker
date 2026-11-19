@@ -444,7 +444,8 @@ class SamRecognizer:
                 "sam_proposals": raw_count,
                 "selected_contours": len(result),
                 "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
-                "note": ("Image-based dense-core filter; not a trained or calibrated capsid classifier."
+                "note": ("Dense-core filter with bounded polygonal boundaries; "
+                         "not a trained or calibrated capsid classifier."
                          if is_capsid else "Unclassified generic SAM proposals."),
             }
             self._automatic_image_key, self._automatic_result = key, result

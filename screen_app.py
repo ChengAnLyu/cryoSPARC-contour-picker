@@ -16,6 +16,7 @@ import time
 
 import numpy as np
 
+from application_icon import apply_application_icon
 from desktop import DesktopAdapter, GlobalHotkeys
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskRunner, play_clicks
 from manual_sampling import legacy_contour_points, mask_contour_points
@@ -56,6 +57,25 @@ class ScreenContourBatch:
     screen: np.ndarray
 
 
+def _screen_picked_points(picked, geometry):
+    """Validate actual ROI-local pick positions before building native arrays."""
+    result = set()
+    for point in picked:
+        try:
+            x, y = point
+            if any(isinstance(value, (bool, np.bool_)) for value in (x, y)):
+                raise ValueError
+            x, y = float(x), float(y)
+            if (not math.isfinite(x) or not math.isfinite(y)
+                    or not x.is_integer() or not y.is_integer()
+                    or not 0 <= x < geometry.width or not 0 <= y < geometry.height):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Previously placed picks must be integer positions inside the selected screen area.") from exc
+        result.add((int(x), int(y)))
+    return result
+
+
 def screen_model_batches(candidates, geometry, spacing, picked=(), cancel=None,
                          max_points=10000):
     """Prepare every contour before clicking, retaining detection order.
@@ -70,7 +90,7 @@ def screen_model_batches(candidates, geometry, spacing, picked=(), cancel=None,
     if (isinstance(max_points, (bool, np.bool_))
             or not isinstance(max_points, (int, np.integer)) or max_points < 1):
         raise ValueError("max_points must be a positive integer.")
-    already = {tuple(map(int, point)) for point in picked}
+    already = _screen_picked_points(picked, geometry)
     batches, count = [], 0
     for candidate in candidates:
         if candidate.mask.shape != (geometry.height, geometry.width):
@@ -117,14 +137,21 @@ def screen_model_points(candidates, geometry, spacing, picked=(), cancel=None):
     return np.concatenate([batch.local for batch in batches]), np.concatenate([batch.screen for batch in batches])
 
 
-def screen_background_guard(candidates, geometry, spacing):
+def screen_background_guard(candidates, geometry, spacing, picked=()):
     """Pixels outside selected regions and expected pick-marker margins.
 
     This is a conservative scene-change heuristic, not image registration.
+    Earlier actual picks are also excluded: cryoSPARC may finish painting their
+    markers after the first contour has completed. Their delayed appearance
+    must not be mistaken for a moved micrograph on the next contour.
     A tiny or empty remainder cannot establish that old proposals still align.
     """
     from scipy.ndimage import distance_transform_edt
     selected = union_masks(candidates, (geometry.height, geometry.width))
+    for x, y in _screen_picked_points(picked, geometry):
+        selected[y, x] = True
+    if not np.any(selected):
+        return np.ones(selected.shape, dtype=bool)
     background = distance_transform_edt(~selected) > max(8, int(spacing))
     if np.count_nonzero(background) < max(64, int(.02 * background.size)):
         return None
@@ -160,6 +187,7 @@ class ScreenPickerApp:
         self.tk, self.ttk = tk, ttk
         self.filedialog, self.messagebox = filedialog, messagebox
         self.root, self.args, self.log_path = root, args, Path(log_path)
+        apply_application_icon(root)
         self.desktop, self.runner = DesktopAdapter(), TaskRunner()
         self.events = queue.Queue()
         self.overlay = self.input_surface = self.advanced = None
@@ -174,6 +202,9 @@ class ScreenPickerApp:
         self.scheduled = set()
         self.transition = False
         self._fit_after = None
+        self._poll_after = None
+        self._shutdown_after = None
+        self._variable_traces = []
         self._fitting = False
         self.job_kind = None
         self.active_token = None
@@ -213,7 +244,7 @@ class ScreenPickerApp:
                     self.mouse_observer.stop()
                 self.hotkeys = self.mouse_observer = None
                 self.status.set(f"Screen input unavailable: {exc}")
-        self.root.after(30, self.poll)
+        self._poll_after = self.root.after(30, self.poll)
 
     def _build_ui(self, checkpoint_path):
         tk, ttk, root = self.tk, self.ttk, self.root
@@ -279,8 +310,9 @@ class ScreenPickerApp:
         self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
         self.grid_side = tk.IntVar(value=8)
         self.click_delay = tk.DoubleVar(value=.10)
-        self.status.trace_add("write", self._queue_panel_fit)
-        self.region_label.trace_add("write", self._queue_panel_fit)
+        for variable in (self.status, self.region_label):
+            identifier = variable.trace_add("write", self._queue_panel_fit)
+            self._variable_traces.append((variable, identifier))
         self.fit_panel()
 
     def _queue_panel_fit(self, *args):
@@ -764,6 +796,8 @@ class ScreenPickerApp:
             raise ValueError("Detect the selected screen area before picking.")
         candidates, picked = tuple(candidates), set(self.picked_points)
         spacing, frame_id = int(self.spacing.get()), self.frame_id
+        SCREEN_LOG.info("Starting model picks: frame=%s contours=%s previous_picks=%s auto=%s ids=%s",
+                        frame_id, len(candidates), len(picked), auto, [candidate.id for candidate in candidates])
         self._hide_overlays()
         self._check_panel_clear(geometry)
         self.transition = True
@@ -779,10 +813,12 @@ class ScreenPickerApp:
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the micrograph.")
-                if screen_changed_fraction(reference, self._capture_region(geometry)) > .03:
+                alignment = screen_background_guard((), geometry, spacing, picked)
+                if alignment is None:
+                    raise RuntimeError("Too little unchanged background to verify the remaining contours. Select a larger area and Detect again.")
+                if screen_background_changed(reference, self._capture_region(geometry), alignment) > .03:
                     raise RuntimeError("The micrograph changed before picking. Detect again.")
-                background = (screen_background_guard(candidates, geometry, spacing) if planned
-                              else np.ones((geometry.height, geometry.width), dtype=bool))
+                background = screen_background_guard(candidates if planned else (), geometry, spacing, picked)
                 next_check = time.monotonic() + .75
                 def verify_scene(*, force=False):
                     nonlocal next_check
@@ -795,7 +831,7 @@ class ScreenPickerApp:
                 def click(x, y):
                     verify_scene()
                     self.desktop.click(x, y)
-                count = 0
+                count, completed_local = 0, []
                 for index, batch in enumerate(batches, 1):
                     token.wait_until_ready()
                     if index > 1:
@@ -810,21 +846,26 @@ class ScreenPickerApp:
                         self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
                         continue
                     def progress(done, total):
+                        actual = tuple(map(int, batch.local[done-1]))
+                        completed_local.append(actual)
                         self.events.put(("picked", token.generation, frame_id,
-                                         tuple(map(int, batch.local[done-1])), done, total, index, len(batches)))
+                                         actual, done, total, index, len(batches)))
                         # Record actual completion before a cancellation check
                         # can discard the final worker result.
                         if done == total:
                             self.events.put(("contour_done", token.generation, frame_id, batch.candidate_id))
                     count += play_clicks(batch.screen, click, geometry, token, delay=delay,
                                          max_clicks=10000, progress=progress)
+                    SCREEN_LOG.info("Completed model contour: frame=%s contour=%s/%s id=%s picks=%s",
+                                    frame_id, index, len(batches), batch.candidate_id, len(batch.screen))
                 token.sleep(.12)
                 self.desktop.ensure_target(target)
                 after = self._capture_region(geometry)
                 if background is not None and screen_background_changed(reference, after, background) > .03:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
                 return {"count": count, "ids": {batch.candidate_id for batch in batches}, "reference": after,
-                        "auto": auto, "contours": len(batches), "scene_verified": background is not None}
+                        "auto": auto, "contours": len(batches), "scene_verified": background is not None,
+                        "frame_id": frame_id, "picked": tuple(completed_local)}
             self._submit("model picks", work)
         self._schedule(90, begin)
 
@@ -915,6 +956,12 @@ class ScreenPickerApp:
                 else:
                     self.status.set("No proposals. Try a tight Box prompt around a target.")
         elif kind == "model picks":
+            if value.get("frame_id", self.frame_id) != self.frame_id:
+                return
+            # Progress events can trail a completed result or exceed a poll's
+            # event budget. Commit actual clicks before making the next
+            # contour selectable; its planner must see the complete history.
+            self.picked_points.update(value.get("picked", ()))
             if not value.get("scene_verified", True):
                 self.stop(message=f"{value['count']} picks placed. Too little unchanged background to verify alignment; select a larger area and Detect again.")
                 self.candidates, self.alternatives = [], []
@@ -972,8 +1019,32 @@ class ScreenPickerApp:
         self.status.set(message or "Picking disabled. Uncheck Disable Picking when ready.")
 
     def poll(self):
+        """Keep queue processing alive after a recoverable callback failure."""
+        identifier = getattr(self, "_poll_after", None)
+        self._poll_after = None
+        if identifier is not None:
+            self.root.after_cancel(identifier)
         if self.closed:
             return
+        try:
+            self._poll_once()
+        except Exception as exc:
+            SCREEN_LOG.exception("Screen event processing failed; stopping the active operation")
+            try:
+                self._error(exc)
+            except Exception:
+                # Cancellation must survive even a failed native window update.
+                self.runner.invalidate()
+                SCREEN_LOG.exception("Screen error recovery could not update the panel")
+        finally:
+            if not self.closed:
+                self._poll_after = self.root.after(30, self.poll)
+
+    def _poll_once(self):
+        # A collected completion guarantees that all its progress events have
+        # already been queued. Collect before draining so the final event
+        # cannot arrive between an empty-queue check and enabling selection.
+        completed_results = self.runner.poll_results()
         try:
             for _ in range(4000):
                 item = self.events.get_nowait()
@@ -1002,7 +1073,12 @@ class ScreenPickerApp:
                         self.alternatives = []
         except queue.Empty:
             pass
-        for result in self.runner.poll_results():
+        for result in completed_results:
+            # Escape may invalidate this completion while its earlier progress
+            # is being processed. Real clicks stay recorded; stale UI state
+            # must not be presented again.
+            if result.token.generation != self.runner.generation:
+                continue
             kind = self.job_kind
             self.active_token = None
             if result.error is not None or result.cancelled:
@@ -1024,7 +1100,6 @@ class ScreenPickerApp:
             except Exception as exc:
                 self._error(exc)
         self._sync_manual()
-        self.root.after(30, self.poll)
 
     def open_advanced(self):
         try:
@@ -1079,11 +1154,23 @@ class ScreenPickerApp:
         if self.closed:
             return
         self.closed = True
+        # Variable traces own Tcl commands separately from root.bind/after.
+        # root.destroy alone does not delete those commands, which otherwise
+        # keep bound controller callbacks and the interpreter graph alive.
+        traces, self._variable_traces = getattr(self, "_variable_traces", []), []
+        for variable, identifier in traces:
+            try:
+                variable.trace_remove("write", identifier)
+            except self.tk.TclError:
+                SCREEN_LOG.warning("A panel variable trace was already unavailable during shutdown.")
+        if getattr(self, "_poll_after", None) is not None:
+            self.root.after_cancel(self._poll_after)
+            self._poll_after = None
         if self._fit_after is not None:
             self.root.after_cancel(self._fit_after)
             self._fit_after = None
         self._gate_manual()
-        self.runner.shutdown(wait=False)
+        stopped = self.runner.shutdown(wait=False)
         for identifier in tuple(self.scheduled):
             self.root.after_cancel(identifier)
         self.scheduled.clear()
@@ -1096,4 +1183,19 @@ class ScreenPickerApp:
             self.overlay.close()
         if self.advanced is not None:
             self.advanced.destroy()
-        self.root.destroy()
+            self.advanced = None
+        if stopped:
+            self.root.destroy()
+        else:
+            # A native model pass cannot be interrupted. Keep its interpreter
+            # alive until callbacks/results can be released on the GUI thread.
+            self.status.set("Stopping the active operation… the window will close when it has stopped.")
+            self._shutdown_after = self.root.after(30, self._finish_close)
+
+    def _finish_close(self):
+        self._shutdown_after = None
+        self.runner.poll_results()
+        if self.runner.shutdown(wait=False):
+            self.root.destroy()
+        else:
+            self._shutdown_after = self.root.after(30, self._finish_close)

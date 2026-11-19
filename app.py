@@ -27,7 +27,9 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw
 
-from capsid import filter_capsid_proposals
+from application_icon import (apply_application_icon, application_icon_paths,
+                              configure_application_identity, windows_application_icon_status)
+from capsid import filter_capsid_proposals, polygonal_capsid_mask
 
 from recognition import (
     Candidate, RecognitionConfig, RecognitionError, Cancelled, SamRecognizer,
@@ -38,11 +40,12 @@ from execution import (
     WorkerBusyError, play_clicks,
 )
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
-from screen_app import ScreenPickerApp, screen_model_batches
+from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fraction,
+                        screen_region_overlaps_panel)
 from screen_overlay import control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -157,6 +160,16 @@ def _smoke_image_processing() -> dict[str, Any]:
     proposal[20:44, 24:72] = True
     if filter_capsid_proposals(blank, [{"segmentation": proposal}]):
         raise RuntimeError("Uniform-image capsid rejection failed.")
+    core = np.zeros((80, 100), dtype=bool)
+    core[10:70, 10:90] = True
+    core[10:18, 40:50] = False
+    core[35:39, 25:29] = False
+    allowed = np.ones_like(core)
+    allowed[35:39, 25:29] = False
+    polygon, evidence = polygonal_capsid_mask(core, allowed_mask=allowed)
+    if (not evidence["components"][0]["applied"] or np.any(polygon & ~allowed)
+            or not polygon[12, 44] or np.any(polygon[35:39, 25:29])):
+        raise RuntimeError("Polygon fitting or its excluded-area constraint failed.")
     buffer = io.BytesIO()
     Image.fromarray(np.zeros((8, 12, 3), dtype=np.uint8)).save(buffer, format="PNG")
     buffer.seek(0)
@@ -167,7 +180,9 @@ def _smoke_image_processing() -> dict[str, Any]:
     return {"grid_points": int(len(points)), "png_roundtrip": True,
             "per_contour_grid_points": int(len(batches[0].local)),
             "cross_contour_duplicate_guard": True,
-            "capsid_uniform_scene_rejected": True}
+            "capsid_uniform_scene_rejected": True,
+            "capsid_polygon_fitting": True,
+            "polygon_exclusions_preserved": True}
 
 
 def _smoke_torchvision() -> dict[str, Any]:
@@ -341,16 +356,164 @@ def _smoke_panel_screenshot(window, destination: Path) -> dict[str, Any]:
     return {"path": str(destination), "native_outer_bbox": list(bbox)}
 
 
+def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
+    """Exercise real Tk surfaces and the real worker with an in-memory desktop.
+
+    Events are delivered only to our own Tk canvas. The desktop adapter below
+    cannot focus another application or send system input. This catches the
+    lifecycle between separate semi-auto jobs in source and frozen builds.
+    """
+    import threading
+
+    root = picker.root
+    previous_mode = picker.mode
+    previous_desktop, previous_hotkeys, previous_mouse = (picker.desktop, picker.hotkeys,
+                                                         picker.mouse_observer)
+    picker.set_mode("semi-auto")
+    _smoke_settle_panel(picker)
+    width, height = root.winfo_screenwidth(), root.winfo_screenheight()
+    occupied = control_panel_bounds(root)
+    geometry = next((CaptureGeometry(x, y, 240, 160)
+                     for x, y in ((width-260, 30), (width-260, height-190),
+                                  (20, height-190), (20, 30))
+                     if x >= 0 and y >= 0
+                     and not screen_region_overlaps_panel(CaptureGeometry(x, y, 240, 160), occupied)), None)
+    if geometry is None:
+        raise RuntimeError("No free screen area for the repeated-contour UI check.")
+
+    class Hooks:
+        def enable_space_pause(self, enabled):
+            pass
+        def stop(self):
+            pass
+
+    class MemoryDesktop:
+        def __init__(self):
+            yy, xx = np.mgrid[:geometry.height, :geometry.width]
+            grey = (80 + (xx * 3 + yy * 7) % 100).astype(np.uint8)
+            self.rgb = np.repeat(grey[..., None], 3, axis=2)
+            self.clicks = []
+            self.thread_ids = set()
+        def focus_target(self, target):
+            self.ensure_target(target)
+        def ensure_target(self, target):
+            if target != 12345:
+                raise RuntimeError("Unexpected synthetic picking target.")
+        def window_under_roi(self, region):
+            if region != geometry:
+                raise RuntimeError("Unexpected synthetic capture area.")
+            return 12345
+        def _layers_hidden(self):
+            if ((picker.overlay is not None and picker.overlay.visible)
+                    or (picker.input_surface is not None and picker.input_surface.visible)):
+                raise RuntimeError("A screen layer remained visible during picking/capture.")
+        def screenshot(self, region):
+            self.window_under_roi(region)
+            self._layers_hidden()
+            return self.rgb.copy()
+        def click(self, x, y):
+            self._layers_hidden()
+            if not geometry.contains(x, y):
+                raise RuntimeError("A generated test pick escaped the screen area.")
+            self.thread_ids.add(threading.get_ident())
+            self.clicks.append((x, y))
+        def paint_delayed_markers(self):
+            image = Image.fromarray(self.rgb)
+            draw = ImageDraw.Draw(image)
+            for x, y in self.clicks:
+                x, y = x-geometry.left, y-geometry.top
+                draw.ellipse((x-10, y-10, x+10, y+10), outline=(40, 240, 60), width=4)
+            self.rgb = np.array(image)
+
+    desktop = MemoryDesktop()
+    candidates = []
+    for left in (12, 89, 166):
+        mask = polygon_mask([(left+9, 30), (left+43, 30), (left+54, 48),
+                             (left+49, 94), (left+10, 101), (left, 73)],
+                            (geometry.height, geometry.width))
+        candidates.append(make_candidate(mask, source="synthetic lifecycle check"))
+    completed = []
+    delayed_fraction = 0.0
+    try:
+        picker.desktop, picker.hotkeys, picker.mouse_observer = desktop, Hooks(), Hooks()
+        picker.geometry, picker.target = geometry, 12345
+        picker.rgb = desktop.rgb.copy()
+        picker.reference = desktop.rgb.copy()
+        picker.frame_id += 1
+        picker.candidates = candidates.copy()
+        picker.picked_points.clear()
+        picker.spacing.set(20)
+        picker.click_delay.set(.02)
+        picker.disabled.set(False)
+        picker._present_masks()
+        root.update()
+        for index, candidate in enumerate(candidates):
+            surface = picker.input_surface
+            if surface is None or not surface.visible:
+                raise RuntimeError(f"Clickable overlay missing before contour {index+1}.")
+            ys, xs = np.nonzero(candidate.mask)
+            mid = len(xs)//2
+            local_x, local_y = int(xs[mid]), int(ys[mid])
+            x, y = geometry.local_to_screen(local_x, local_y)
+            surface.canvas.event_generate("<ButtonPress-1>", x=local_x, y=local_y,
+                                          rootx=x, rooty=y)
+            surface.canvas.event_generate("<ButtonRelease-1>", x=local_x, y=local_y,
+                                          rootx=x, rooty=y)
+            if not (picker.transition or picker.runner.busy):
+                raise RuntimeError(f"Contour {index+1} did not start: {picker.status.get()}")
+            deadline = time.monotonic() + 15
+            while picker.transition or picker.runner.busy:
+                root.update()
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"Contour {index+1} did not finish: {picker.status.get()}")
+                time.sleep(.005)
+            root.update()
+            if picker.disabled.get() or any(c.id == candidate.id for c in picker.candidates):
+                raise RuntimeError(f"Contour {index+1} failed: {picker.status.get()}")
+            if root.state() != "normal" or not root.winfo_viewable():
+                raise RuntimeError(f"Control panel disappeared after contour {index+1}.")
+            if index < len(candidates)-1 and (picker.input_surface is None or not picker.input_surface.visible):
+                raise RuntimeError(f"Next contour was not selectable after contour {index+1}.")
+            completed.append(len(desktop.clicks))
+            if index == 0:
+                desktop.paint_delayed_markers()
+                delayed_fraction = screen_changed_fraction(picker.reference, desktop.rgb)
+                if delayed_fraction <= .03:
+                    raise RuntimeError("Delayed-marker fixture did not cross the former drift threshold.")
+        if len(desktop.clicks) != len(set(desktop.clicks)) or not desktop.clicks:
+            raise RuntimeError("Repeated contours produced duplicate or empty test picks.")
+        if desktop.thread_ids == {threading.get_ident()} or len(desktop.thread_ids) != 1:
+            raise RuntimeError("Picking did not use the serialized background worker.")
+        return {"contours_completed": len(completed), "cumulative_pick_counts": completed,
+                "delayed_marker_changed_fraction": delayed_fraction,
+                "separate_worker_jobs": True, "real_tk_input_events": True,
+                "remaining_contours_selectable": True, "panel_visible_throughout": True,
+                "unique_test_picks": len(desktop.clicks), "desktop_events_sent": 0,
+                "note": "Real controller/worker/Windows overlays; in-memory target and click sink, not cryoSPARC."}
+    finally:
+        picker.stop()
+        if not picker.runner.shutdown(wait=True, timeout=5):
+            raise RuntimeError("Repeated-contour test worker did not terminate.")
+        picker.runner.poll_results()
+        picker.runner = TaskRunner()
+        picker.desktop, picker.hotkeys, picker.mouse_observer = (previous_desktop,
+                                                               previous_hotkeys, previous_mouse)
+        picker.set_mode(previous_mode)
+
+
 def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None) -> dict[str, Any]:
     # These are native Windows widgets at simulated Tk font/layout scales. The
     # Windows monitor's DPI setting is never changed. Each fresh interpreter is
     # scaled before widgets/fonts exist, because changing Tk scaling afterwards
     # does not reliably resize previously constructed controls.
     enable_dpi_awareness()
+    configure_application_identity()
     tkinter = importlib.import_module("tkinter")
     scale_checks = []
     panel_layouts = {}
     overlay_checks = None
+    repeated_contours = None
+    icon_checks = None
     tk_version = None
     long_status = ("Recognition is running on the selected screen area.\n"
                    "Escape stops picking; F8 pauses or resumes.\n"
@@ -401,10 +564,20 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                                  "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts})
             if overlay_checks is None:
                 overlay_checks = verify_screen_overlay(window)
+                icon_checks = windows_application_icon_status(window)
+                if not all(icon_checks.values()) or not all(path.is_file() for path in application_icon_paths()):
+                    raise RuntimeError("The native application icon or bundled artwork is missing.")
+                repeated_contours = _smoke_repeated_screen_picks(picker)
         finally:
             if original_scaling is not None:
                 window.tk.call("tk", "scaling", original_scaling)
             if picker is not None:
+                # Each simulated scale owns a fresh Tcl interpreter. Finish
+                # its idle worker before creating the next root; production
+                # close remains asynchronous while native work is active.
+                runner = getattr(picker, "runner", None)
+                if runner is not None and not runner.shutdown(wait=True, timeout=5):
+                    raise RuntimeError("Native UI check worker did not stop before interpreter teardown.")
                 picker.close()
             else:
                 window.destroy()
@@ -419,6 +592,8 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
             "layout_scaling_method": "Native Windows Tk widgets; pixels-per-point set before construction to simulate 100/125/150/200% of 96 DPI. Windows monitor scaling is unchanged.",
             "layout_scale_checks": scale_checks,
             "screen_overlay": overlay_checks,
+            "application_icon": icon_checks,
+            "repeated_semi_auto_contours": repeated_contours,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 
 
@@ -605,6 +780,7 @@ class PickerApp:
         self.tk, self.ttk = tk, ttk
         self.filedialog, self.messagebox = filedialog, messagebox
         self.root, self.args, self.log_path = root, args, log_path
+        apply_application_icon(root)
         self.runner = TaskRunner()
         self.events: queue.Queue = queue.Queue()
         self.desktop = DesktopAdapter()
@@ -1476,6 +1652,8 @@ def _run_application(args, *, console_available: bool) -> int:
     interactive = not (args.diagnostics or args.smoke_test or args.segment_image)
     try:
         log_path = setup_logging(include_console=console_available)
+        APP_LOG.info("Starting SARU Picker %s; platform=%s frozen=%s", APP_VERSION,
+                     sys.platform, bool(getattr(sys, "frozen", False)))
         checkpoint = resolve_checkpoint(args.checkpoint)
         if args.diagnostics or args.smoke_test:
             report = (run_smoke_test(checkpoint, log_path) if args.smoke_test
@@ -1518,6 +1696,7 @@ def _run_application(args, *, console_available: bool) -> int:
                 recognizer.close()
             return 0
         enable_dpi_awareness()
+        configure_application_identity()
         import tkinter as tk
         root = tk.Tk()
         if args.review or args.image:

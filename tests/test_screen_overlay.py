@@ -197,6 +197,24 @@ class ScreenSurfaceTests(unittest.TestCase):
         surface._release(event(310, 210))  # Release over its new caption cancels.
         self.assertEqual(events[-2:], [("press", 110, 120), ("cancel",)])
 
+    def test_retired_input_surface_cannot_cancel_or_select_the_next_contour(self):
+        events = []
+        surface = InputSurface(self.root, CaptureGeometry(0, 0, 300, 300),
+                               lambda *xy: events.append("press"),
+                               lambda *xy: events.append("move"),
+                               lambda *xy: surface.close(),
+                               on_cancel=lambda: events.append("cancel"), **self.options)
+        surface.show()
+        event = SimpleNamespace(x_root=30, y_root=30)
+        surface._press(event)
+        surface._release(event)
+        self.assertTrue(surface.closed)
+        self.assertIsNone(surface._release_callback)
+        surface._cancel()
+        surface._press(event)
+        surface._release(event)
+        self.assertEqual(events, ["press"])
+
     def test_mask_pixels_keep_roi_origin_holes_and_disconnected_parts(self):
         geometry = CaptureGeometry(123, 234, 20, 16)
         mask = np.zeros((16, 20), dtype=bool)

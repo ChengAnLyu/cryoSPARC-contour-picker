@@ -5,6 +5,7 @@ small stdlib launcher before application imports can succeed or fail.
 """
 
 import importlib.util
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -12,7 +13,12 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import weakref
 from unittest.mock import Mock, patch
+
+from PIL import Image
+
+import application_icon
 
 
 _LAUNCHER_PATH = Path(__file__).resolve().parents[1] / "packaging" / "launcher.py"
@@ -81,6 +87,94 @@ class LauncherContractTests(unittest.TestCase):
                     stream.close()
         self.assertIn("stdout", observed)
         self.assertIn("stderr", observed)
+
+
+class ApplicationIconContractTests(unittest.TestCase):
+    def test_public_artwork_is_the_generic_fallback_with_windows_sizes(self):
+        ico, png = application_icon.application_icon_paths()
+        self.assertEqual(hashlib.sha256(png.read_bytes()).hexdigest(),
+                         "d824339e4c81ac13e967e82ed8f776b7a6fb4d74a8311dc0e81da95d6a9812e2")
+        with Image.open(png) as original:
+            self.assertEqual(original.size, (256, 256))
+        with Image.open(ico) as icons:
+            sizes = {(n, n) for n in (16, 24, 32, 48, 64, 128, 256)}
+            self.assertEqual(icons.ico.sizes(), sizes)
+            for size in sizes:
+                frame = icons.ico.getimage(size).convert("RGBA")
+                self.assertEqual(frame.size, size)
+                self.assertIsNotNone(frame.getbbox())
+
+    def test_installer_sidecars_are_optional_external_files_and_applied_before_launch(self):
+        installer = (_LAUNCHER_PATH.parent / "installer.iss").read_text(encoding="utf-8")
+        files = installer.split("[Files]", 1)[1].split("[Icons]", 1)[0]
+        bundled_position = files.index('Source: "{#AppSourceDir}\\*"')
+        for name in ("app-icon.png", "app-icon.ico"):
+            source = 'Source: "{src}\\' + name + '"'
+            line = next(line for line in files.splitlines() if line.startswith(source))
+            self.assertGreater(files.index(line), bundled_position)
+            self.assertIn('DestDir: "{app}\\_internal\\assets"', line)
+            flags = line.split("Flags:", 1)[1].strip().split()
+            self.assertIn("external", flags, "Private sidecars must not be embedded at build time.")
+            self.assertIn("skipifsourcedoesntexist", flags)
+            self.assertIn("ignoreversion", flags)
+        run = installer.split("[Run]", 1)[1]
+        commands = [line for line in run.splitlines() if line.startswith("Filename:")]
+        self.assertIn('Filename: "{app}\\SARU Icon Helper.exe"', commands[0])
+        self.assertIn('--icon ""{app}\\_internal\\assets\\app-icon.ico""', commands[0])
+        self.assertIn('--report ""{localappdata}\\SARU_Picker\\icon-install.json""', commands[0])
+        flags = commands[0].split("Flags:", 1)[1].strip().split()
+        self.assertEqual(set(flags), {"runhidden", "waituntilterminated"})
+        self.assertIn('Filename: "{app}\\SARU Picker.exe"', commands[1])
+        icon_path = "{app}\\_internal\\assets\\app-icon.ico"
+        self.assertIn("UninstallDisplayIcon=" + icon_path, installer)
+        shortcuts = installer.split("[Icons]", 1)[1].split("[Run]", 1)[0]
+        self.assertEqual(shortcuts.count('IconFilename: "' + icon_path + '"'), 2)
+
+    def test_frozen_windows_uses_bundled_ico_without_creating_a_tk_photo(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            assets = bundle / "assets"
+            assets.mkdir()
+            ico = assets / "app-icon.ico"
+            ico.write_bytes(b"bundled icon placeholder")
+            root = SimpleNamespace(iconbitmap=Mock(), iconphoto=Mock())
+            photo_factory = Mock(side_effect=AssertionError("No Tk image should be needed."))
+            with patch.object(sys, "frozen", True, create=True), \
+                 patch.object(sys, "_MEIPASS", str(bundle), create=True), \
+                 patch.object(sys, "platform", "win32"), \
+                 patch.dict(sys.modules, {"tkinter": SimpleNamespace(PhotoImage=photo_factory)}):
+                self.assertEqual(application_icon.application_icon_paths()[0], ico)
+                self.assertTrue(application_icon.apply_application_icon(root))
+            root.iconbitmap.assert_called_once_with(default=str(ico))
+            root.iconphoto.assert_not_called()
+            photo_factory.assert_not_called()
+
+    def test_png_fallback_releases_tk_image_on_the_calling_thread(self):
+        references = []
+        calls = []
+
+        class Photo:
+            pass
+
+        def photo_factory(**kwargs):
+            photo = Photo()
+            references.append(weakref.ref(photo))
+            return photo
+
+        root = SimpleNamespace(iconphoto=lambda default, photo: calls.append(default))
+        with patch.object(sys, "platform", "linux"), \
+             patch.dict(sys.modules, {"tkinter": SimpleNamespace(PhotoImage=photo_factory)}):
+            self.assertTrue(application_icon.apply_application_icon(root))
+        self.assertEqual(calls, [True])
+        self.assertEqual(len(references), 1)
+        self.assertIsNone(references[0](), "Window icon setup must not retain a Tk image for worker GC.")
+
+    def test_standalone_without_optional_artwork_still_starts(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(application_icon, "__file__", str(Path(directory) / "main.py")), \
+             patch.object(sys, "frozen", False, create=True), \
+             self.assertLogs(application_icon.APPLICATION_ICON_LOG, level="WARNING"):
+            self.assertFalse(application_icon.apply_application_icon(SimpleNamespace()))
 
 
 if __name__ == "__main__":

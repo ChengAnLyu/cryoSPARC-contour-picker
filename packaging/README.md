@@ -3,7 +3,7 @@
 This directory turns the source into an installed Windows x64 application. The
 installer includes the Python interpreter, Tcl/Tk, CPU PyTorch/torchvision,
 desktop automation libraries, and the original SAM ViT-B weights. End users
-install `SARU-Picker-Setup-2.2.0-win64.exe` and open **SARU Picker** from the Start
+install `SARU-Picker-Setup-2.3.0-win64.exe` and open **SARU Picker** from the Start
 menu or desktop shortcut. The installed application does not download models.
 
 The source archive is not itself an installer. A successful Windows workflow
@@ -83,10 +83,27 @@ build even if the build machine has a global runtime installation.
 The executable's `--smoke-test --report <absolute-path>` command checks image
 processing, torchvision's native NMS operation, the compact panel, native screen-overlay hit testing, Windows
 desktop imports, and a real CPU SAM inference using a synthetic image. It sends
-no mouse clicks or keyboard input. Both the exit code and the individual JSON
+no operating-system mouse clicks or keyboard input. It also checks the actual
+Windows small/large window icon handles and three consecutive semi-auto contour
+selections through native Tk events and the real worker with an in-memory
+desktop adapter. The second selection includes late pick-marker painting to
+exercise the repaired alignment guard. Both the exit code and the individual JSON
 check results must pass. Its purpose is deployment validation, not measurement
 of scientific recognition accuracy. The installed application is tested with
 the same command.
+
+The public geometric fallback lives in `assets/app-icon.png` and a
+multi-resolution `assets/app-icon.ico`; `generate_fallback_icon.py` reproduces
+it. A private distribution can place custom `app-icon.png` and `app-icon.ico`
+beside setup in the delivered ZIP. Inno copies those optional sidecars over the
+installed artwork and runs `SARU Icon Helper.exe` to update the installed main
+EXE. The helper preserves the appended PyInstaller archive and other resources.
+Personal artwork need not be committed to the public repository. Extract the
+entire custom-icon ZIP before running setup. The setup EXE itself retains the
+fallback icon. The native window default and shortcut AppUserModelID are shared
+by source and installed launches. The windowed launcher keeps `native_fault.log`
+open while the app runs so supported native exceptions can leave Python thread
+tracebacks.
 
 `--diagnostics --report <absolute-path>` records metadata without running full
 inference. A windowed executable has no normal console; use a report file. For
@@ -122,7 +139,7 @@ acceptance test until those steps have actually been completed.
 Build outputs:
 
 - `dist/SARU_Picker/`: full portable application directory.
-- `artifacts/SARU-Picker-Setup-2.2.0-win64.exe`: Windows installer.
+- `artifacts/SARU-Picker-Setup-2.3.0-win64.exe`: Windows installer.
 - `artifacts/frozen-smoke-test.json`: frozen application validation.
 - `artifacts/installed-smoke-test.json`: installation validation when requested.
 - `artifacts/build-manifest.json`: versions, source commit, and model checksum.

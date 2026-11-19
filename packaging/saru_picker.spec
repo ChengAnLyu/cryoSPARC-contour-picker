@@ -12,6 +12,10 @@ if sys.platform != "win32":
     raise SystemExit("Build this Windows application on Windows; PyInstaller does not cross-compile.")
 
 project = Path(SPECPATH).resolve().parent
+icon = project / "assets" / "app-icon.ico"
+icon_png = project / "assets" / "app-icon.png"
+if not icon.is_file() or not icon_png.is_file():
+    raise SystemExit("The application ICO and PNG assets are required for the Windows build.")
 manifest_path = project / "packaging" / "model-manifest.json"
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 model = Path(os.environ.get("SARU_MODEL_FILE", project / "models" / manifest["filename"]))
@@ -27,6 +31,8 @@ if not (notices / "THIRD_PARTY_NOTICES.txt").is_file():
     raise SystemExit("Run collect_licenses.py before creating the frozen distribution.")
 
 datas = [
+    (str(icon), "assets"),
+    (str(icon_png), "assets"),
     (str(model), "models"),
     (str(manifest_path), "models"),
     (str(notices), "licenses"),
@@ -76,7 +82,11 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     version=str(project / "packaging" / "windows-version.txt"),
+    icon=str(icon),
     uac_admin=False,
     contents_directory="_internal",
 )
+# build.ps1 adds the independently frozen, one-file SARU Icon Helper.exe to
+# this directory afterwards. Do not merge its Analysis here: two separate
+# base_library.zip / _internal runtimes would otherwise overwrite one another.
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="SARU_Picker")

@@ -30,6 +30,7 @@ class Root:
         self.callbacks = {}
         self.next_id = 0
         self.bounds = (0, 0, 100, 80)
+        self.destroyed = False
     def after(self, delay, callback):
         self.next_id += 1
         self.callbacks[self.next_id] = callback
@@ -49,7 +50,7 @@ class Root:
     def lift(self):
         pass
     def destroy(self):
-        pass
+        self.destroyed = True
     def winfo_rootx(self):
         return self.bounds[0]
     def winfo_rooty(self):
@@ -115,6 +116,7 @@ class Runner:
         return result
     def shutdown(self, **kwargs):
         self.invalidate()
+        return not self.busy
 
 
 class Desktop:
@@ -185,6 +187,7 @@ def app_state(mode="manual"):
     app.frames, app.wait_seconds = Variable(1), Variable(5.0)
     app.closed = app.transition = app.paused = False
     app._fit_after = None
+    app._poll_after = app._shutdown_after = None
     app._fitting = False
     app.scheduled = set()
     app.active_token = None
@@ -207,6 +210,26 @@ def app_state(mode="manual"):
 
 
 class ScreenGeometryTests(unittest.TestCase):
+    def test_previous_pick_coordinates_reject_fractional_nan_and_out_of_bounds(self):
+        geometry = CaptureGeometry(100, 100, 80, 70)
+        candidate = make_candidate(np.ones((70, 80), bool))
+        for point in ((1.5, 2), (float("nan"), 2), (float("inf"), 2), (-1, 2),
+                      (80, 2), (1, 70), (True, 2), (1, 2, 3), ("bad", 2)):
+            with self.subTest(point=point):
+                with self.assertRaisesRegex(ValueError, "Previously placed picks"):
+                    screen_model_batches([candidate], geometry, 13, [point])
+                with self.assertRaisesRegex(ValueError, "Previously placed picks"):
+                    screen_background_guard([], geometry, 13, [point])
+
+    def test_previous_marker_guard_excludes_only_near_known_picks(self):
+        geometry = CaptureGeometry(0, 0, 100, 100)
+        guard = screen_background_guard([], geometry, 13, [(20, 20)])
+        self.assertFalse(guard[20, 20])
+        self.assertFalse(guard[20, 33])
+        self.assertTrue(guard[20, 34])
+        self.assertTrue(guard[80, 80])
+        self.assertTrue(np.all(screen_background_guard([], geometry, 13)))
+
     def test_visible_panel_overlap_uses_full_rectangle_not_roi_sample_points(self):
         region = CaptureGeometry(100, 100, 300, 200)
         self.assertTrue(screen_region_overlaps_panel(region, (120, 120, 50, 40)))
@@ -612,6 +635,163 @@ class ScreenControllerTests(unittest.TestCase):
         self.assertEqual(app.desktop.keys, [])
         self.assertTrue(app.input_surface.visible)
         self.assertTrue(app.overlay.visible)
+
+    def test_three_semi_auto_selections_survive_delayed_previous_pick_markers(self):
+        app = app_state("semi-auto")
+        masks = [np.zeros((70, 80), bool) for _ in range(3)]
+        masks[0][12:38, 4:20] = True
+        masks[1][17:45, 31:47] = True
+        masks[2][10:40, 60:77] = True
+        candidates = [make_candidate(mask) for mask in masks]
+        app.candidates = list(candidates)
+        y_grid, x_grid = np.indices((70, 80))
+        observed_clicks = []
+        with patch("screen_app.InputSurface", Surface):
+            app._present_masks()
+            for number, candidate in enumerate(candidates):
+                if number:
+                    # Browser markers arrive after the previous completion
+                    # screenshot, reproducing the old second-contour refusal.
+                    for x, y in app.picked_points:
+                        marker = (x_grid-x)**2 + (y_grid-y)**2 <= 6**2
+                        app.desktop.rgb[100:170, 140:220][marker] = (0, 255, 0)
+                    self.assertGreater(screen_changed_fraction(app.reference, app.desktop.rgb[100:170, 140:220]), .03)
+                expected = screen_model_batches([candidate], app.geometry, 13, app.picked_points)[0].screen
+                x, y = candidate.bbox[:2]
+                app._input_press(140+x+1, 100+y+1)
+                app._input_release(140+x+1, 100+y+1)
+                for _ in range(4):
+                    if app.runner.busy:
+                        break
+                    app.root.run_next()
+                self.assertTrue(app.runner.busy)
+                result = app.runner.finish()
+                app.runner.results.append(TaskResult(app.active_token, value=result))
+                app.poll()
+                observed_clicks.extend(tuple(point) for point in expected)
+                self.assertEqual(app.desktop.clicks, observed_clicks)
+                self.assertFalse(app.disabled.get())
+                self.assertEqual([item.id for item in app.candidates], [item.id for item in candidates[number+1:]])
+                self.assertFalse(app.root.hidden)
+                self.assertFalse(app.root.destroyed)
+            self.assertIsNone(app.input_surface)
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_second_contour_still_rejects_global_image_change_before_clicking(self):
+        app = app_state("semi-auto")
+        mask = np.zeros((70, 80), bool)
+        mask[15:45, 50:75] = True
+        app.picked_points = {(8, 15), (21, 15), (14, 26)}
+        app.desktop.rgb[100:170, 140:220] = 0
+        app._start_model_picks([make_candidate(mask)])
+        app.root.run_next()
+        with self.assertRaisesRegex(RuntimeError, "changed before picking"):
+            app.runner.finish()
+        self.assertEqual(app.desktop.clicks, [])
+
+    def test_completion_handoff_records_final_pick_before_reopening_contours(self):
+        app = app_state("semi-auto")
+        first, second = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[10:40, 5:30], second[10:40, 45:70] = True, True
+        a, b = make_candidate(first), make_candidate(second)
+        app.candidates = [a, b]
+        app.job_kind = "model picks"
+        final_point = (18, 32)
+        result = TaskResult(CancellationToken(app.runner.generation), value={
+            "count": 1, "ids": {a.id}, "reference": app.reference.copy(), "auto": False})
+        def collect_at_handoff():
+            app.events.put(("picked", app.runner.generation, app.frame_id, final_point, 1, 1, 1, 1))
+            app.events.put(("contour_done", app.runner.generation, app.frame_id, a.id))
+            return [result]
+        app.runner.poll_results = collect_at_handoff
+        with patch.object(app, "_present_masks", side_effect=lambda: self.assertIn(final_point, app.picked_points)):
+            app.poll()
+        self.assertEqual(app.picked_points, {final_point})
+        self.assertEqual(app.candidates, [b])
+
+    def test_result_snapshot_prevents_lost_picks_when_event_budget_is_full(self):
+        app = app_state("semi-auto")
+        app.job_kind = "model picks"
+        points = ((5, 10), (18, 10), (11, 21))
+        for _ in range(4001):
+            app.events.put(("mouse", -1, "move", 150, 120))
+        app.runner.results.append(TaskResult(CancellationToken(app.runner.generation), value={
+            "count": len(points), "ids": set(), "reference": app.reference.copy(),
+            "auto": False, "frame_id": app.frame_id, "picked": points}))
+        with patch.object(app, "_present_masks", side_effect=lambda: self.assertEqual(app.picked_points, set(points))):
+            app.poll()
+        self.assertEqual(app.events.qsize(), 1)
+
+    def test_escape_during_completion_handoff_does_not_restore_stale_contours(self):
+        app = app_state("semi-auto")
+        app.job_kind = "model picks"
+        app.runner.results.append(TaskResult(CancellationToken(app.runner.generation), value={
+            "count": 1, "ids": set(), "reference": app.reference.copy(), "auto": False}))
+        app.events.put(("hotkey", "stop"))
+        with patch.object(app, "_present_masks") as present:
+            app.poll()
+        present.assert_not_called()
+        self.assertTrue(app.disabled.get())
+
+    def test_unexpected_event_error_cancels_work_but_keeps_polling(self):
+        app = app_state()
+        app._poll_after = app.root.after(30, app.poll)
+        app.events.put(("mouse", 0, "press", 150, 120))
+        with patch.object(app, "_manual_input", side_effect=RuntimeError("broken queued input")):
+            with self.assertLogs("saru.screen", level="ERROR"):
+                app.poll()
+        self.assertTrue(app.disabled.get())
+        self.assertFalse(app.root.destroyed)
+        self.assertEqual(len(app.root.callbacks), 1)
+        self.assertIn(app._poll_after, app.root.callbacks)
+        app.root.run_next()
+        self.assertEqual(len(app.root.callbacks), 1)
+
+    def test_close_cancels_poll_before_destroying_idle_window(self):
+        app = app_state()
+        app._poll_after = app.root.after(30, app.poll)
+        app.close()
+        self.assertEqual(app.root.callbacks, {})
+        self.assertTrue(app.root.destroyed)
+        self.assertIsNone(app._poll_after)
+
+    def test_close_releases_real_tcl_variable_trace_callbacks(self):
+        import gc
+        import tkinter as tk
+        import weakref
+
+        interpreter = tk.Tcl()  # No display or native windows are created.
+        app = app_state()
+        app.tk = tk
+        app.status = tk.StringVar(master=interpreter, value="ready")
+        app.region_label = tk.StringVar(master=interpreter, value="region")
+        variables = (app.status, app.region_label)
+        app._variable_traces = [(variable, variable.trace_add("write", app._queue_panel_fit))
+                                for variable in variables]
+        owner = weakref.ref(app)
+        self.assertTrue(all(variable.trace_info() for variable in variables))
+        app.close()
+        self.assertTrue(all(not variable.trace_info() for variable in variables))
+        self.assertTrue(all(not variable._tclCommands for variable in variables))
+        app.desktop.app = None  # Remove the fake desktop's deliberate owner link.
+        del app
+        gc.collect()
+        # Tcl and its variables intentionally remain alive here; their former
+        # registered callbacks must not keep the closed controller alive.
+        self.assertIsNone(owner())
+
+    def test_close_waits_for_worker_ownership_before_destroying_tk(self):
+        app = app_state("semi-auto")
+        app.runner.busy = True
+        app._poll_after = app.root.after(30, app.poll)
+        app.close()
+        self.assertTrue(app.closed)
+        self.assertFalse(app.root.destroyed)
+        self.assertEqual(len(app.root.callbacks), 1)
+        app.runner.busy = False
+        app.root.run_next()
+        self.assertTrue(app.root.destroyed)
+        self.assertEqual(app.root.callbacks, {})
 
     def test_semi_release_fills_only_clicked_contour_on_its_manual_grid(self):
         app = app_state("semi-auto")
