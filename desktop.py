@@ -10,6 +10,7 @@ import ctypes
 import importlib
 import logging
 import math
+import os
 from numbers import Real
 import platform
 import threading
@@ -113,6 +114,7 @@ class _DesktopWindowsAPI:
             "ShowWindow": ([wintypes.HWND, ctypes.c_int], wintypes.BOOL),
             "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
             "GetSystemMetrics": ([ctypes.c_int], ctypes.c_int),
+            "GetWindowThreadProcessId": ([wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
         }
         for name, (args, result) in specs.items():
             fn = getattr(self._user32, name)
@@ -145,6 +147,11 @@ class _DesktopWindowsAPI:
 
     def primary_size(self) -> tuple[int, int]:
         return self._user32.GetSystemMetrics(0), self._user32.GetSystemMetrics(1)
+
+    def process_id(self, handle: int) -> int:
+        process = self._wintypes.DWORD()
+        self._user32.GetWindowThreadProcessId(handle, ctypes.byref(process))
+        return int(process.value)
 
 
 def _desktop_integer(value, name: str) -> int:
@@ -262,6 +269,29 @@ class DesktopAdapter:
         api = self._get_api()
         return self._validate_handle(api.root_window(api.foreground()))
 
+    def target_at(self, x: int, y: int) -> int:
+        """Resolve the live window at a physical screen point without focusing it."""
+        x, y = _desktop_integer(x, "Pointer x"), _desktop_integer(y, "Pointer y")
+        width, height = self.size()
+        if not (0 <= x < width and 0 <= y < height):
+            raise DesktopError("Draw on the primary monitor.")
+        api = self._get_api()
+        return self._validate_handle(api.root_window(api.window_at(x, y)))
+
+    def is_target_at(self, x: int, y: int, target: int) -> bool:
+        try:
+            return self.target_at(x, y) == self._validate_handle(target)
+        except DesktopError:
+            return False
+
+    def is_own_window(self, handle: int) -> bool:
+        """Exclude our own controls, title bars and dialogs from manual traces."""
+        handle = self._validate_handle(handle)
+        process_id = self._get_api().process_id(handle)
+        if not process_id:
+            raise DesktopError("The window owning this screen position could not be identified.")
+        return process_id == os.getpid()
+
     def window_under_roi(self, region: CaptureGeometry) -> int:
         """Require ROI center and corners to belong to one top-level window."""
         self.validate_region(region)
@@ -324,10 +354,12 @@ class DesktopAdapter:
 
 
 class GlobalHotkeys:
-    """Debounced global Escape/F8 listener with queue-only callbacks.
+    """Debounced global Escape/F8 listener with optional scoped Space pause.
 
-    The callback receives ``'stop'`` or ``'pause'`` on a listener thread and
+    The callback receives ``'stop'``, ``'pause'`` or ``'space_pause'`` on a listener thread and
     must only enqueue a message or update thread-safe cancellation state.
+    Space is consumed only while explicitly enabled for an automatic run;
+    otherwise ordinary browser keyboard input is left alone.
     """
 
     def __init__(
@@ -336,6 +368,8 @@ class GlobalHotkeys:
         listener_factory=None,
         key_enum=None,
         platform_name: str | None = None,
+        *,
+        space_pause: bool = False,
     ) -> None:
         if not callable(callback):
             raise TypeError("Hotkey callback must be callable.")
@@ -347,6 +381,56 @@ class GlobalHotkeys:
         self._pressed: set = set()
         self._lock = threading.Lock()
         self._active = False
+        self._space_pause = bool(space_pause)
+        self._space_enabled = False
+        self._space_held = False
+        self._space_passthrough_held = False
+
+    def enable_space_pause(self, enabled: bool) -> None:
+        with self._lock:
+            self._space_enabled = bool(enabled) and self._space_pause
+
+    def _win32_filter(self, msg, data):
+        """Consume only the Space press/release pair owned by an auto run.
+
+        Pynput's filter precedes its ordinary callbacks. Calling suppress_event
+        intentionally raises its internal suppression signal, so this method
+        must not catch that signal. Holding Space cannot toggle pause repeatedly.
+        """
+        if getattr(data, "vkCode", None) != 0x20 or getattr(data, "flags", 0) & 0x10:
+            return True
+        down, up = msg in (0x0100, 0x0104), msg in (0x0101, 0x0105)
+        if not (down or up):
+            return True
+        with self._lock:
+            if not self._active or not self._space_pause:
+                return True
+            # A key press that began outside the run belongs to the browser,
+            # including its repeats and release even if a run starts meanwhile.
+            if self._space_passthrough_held:
+                if up:
+                    self._space_passthrough_held = False
+                return True
+            if up and not self._space_held:
+                return True
+            if not (self._space_enabled or self._space_held):
+                if down:
+                    self._space_passthrough_held = True
+                return True
+            emit = down and not self._space_held
+            if down:
+                self._space_held = True
+            elif up:
+                self._space_held = False
+        if emit:
+            try:
+                self._callback("space_pause")
+            except Exception:
+                DESKTOP_LOGGER.exception("Space pause callback failed.")
+        listener = self._listener
+        if listener is not None:
+            listener.suppress_event()
+        return False
 
     def start(self) -> None:
         if self._active:
@@ -363,7 +447,10 @@ class GlobalHotkeys:
         self._pressed.clear()
         self._active = True
         try:
-            self._listener = self._factory(on_press=self._on_press, on_release=self._on_release)
+            callbacks = {"on_press": self._on_press, "on_release": self._on_release}
+            if self._space_pause:
+                callbacks["win32_event_filter"] = self._win32_filter
+            self._listener = self._factory(**callbacks)
             self._listener.start()
         except Exception:
             self._active = False
@@ -390,6 +477,9 @@ class GlobalHotkeys:
         with self._lock:
             self._active = False
             self._pressed.clear()
+            self._space_enabled = False
+            self._space_held = False
+            self._space_passthrough_held = False
         listener, self._listener = self._listener, None
         if listener is not None:
             listener.stop()

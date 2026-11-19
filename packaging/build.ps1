@@ -30,7 +30,7 @@ $BuildDirectory = Join-Path $ProjectRoot "build"
 $ArtifactDirectory = Join-Path $ProjectRoot "artifacts"
 $VenvDirectory = Join-Path $ProjectRoot ".build-venv"
 $VenvPython = Join-Path $VenvDirectory "Scripts\python.exe"
-$AppVersion = "2.0.0"
+$AppVersion = "2.1.0"
 $Manifest = Get-Content (Join-Path $PSScriptRoot "model-manifest.json") -Raw | ConvertFrom-Json
 
 function Invoke-Checked {
@@ -118,6 +118,8 @@ try {
     Invoke-Checked $VenvPython @("-c", "import torch,torchvision; assert torch.__version__ == '2.5.1+cpu'; assert torchvision.__version__ == '0.20.1+cpu'; assert torch.version.cuda is None")
     Invoke-Checked $VenvPython @("build_standalone.py")
     Invoke-Checked $VenvPython @("-m", "unittest", "discover", "-s", "tests", "-v")
+    # Catch native overlay/focus/layout defects before bundling the large model.
+    Invoke-Checked $VenvPython @("-c", "from pathlib import Path; from app import setup_logging, _smoke_windows_runtime, write_json_report; result=_smoke_windows_runtime(setup_logging()); write_json_report(Path('artifacts/source-ui-smoke.json'), {'status':'ok', 'mode':'ui-smoke', 'details':result})")
 
     if ($Checkpoint) {
         $ModelFile = (Resolve-Path -LiteralPath $Checkpoint).Path

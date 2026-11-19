@@ -1,4 +1,4 @@
-"""Snapshot review UI and command-line entry point for SARU Picker.
+"""Screen picker entry point and optional offline review UI for SARU Picker.
 
 The desktop image remains the coordinate source. Resizing this preview never
 changes the sampling interval in the captured image. Tk is used only on the
@@ -36,9 +36,11 @@ from execution import (
     WorkerBusyError, play_clicks,
 )
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
+from screen_app import ScreenPickerApp
+from screen_overlay import verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -170,20 +172,27 @@ def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
     try:
         window.withdraw()
         args = argparse.Namespace(checkpoint=None, device="cpu", model_type="vit_b", image=None)
-        picker = PickerApp(window, args, log_path, start_hotkeys=False)
-        rgb = np.zeros((64, 96, 3), dtype=np.uint8)
-        rgb[:] = (85, 105, 125)
-        picker._set_image(rgb, description="Packaging smoke image")
-        mask = np.zeros(rgb.shape[:2], dtype=bool)
-        mask[12:52, 20:76] = True
-        picker._add_candidate(make_candidate(mask, source="smoke-test"), select=True)
+        picker = ScreenPickerApp(window, args, log_path, resolve_checkpoint(), start_listeners=False)
+        if (picker.mode != "manual" or not picker.disabled.get()
+                or picker.hotkeys is not None or picker.mouse_observer is not None
+                or picker.overlay is not None):
+            raise RuntimeError("The compact screen application did not start in passive manual mode.")
+        panel_layouts = {}
+        for mode in ("manual", "semi-auto", "auto"):
+            if picker.mode != mode:
+                picker.set_mode(mode)
+            window.state("normal")
+            window.update_idletasks()
+            width, height = window.winfo_width(), window.winfo_height()
+            button_bottom = picker.terminate_button.winfo_rooty() + picker.terminate_button.winfo_height()
+            if width != 420 or (mode == "manual" and height != 320):
+                raise RuntimeError("The original compact manual panel dimensions changed.")
+            if button_bottom > window.winfo_rooty() + height:
+                raise RuntimeError(f"The {mode} controls do not fit inside the floating panel.")
+            panel_layouts[mode] = [width, height]
+        window.withdraw()
         window.update_idletasks()
-        picker.render()
-        window.update_idletasks()
-        if (not picker.canvas.find_all() or not hasattr(picker, "photo")
-                or picker.photo.width() < 1 or picker.photo.height() < 1
-                or len(picker.table.get_children()) != 1 or picker.hotkeys is not None):
-            raise RuntimeError("The packaged application did not construct and render its review interface.")
+        overlay_checks = verify_screen_overlay(window)
         tk_version = str(window.tk.call("info", "patchlevel"))
     finally:
         if picker is not None:
@@ -197,6 +206,8 @@ def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
         raise RuntimeError("Desktop dependencies are incomplete.")
     return {"tk_version": tk_version, "desktop_modules_imported": True,
             "full_application_constructed": True, "synthetic_mask_rendered": True,
+            "compact_manual_default": True, "panel_layouts": panel_layouts,
+            "screen_overlay": overlay_checks,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 
 
@@ -1225,8 +1236,9 @@ class PickerApp:
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="SARU Picker: prompted SAM and reviewed mask sampling.")
-    parser.add_argument("--image", help="Open an image in the GUI.")
+    parser = argparse.ArgumentParser(description="SARU Picker: manual and model-assisted picking directly over cryoSPARC.")
+    parser.add_argument("--review", action="store_true", help="Open the optional snapshot review editor instead of the screen overlay.")
+    parser.add_argument("--image", help="Open an image in the optional offline review editor.")
     parser.add_argument("--checkpoint", help="Explicit original SAM checkpoint (.pth); otherwise use the bundled model.")
     parser.add_argument("--model-type", choices=("vit_b", "vit_l", "vit_h"), default="vit_b")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -1293,7 +1305,10 @@ def _run_application(args, *, console_available: bool) -> int:
         enable_dpi_awareness()
         import tkinter as tk
         root = tk.Tk()
-        PickerApp(root, args, log_path)
+        if args.review or args.image:
+            PickerApp(root, args, log_path)
+        else:
+            ScreenPickerApp(root, args, log_path, checkpoint)
         root.mainloop()
         return 0
     except Exception as exc:

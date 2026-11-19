@@ -1,69 +1,39 @@
-# SARU Picker for Windows
+# SARU Picker 2.1 for Windows
 
-The Windows CPU edition packages the application, Python, its dependencies, and
-the original SAM ViT-B checkpoint into a normal per-user installer. End users do
-not need to install Python, PyCharm, pip packages, or model files separately.
+Install **SARU-Picker-Setup-2.1.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed.
 
-## Install and use
+## Work directly over cryoSPARC
 
-The installer produced by the Windows build is named
-`SARU-Picker-Setup-2.0.0-win64.exe`. Run it, complete the installation, and open
-**SARU Picker** from the Start menu. A desktop shortcut is optional. Windows
-Settings can uninstall it later.
+The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer.
 
-The application runs locally after installation. Select the micrograph region,
-draw a contour or use a box/point prompt, review the selected masks and sampling
-points, and start playback. Escape stops; F8 pauses or resumes. Keep cryoSPARC's
-image zoom and position fixed while using a capture.
+| Mode | Screen interaction |
+| --- | --- |
+| manual | Uncheck Disable Picking, hold left mouse to trace a red contour, then release to fill it with picks. No ROI or model step. |
+| semi-auto | Select screen area, Detect, then click inside an intended green proposal to pick it. Box prompt and Next alternative support guided selection. |
+| auto | Select screen area, choose frame count and wait, enable picking, and Start auto. All proposals are accepted for the bounded run. |
 
-This first installer is for Windows x64 and CPU inference. It includes the
-same SAM ViT-B model used in the source version. Packaging improves setup and
-launching; it does not train the model or change the recognition results.
+Escape stops and disables picking. Space pauses/resumes an active auto run; F8 is an additional pause key. Keep cryoSPARC on the primary monitor and keep its micrograph zoom and position fixed during recognition and playback.
 
-## Model and application data
+The earlier 2.0 default snapshot editor is now optional, available with --review. Screenshots in the normal workflow are internal model input; they do not replace the live screen.
 
-The bundled checkpoint is `sam_vit_b_01ec64.pth`, 375,042,383 bytes. The build
-verifies its SHA-256 before packaging:
+## Installed data
+
+The build verifies and includes sam_vit_b_01ec64.pth, 375,042,383 bytes, SHA-256:
 
 `ec2df62732614e57411cdcf32a23ffdf28910380d03139ee0f4fcbe91eb8c912`
 
-The application finds the included model automatically, including when launched
-from a Start-menu shortcut with a different working directory. Logs and other
-writable application data use `%LOCALAPPDATA%\SARU_Picker`; the install directory
-does not need to be writable during normal operation.
+The app finds this checkpoint independently of its working directory. Logs use %LOCALAPPDATA%\SARU_Picker. Installation is per user, with an uninstaller registered in Windows Settings. This test edition is unsigned.
 
-## Build checks
+## Build and verification
 
-The build is configured to:
+The build is defined by packaging/build.ps1 and .github/workflows/build-windows.yml. It downloads verified model weights from Meta's published URL, keeps those large weights out of Git, and collects dependency notices.
 
-1. Install the pinned CPU runtime and package dependencies on Windows.
-2. Verify the model's file size and checksum.
-3. Run the regression suite and generate the standalone source file.
-4. Freeze a windowed, one-directory application with PyInstaller.
-5. Check bundled native DLLs and run the frozen application's smoke test.
-6. Build the installer, install it into a test directory, run the installed
-   smoke test, and uninstall the test copy.
-7. Retain the installer, SHA-256 hashes, and validation reports as build artifacts.
+Before packaging, it runs source regressions and native Windows UI checks. The executable and installed copy then run image-processing, native torchvision, compact-panel, transparent-overlay, input-surface, and synthetic SAM inference checks. A successful run uploads the installer, checksums and reports as an Actions artifact.
 
-The smoke test checks image processing, a native torchvision operation,
-Windows GUI/runtime dependencies, and real SAM inference on a synthetic image.
-It does not send mouse or keyboard events to cryoSPARC and does not measure
-biological recognition accuracy.
+Native UI checks create their own synthetic target window. They verify that annotation pixels are mouse-transparent, that the ROI input catcher receives interior selection, and that hiding the surfaces restores the target. They do not send mouse/keyboard events or test biological accuracy.
 
-## For maintainers
+The installer uses a normal application folder so its model does not need to be unpacked each launch. It is built on Windows because [PyInstaller distributions are platform-specific](https://pyinstaller.org/en/stable/operating-mode.html).
 
-The build entry point is `packaging/build.ps1`, and the hosted Windows build is
-defined in `.github/workflows/build-windows.yml`. The model is downloaded from
-Meta's published checkpoint URL during the build, or supplied locally. It is
-not stored in Git.
+Packaging improves deployment. The recognition model remains original SAM and its automatic proposals still need evaluation on representative micrographs. Live capture, hotkeys and click alignment must also be checked on the user's workstation.
 
-Build on Windows. PyInstaller's output depends on the host operating system;
-a Linux build is not a Windows executable. The installed files use one-directory
-packaging so the large model does not need to be unpacked on every launch.
-
-See [PyInstaller's platform requirements](https://pyinstaller.org/en/stable/index.html)
-and [Inno Setup's per-user installation setting](https://jrsoftware.org/is6help/topic_setup_privilegesrequired.htm).
-
-The build must complete and its reports must be checked before describing a
-particular installer as built or tested. Source-level and Linux smoke tests
-alone do not validate the Windows executable.
+See [the main guide](README.md) for operation and [maintainer instructions](packaging/README.md) for building.

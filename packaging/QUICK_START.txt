@@ -1,32 +1,39 @@
-SARU Picker 2 — Windows CPU edition
+SARU Picker 2.1 — Windows CPU edition
 
-The application includes Python, its required libraries, and the SAM ViT-B
-recognition model. After installation, launch SARU Picker from the Start menu.
-There is no separate Python installation or model download for the end user.
+Install once and open SARU Picker from the Start menu. Python, its libraries,
+and the SAM ViT-B model are included.
 
-1. Put cryoSPARC's picking view on your primary monitor.
-2. Choose "Select screen region (3 s)", activate cryoSPARC, and select the
-   micrograph area on the captured desktop.
-3. Draw a manual contour, or draw a box around an intended inner region and
-   choose "Segment prompt". Foreground and background points refine a mask.
-4. Review alternative masks and accept the intended regions. Automatic
-   proposals still need review; they are not a trained capsid classifier.
-5. Review the sampling points, enable live clicks, and choose "Pick selected
-   masks". Keep the underlying image position and zoom fixed during playback.
+cryoSPARC remains your live image viewer. Keep it on the primary monitor.
 
-Escape stops. F8 pauses or resumes. Click playback requires working hotkeys.
-The PyAutoGUI corner fail-safe also remains enabled.
+MANUAL — original interaction
+1. Choose manual and uncheck Disable Picking.
+2. Hold the left mouse button and trace a shape directly over the micrograph.
+3. Release to fill the contour with picks. Draw the next contour when finished.
+The original spacing slider (5–25 pixels, default 13), bbox-anchored hex grid,
+zero inset and approximately 0.10-second click cadence are preserved.
+Manual mode has no screen-area selection, model or separate review step.
 
-This edition includes a CPU PyTorch build. Use the Auto or CPU device setting.
-The model remains large: the earlier CPU example used about 3.1 GiB of process
-memory. Installing the software does not change recognition accuracy or remove
-the model's memory requirements.
+SEMI-AUTO
+Select screen area, drag around the micrograph, then Detect. Green outlines
+appear directly over cryoSPARC. Enable picking and click inside a target
+proposal. The program waits for your mouse release, hides its overlay, then
+places the picks. Box prompt and Next alternative provide guided selection.
 
-Exports contain clean captured images, selected masks, and capture/screen
-coordinates. They are not calibrated micrograph coordinates. Export accepted
-masks before playback if you want to keep them for later annotation work.
+AUTO
+Select the screen area, set Frames and Wait (s), enable picking and Start auto.
+The app accepts every proposal in that bounded run. For additional frames it
+uses Down, waits, and checks that a new stable image appeared. Original SAM
+has not been trained here to identify the intended inner capsid; evaluate
+proposals in semi-auto before running automatic picking.
 
-Application logs are written in your user profile. Startup failures are logged
-under %LOCALAPPDATA%\SARU_Picker\startup.log.
+Escape stops and disables picking. Space pauses/resumes active auto; F8 is an
+additional pause key. Disable Picking removes the input-catching overlay.
+Keep micrograph zoom and position fixed; select/detect again after changes.
 
-Third-party notices and model information are included in the _internal folder.
+Advanced model settings are available in semi-auto/auto. This edition is CPU
+only, so use Auto or CPU device selection. Recognition still needs the model's
+memory and computation. Packaging does not improve its biological accuracy.
+
+Logs: %LOCALAPPDATA%\SARU_Picker
+Third-party notices and model information: installed _internal folder
+Optional snapshot review editor: launch with --review

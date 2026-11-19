@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SARU Picker 2: responsive SAM mask review and cancellable desktop picking.
+"""SARU Picker 2.1: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
@@ -899,6 +899,7 @@ import ctypes
 import importlib
 import logging
 import math
+import os
 from numbers import Real
 import platform
 import threading
@@ -1001,6 +1002,7 @@ class _DesktopWindowsAPI:
             "ShowWindow": ([wintypes.HWND, ctypes.c_int], wintypes.BOOL),
             "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
             "GetSystemMetrics": ([ctypes.c_int], ctypes.c_int),
+            "GetWindowThreadProcessId": ([wintypes.HWND, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD),
         }
         for name, (args, result) in specs.items():
             fn = getattr(self._user32, name)
@@ -1033,6 +1035,11 @@ class _DesktopWindowsAPI:
 
     def primary_size(self) -> tuple[int, int]:
         return self._user32.GetSystemMetrics(0), self._user32.GetSystemMetrics(1)
+
+    def process_id(self, handle: int) -> int:
+        process = self._wintypes.DWORD()
+        self._user32.GetWindowThreadProcessId(handle, ctypes.byref(process))
+        return int(process.value)
 
 
 def _desktop_integer(value, name: str) -> int:
@@ -1150,6 +1157,29 @@ class DesktopAdapter:
         api = self._get_api()
         return self._validate_handle(api.root_window(api.foreground()))
 
+    def target_at(self, x: int, y: int) -> int:
+        """Resolve the live window at a physical screen point without focusing it."""
+        x, y = _desktop_integer(x, "Pointer x"), _desktop_integer(y, "Pointer y")
+        width, height = self.size()
+        if not (0 <= x < width and 0 <= y < height):
+            raise DesktopError("Draw on the primary monitor.")
+        api = self._get_api()
+        return self._validate_handle(api.root_window(api.window_at(x, y)))
+
+    def is_target_at(self, x: int, y: int, target: int) -> bool:
+        try:
+            return self.target_at(x, y) == self._validate_handle(target)
+        except DesktopError:
+            return False
+
+    def is_own_window(self, handle: int) -> bool:
+        """Exclude our own controls, title bars and dialogs from manual traces."""
+        handle = self._validate_handle(handle)
+        process_id = self._get_api().process_id(handle)
+        if not process_id:
+            raise DesktopError("The window owning this screen position could not be identified.")
+        return process_id == os.getpid()
+
     def window_under_roi(self, region: CaptureGeometry) -> int:
         """Require ROI center and corners to belong to one top-level window."""
         self.validate_region(region)
@@ -1212,10 +1242,12 @@ class DesktopAdapter:
 
 
 class GlobalHotkeys:
-    """Debounced global Escape/F8 listener with queue-only callbacks.
+    """Debounced global Escape/F8 listener with optional scoped Space pause.
 
-    The callback receives ``'stop'`` or ``'pause'`` on a listener thread and
+    The callback receives ``'stop'``, ``'pause'`` or ``'space_pause'`` on a listener thread and
     must only enqueue a message or update thread-safe cancellation state.
+    Space is consumed only while explicitly enabled for an automatic run;
+    otherwise ordinary browser keyboard input is left alone.
     """
 
     def __init__(
@@ -1224,6 +1256,8 @@ class GlobalHotkeys:
         listener_factory=None,
         key_enum=None,
         platform_name: str | None = None,
+        *,
+        space_pause: bool = False,
     ) -> None:
         if not callable(callback):
             raise TypeError("Hotkey callback must be callable.")
@@ -1235,6 +1269,56 @@ class GlobalHotkeys:
         self._pressed: set = set()
         self._lock = threading.Lock()
         self._active = False
+        self._space_pause = bool(space_pause)
+        self._space_enabled = False
+        self._space_held = False
+        self._space_passthrough_held = False
+
+    def enable_space_pause(self, enabled: bool) -> None:
+        with self._lock:
+            self._space_enabled = bool(enabled) and self._space_pause
+
+    def _win32_filter(self, msg, data):
+        """Consume only the Space press/release pair owned by an auto run.
+
+        Pynput's filter precedes its ordinary callbacks. Calling suppress_event
+        intentionally raises its internal suppression signal, so this method
+        must not catch that signal. Holding Space cannot toggle pause repeatedly.
+        """
+        if getattr(data, "vkCode", None) != 0x20 or getattr(data, "flags", 0) & 0x10:
+            return True
+        down, up = msg in (0x0100, 0x0104), msg in (0x0101, 0x0105)
+        if not (down or up):
+            return True
+        with self._lock:
+            if not self._active or not self._space_pause:
+                return True
+            # A key press that began outside the run belongs to the browser,
+            # including its repeats and release even if a run starts meanwhile.
+            if self._space_passthrough_held:
+                if up:
+                    self._space_passthrough_held = False
+                return True
+            if up and not self._space_held:
+                return True
+            if not (self._space_enabled or self._space_held):
+                if down:
+                    self._space_passthrough_held = True
+                return True
+            emit = down and not self._space_held
+            if down:
+                self._space_held = True
+            elif up:
+                self._space_held = False
+        if emit:
+            try:
+                self._callback("space_pause")
+            except Exception:
+                DESKTOP_LOGGER.exception("Space pause callback failed.")
+        listener = self._listener
+        if listener is not None:
+            listener.suppress_event()
+        return False
 
     def start(self) -> None:
         if self._active:
@@ -1251,7 +1335,10 @@ class GlobalHotkeys:
         self._pressed.clear()
         self._active = True
         try:
-            self._listener = self._factory(on_press=self._on_press, on_release=self._on_release)
+            callbacks = {"on_press": self._on_press, "on_release": self._on_release}
+            if self._space_pause:
+                callbacks["win32_event_filter"] = self._win32_filter
+            self._listener = self._factory(**callbacks)
             self._listener.start()
         except Exception:
             self._active = False
@@ -1278,10 +1365,1648 @@ class GlobalHotkeys:
         with self._lock:
             self._active = False
             self._pressed.clear()
+            self._space_enabled = False
+            self._space_held = False
+            self._space_passthrough_held = False
         listener, self._listener = self._listener, None
         if listener is not None:
             listener.stop()
 
+
+
+# ---------------- manual_sampling.py ----------------
+
+import math
+
+import numpy as np
+
+
+
+# Ordinary desktop contours are far below these limits. They also bound work
+# for a thin or self-intersecting contour whose bounding box contains very few
+# accepted points, where the output-point limit alone would not protect us.
+_MANUAL_MAX_VERTICES = 50_000
+_MANUAL_MAX_ROWS = 20_000
+_MANUAL_MAX_GRID_SITES = 2_000_000
+_MANUAL_MAX_EDGE_ROWS = 20_000_000
+
+
+def _manual_check_cancel(cancel):
+    if cancel is not None and cancel():
+        raise CancelledOperation("Manual contour sampling cancelled.")
+
+
+def legacy_contour_points(points, spacing: int, max_points: int = 10_000,
+                          cancel=None) -> np.ndarray:
+    """Return the original contour's picks as an ``N x 2`` int32 array.
+
+    ``points`` are finite numeric screen coordinates; negative origins and
+    fractional vertices are supported. Vertices must fit signed 32-bit screen
+    coordinates. ``spacing`` is an integer of at least two pixels; the GUI's
+    original slider uses 5–25. No boundary inset or image-mask rasterization is
+    applied. Self-intersecting traces retain the original even/odd fill rule.
+
+    Malformed or collinear contours, an exceeded ``max_points``, or excessive
+    bounding-box work raise ValueError. Nothing is silently truncated. A true
+    ``cancel()`` raises execution.CancelledOperation, allowing TaskRunner to
+    discard the entire request without publishing partial pick positions.
+
+    The implementation evaluates the original ray rule once per scanline and
+    uses sorted crossings to find the same parity at each original grid point.
+    It avoids a slow Python loop over every vertex for every possible pick.
+    """
+    if cancel is not None and not callable(cancel):
+        raise ValueError("cancel must be callable or None.")
+    _manual_check_cancel(cancel)
+    integer_limit = int(np.iinfo(np.int32).max)
+    if (isinstance(spacing, (bool, np.bool_))
+            or not isinstance(spacing, (int, np.integer))
+            or not 2 <= spacing <= integer_limit):
+        raise ValueError("spacing must be an integer of at least 2 pixels within the screen-coordinate range.")
+    if (isinstance(max_points, (bool, np.bool_))
+            or not isinstance(max_points, (int, np.integer)) or max_points < 1):
+        raise ValueError("max_points must be a positive integer.")
+    spacing, max_points = int(spacing), int(max_points)
+    try:
+        vertices = np.asarray(points)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A manual contour needs at least three finite numeric (x,y) points.") from exc
+    if (vertices.ndim != 2 or vertices.shape[1:] != (2,) or len(vertices) < 3
+            or vertices.dtype.kind not in "iuf"):
+        raise ValueError("A manual contour needs at least three finite numeric (x,y) points.")
+    if len(vertices) > _MANUAL_MAX_VERTICES:
+        raise ValueError("The manual contour has too many vertices; draw a shorter contour.")
+    with np.errstate(over="ignore", invalid="ignore"):
+        vertices = vertices.astype(np.float64, copy=True)
+    minimum_coordinate = int(np.iinfo(np.int32).min)
+    if (not np.isfinite(vertices).all() or (vertices < minimum_coordinate).any()
+            or (vertices > integer_limit).any()):
+        raise ValueError("Manual contour coordinates must be finite and fit signed 32-bit screen coordinates.")
+
+    # A signed polygon area would incorrectly reject a valid figure-eight or
+    # bow-tie trace. Reject only a genuinely collinear/point-like contour.
+    differences = vertices - vertices[0]
+    distinct = np.flatnonzero(np.any(differences != 0, axis=1))
+    if not len(distinct):
+        raise ValueError("A manual contour must enclose an area, not a point or straight line.")
+    direction = differences[distinct[0]]
+    cross = direction[0] * differences[:, 1] - direction[1] * differences[:, 0]
+    if not np.any(cross != 0):
+        raise ValueError("A manual contour must enclose an area, not a point or straight line.")
+
+    x_min, y_min = (int(v) for v in np.min(vertices, axis=0))
+    x_max, y_max = (int(v) for v in np.max(vertices, axis=0))
+    # Use the original arithmetic, including truncation and odd-row offset.
+    row_height = int(spacing * math.sqrt(3) / 2)
+    rows = (y_max - y_min) // row_height + 1
+    columns = (x_max - x_min) // spacing + 1
+    if (rows > _MANUAL_MAX_ROWS or rows * columns > _MANUAL_MAX_GRID_SITES
+            or rows * len(vertices) > _MANUAL_MAX_EDGE_ROWS):
+        raise ValueError("The manual contour requires too many sampling checks; increase spacing or draw a smaller contour.")
+
+    x1, y1 = vertices[:, 0], vertices[:, 1]
+    x2, y2 = np.roll(x1, -1), np.roll(y1, -1)
+    lower_y, upper_y = np.minimum(y1, y2), np.maximum(y1, y2)
+    rightmost_x = np.maximum(x1, x2)
+    result = []
+    total = 0
+    for row, y in enumerate(range(y_min, y_max + 1, row_height)):
+        _manual_check_cancel(cancel)
+        active = (lower_y < y) & (y <= upper_y) & (y2 != y1)
+        if not active.any():
+            continue
+        # Original rule: an edge toggles a point when both x <= max(x1,x2)
+        # and x <= its intersection at y. Their conjunction is this threshold.
+        crossings = (x1[active]
+                     + (y - y1[active]) * (x2[active] - x1[active])
+                     / (y2[active] - y1[active]))
+        thresholds = np.minimum(rightmost_x[active], crossings)
+        thresholds.sort()
+        x_start = x_min + (spacing // 2 if row % 2 else 0)
+        xs = np.arange(x_start, x_max + 1, spacing, dtype=np.int64)
+        crossing_count = len(thresholds) - np.searchsorted(thresholds, xs, side="left")
+        xs = xs[(crossing_count % 2) != 0]
+        total += len(xs)
+        if total > max_points:
+            raise ValueError(f"More than {max_points:,} manual pick positions were requested; increase spacing or draw a smaller contour.")
+        if len(xs):
+            result.append(np.column_stack((xs, np.full(len(xs), y, dtype=np.int64))))
+    _manual_check_cancel(cancel)
+    if not result:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.concatenate(result).astype(np.int32)
+
+
+# ---------------- screen_overlay.py ----------------
+
+
+import ctypes
+import importlib
+import logging
+import math
+import platform
+import threading
+from typing import Callable
+
+import numpy as np
+from PIL import Image
+
+
+
+OVERLAY_LOG = logging.getLogger(__name__)
+TRANSPARENT_COLOR = "#010203"
+TRANSPARENT_RGB = (1, 2, 3)
+INPUT_ALPHA = 0.02
+
+
+class OverlayError(RuntimeError):
+    """A screen surface cannot be created or its coordinate contract failed."""
+
+
+def _screen_xy(x, y) -> tuple[int, int]:
+    values = (float(x), float(y))
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Screen coordinates must be finite.")
+    return math.floor(values[0]), math.floor(values[1])
+
+
+class _OverlayWindowsAPI:
+    """Pointer-safe Win32 operations, created only when an overlay is needed."""
+
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TRANSPARENT = 0x00000020
+    WS_EX_NOACTIVATE = 0x08000000
+    WS_EX_TOOLWINDOW = 0x00000080
+
+    def __init__(self, user32=None):
+        from ctypes import wintypes
+
+        self.user32 = user32 or ctypes.WinDLL("user32", use_last_error=True)
+        self._get_long = getattr(self.user32, "GetWindowLongPtrW", None)
+        self._set_long = getattr(self.user32, "SetWindowLongPtrW", None)
+        if self._get_long is None or self._set_long is None:
+            self._get_long = self.user32.GetWindowLongW
+            self._set_long = self.user32.SetWindowLongW
+        if user32 is None:
+            self._get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+            self._get_long.restype = ctypes.c_ssize_t
+            self._set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            self._set_long.restype = ctypes.c_ssize_t
+            self.user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            self.user32.GetAncestor.restype = wintypes.HWND
+            self.user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+            self.user32.GetSystemMetrics.restype = ctypes.c_int
+            self.user32.WindowFromPoint.argtypes = [wintypes.POINT]
+            self.user32.WindowFromPoint.restype = wintypes.HWND
+            self.user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                               ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_int, ctypes.c_int,
+                                               wintypes.UINT]
+            self.user32.SetWindowPos.restype = wintypes.BOOL
+        self._point_type = wintypes.POINT
+
+    def primary_size(self) -> tuple[int, int]:
+        return self.user32.GetSystemMetrics(0), self.user32.GetSystemMetrics(1)
+
+    def root_handle(self, child: int) -> int:
+        return int(self.user32.GetAncestor(int(child), 2) or child)
+
+    def window_at(self, x: int, y: int) -> int:
+        return self.root_handle(int(self.user32.WindowFromPoint(self._point_type(x, y)) or 0))
+
+    def styles(self, child: int) -> int:
+        return int(self._get_long(self.root_handle(child), self.GWL_EXSTYLE))
+
+    def configure(self, child: int, *, click_through: bool) -> int:
+        handle = self.root_handle(child)
+        if handle <= 0:
+            raise OverlayError("The overlay has no native Windows handle.")
+        style = int(self._get_long(handle, self.GWL_EXSTYLE))
+        style |= self.WS_EX_LAYERED | self.WS_EX_NOACTIVATE | self.WS_EX_TOOLWINDOW
+        if click_through:
+            style |= self.WS_EX_TRANSPARENT
+        else:
+            style &= ~self.WS_EX_TRANSPARENT
+        # A zero return can mean success when the former style was zero.
+        if hasattr(ctypes, "set_last_error"):
+            ctypes.set_last_error(0)
+        previous = self._set_long(handle, self.GWL_EXSTYLE, style)
+        error = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
+        if previous == 0 and error:
+            raise OverlayError(f"Could not configure the screen overlay (Windows error {error}).")
+        return handle
+
+    def raise_without_activation(self, child: int) -> None:
+        # HWND_TOPMOST; NOSIZE | NOMOVE | NOACTIVATE | FRAMECHANGED | SHOWWINDOW.
+        if not self.user32.SetWindowPos(self.root_handle(child), -1, 0, 0, 0, 0,
+                                       0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040):
+            raise OverlayError("Could not show the screen overlay without activating it.")
+
+
+class _ScreenSurface:
+    def __init__(self, root, *, window_factory=None, canvas_factory=None,
+                 style_api=None, platform_name=None):
+        self.root = root
+        self.window = None
+        self.canvas = None
+        self.visible = False
+        self.closed = False
+        self._gui_thread = threading.get_ident()
+        self._window_factory = window_factory
+        self._canvas_factory = canvas_factory
+        self._style_api = style_api
+        self._platform_name = platform_name or platform.system()
+
+    def _check_thread(self):
+        if threading.get_ident() != self._gui_thread:
+            raise RuntimeError("Screen overlay methods must run on the GUI thread.")
+
+    def _api(self):
+        if self._platform_name != "Windows":
+            raise OverlayError("Live screen overlays require Windows.")
+        if self._style_api is None:
+            self._style_api = _OverlayWindowsAPI()
+        return self._style_api
+
+    def _make_window(self, bounds, *, input_surface):
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen surface is closed.")
+        api = self._api()
+        width, height = api.primary_size()
+        if (bounds.left < 0 or bounds.top < 0
+                or bounds.left + bounds.width > width
+                or bounds.top + bounds.height > height):
+            raise OverlayError("Screen overlays are restricted to the primary monitor.")
+        if self._window_factory is None or self._canvas_factory is None:
+            import tkinter as tk
+            self._window_factory = self._window_factory or tk.Toplevel
+            self._canvas_factory = self._canvas_factory or tk.Canvas
+        window = self._window_factory(self.root)
+        try:
+            window.withdraw()
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            window.geometry(f"{bounds.width}x{bounds.height}+{bounds.left}+{bounds.top}")
+            background = "black" if input_surface else TRANSPARENT_COLOR
+            window.configure(bg=background)
+            if input_surface:
+                # No color key and never alpha=0: every ROI pixel must receive input.
+                window.attributes("-alpha", INPUT_ALPHA)
+            else:
+                window.attributes("-transparentcolor", TRANSPARENT_COLOR)
+            canvas = self._canvas_factory(window, bg=background, highlightthickness=0,
+                                          borderwidth=0, cursor="crosshair" if input_surface else "")
+            canvas.pack(fill="both", expand=True)
+            window.update_idletasks()
+            api.configure(window.winfo_id(), click_through=not input_surface)
+            self.window, self.canvas = window, canvas
+        except Exception:
+            window.destroy()
+            raise
+
+    def _show(self, *, input_surface):
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen surface is closed.")
+        # Tk wm state normal avoids the forced focus performed by deiconify.
+        try:
+            self.window.state("normal")
+            self.window.update_idletasks()
+            api = self._api()
+            api.configure(self.window.winfo_id(), click_through=not input_surface)
+            api.raise_without_activation(self.window.winfo_id())
+            self.visible = True
+        except Exception:
+            # A failed native update must not strand a nearly invisible mouse
+            # catcher over cryoSPARC while the controller handles the error.
+            self.window.withdraw()
+            self.visible = False
+            raise
+
+    def hide(self):
+        self._check_thread()
+        if self.window is not None and not self.closed:
+            self.window.withdraw()
+        self.visible = False
+
+    def close(self):
+        self._check_thread()
+        if self.closed:
+            return
+        self.closed = True
+        self.visible = False
+        if self.window is not None:
+            self.window.destroy()
+        self.window = self.canvas = None
+
+
+def _mask_outline(mask: np.ndarray) -> np.ndarray:
+    """Inside boundary pixels, preserving both disconnected pieces and holes."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2 or min(mask.shape, default=0) == 0:
+        raise ValueError("Overlay masks must be nonempty two-dimensional arrays.")
+    interior = mask.copy()
+    interior[0, :] = interior[-1, :] = False
+    interior[:, 0] = interior[:, -1] = False
+    if mask.shape[0] > 2 and mask.shape[1] > 2:
+        interior[1:-1, 1:-1] &= (mask[:-2, 1:-1] & mask[2:, 1:-1]
+                                  & mask[1:-1, :-2] & mask[1:-1, 2:])
+    return mask & ~interior
+
+
+def _mask_image(candidates, geometry, selected_ids=(), preview=None):
+    image = np.empty((geometry.height, geometry.width, 3), dtype=np.uint8)
+    image[:] = TRANSPARENT_RGB
+    selected = set(selected_ids)
+    layers = [(candidate, (80, 255, 120) if candidate.id in selected else (40, 210, 95))
+              for candidate in candidates]
+    if preview is not None:
+        layers.append((preview, (255, 215, 70)))
+    for candidate, color in layers:
+        mask = np.asarray(candidate.mask, dtype=bool)
+        if mask.shape != (geometry.height, geometry.width):
+            raise ValueError("Overlay mask dimensions do not match the selected screen area.")
+        image[_mask_outline(mask)] = color
+    return Image.fromarray(image)
+
+
+class ScreenOverlay(_ScreenSurface):
+    """Lazy, click-through full-primary-screen annotation canvas."""
+
+    def __init__(self, root, *, photo_factory=None, **kwargs):
+        super().__init__(root, **kwargs)
+        self._photo_factory = photo_factory
+        self._mask_photo = None
+
+    def _ensure(self):
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen overlay is closed.")
+        if self.window is None:
+            width, height = self._api().primary_size()
+            self._make_window(CaptureGeometry(0, 0, width, height), input_surface=False)
+
+    def show(self):
+        self._ensure()
+        self._show(input_surface=False)
+
+    def clear(self):
+        self._check_thread()
+        if self.canvas is not None:
+            self.canvas.delete("all")
+        self._mask_photo = None
+
+    def draw_trace(self, screen_xy):
+        self._ensure()
+        points = [_screen_xy(*point) for point in screen_xy]
+        self.canvas.delete("trace")
+        if len(points) > 1:
+            self.canvas.create_line(*[value for point in points for value in point],
+                                    fill="#ff3838", width=2, tags="trace")
+
+    def draw_region(self, geometry: CaptureGeometry):
+        self._ensure()
+        self.canvas.delete("region")
+        self.canvas.create_rectangle(geometry.left, geometry.top,
+                                     geometry.left + geometry.width - 1,
+                                     geometry.top + geometry.height - 1,
+                                     outline="#63dbe9", width=2, tags="region")
+
+    def draw_masks(self, candidates, geometry: CaptureGeometry, selected_ids=(), preview=None):
+        self._ensure()
+        bitmap = _mask_image(candidates, geometry, selected_ids, preview)
+        if self._photo_factory is None:
+            from PIL import ImageTk
+            self._photo_factory = ImageTk.PhotoImage
+        photo = self._photo_factory(bitmap, master=self.window)
+        self.canvas.delete("masks")
+        self.canvas.create_image(geometry.left, geometry.top, image=photo, anchor="nw", tags="masks")
+        self._mask_photo = photo
+
+    def draw_box(self, screen_box):
+        self._ensure()
+        self.canvas.delete("box")
+        if screen_box is not None:
+            x0, y0 = _screen_xy(*screen_box[:2])
+            x1, y1 = _screen_xy(*screen_box[2:])
+            self.canvas.create_rectangle(x0, y0, x1, y1,
+                                         outline="#ffe164", width=2, tags="box")
+
+    def draw_points(self, screen_xy, labels):
+        self._ensure()
+        points, labels = list(screen_xy), list(labels)
+        if len(points) != len(labels):
+            raise ValueError("Each prompt point needs a foreground/background label.")
+        self.canvas.delete("points")
+        for point, label in zip(points, labels):
+            if label not in (0, 1):
+                raise ValueError("Prompt labels must be 0 or 1.")
+            x, y = _screen_xy(*point)
+            color = "#6aff8b" if label else "#ff6c6c"
+            self.canvas.create_oval(x - 4, y - 4, x + 4, y + 4,
+                                    outline=color, width=2, tags="points")
+            self.canvas.create_line(x - 3, y, x + 3, y, fill=color, width=2, tags="points")
+            if label:
+                self.canvas.create_line(x, y - 3, x, y + 3, fill=color, width=2, tags="points")
+
+    def close(self):
+        super().close()
+        self._mask_photo = None
+
+
+class InputSurface(_ScreenSurface):
+    """Near-transparent mouse catcher; callbacks receive physical screen x/y.
+
+    Press/right-click must begin inside bounds. Moves/releases from a started
+    drag are delivered even outside bounds so the controller can finish or
+    clamp the gesture explicitly. No screenshot or native input is generated.
+    """
+
+    def __init__(self, root, bounds: CaptureGeometry, on_press, on_move, on_release,
+                 on_right=None, on_cancel=None, **kwargs):
+        super().__init__(root, **kwargs)
+        for callback in (on_press, on_move, on_release):
+            if not callable(callback):
+                raise TypeError("Input gesture callbacks must be callable.")
+        self.bounds = bounds
+        self._press_callback, self._move_callback = on_press, on_move
+        self._release_callback = on_release
+        self._right_callback, self._cancel_callback = on_right, on_cancel
+        self._dragging = False
+
+    def _ensure(self):
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen input surface is closed.")
+        if self.window is not None:
+            return
+        self._make_window(self.bounds, input_surface=True)
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._move)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
+        self.canvas.bind("<ButtonPress-3>", self._right)
+        self.window.bind("<Escape>", self._cancel)
+
+    def show(self):
+        self._ensure()
+        self._show(input_surface=True)
+
+    def hide(self):
+        self._check_thread()
+        self._dragging = False
+        super().hide()
+
+    def _event_xy(self, event):
+        # Do not use canvas-local x/y or Tk scaling: coordinates are screen pixels.
+        return _screen_xy(event.x_root, event.y_root)
+
+    def _press(self, event):
+        point = self._event_xy(event)
+        if self.visible and self.bounds.contains(*point):
+            self._dragging = True
+            self._press_callback(*point)
+        return "break"
+
+    def _move(self, event):
+        if self.visible and self._dragging:
+            self._move_callback(*self._event_xy(event))
+        return "break"
+
+    def _release(self, event):
+        was_dragging, self._dragging = self._dragging, False
+        if self.visible and was_dragging:
+            self._release_callback(*self._event_xy(event))
+        return "break"
+
+    def _right(self, event):
+        point = self._event_xy(event)
+        if self.visible and self.bounds.contains(*point) and self._right_callback:
+            self._right_callback(*point)
+        return "break"
+
+    def _cancel(self, event=None):
+        self._dragging = False
+        if self._cancel_callback:
+            self._cancel_callback()
+        return "break"
+
+
+class ManualMouseObserver:
+    """Passive global drag observer; callback must only queue its event tuple.
+
+    Physical input continues to cryoSPARC as in the original manual mode.
+    Playback-generated input is excluded by both current pynput's ``injected``
+    callback argument and the Windows low-level hook flags. This listener never
+    suppresses user input and never calls Tk. Stop it while picking is disabled.
+    """
+
+    def __init__(self, callback: Callable[[tuple[str, int, int]], None], *,
+                 listener_factory=None, button_enum=None, platform_name=None):
+        if not callable(callback):
+            raise TypeError("Mouse observer callback must be callable.")
+        self._callback = callback
+        self._factory = listener_factory
+        self._buttons = button_enum
+        self._platform_name = platform_name or platform.system()
+        self._listener = None
+        self._active = False
+        self._drawing = False
+        self._generation = 0
+        self._lock = threading.RLock()
+
+    @property
+    def active(self):
+        with self._lock:
+            return self._active
+
+    def start(self):
+        if self._platform_name != "Windows":
+            raise OverlayError("Global screen drawing is supported on Windows.")
+        with self._lock:
+            if self._active:
+                return
+            if self._factory is None or self._buttons is None:
+                mouse = importlib.import_module("pynput.mouse")
+                self._factory = self._factory or mouse.Listener
+                self._buttons = self._buttons or mouse.Button
+            self._generation += 1
+            generation = self._generation
+            self._active, self._drawing = True, False
+            try:
+                listener = self._factory(
+                    on_click=lambda *args: self._click(*args, generation=generation),
+                    on_move=lambda *args: self._move(*args, generation=generation),
+                    win32_event_filter=lambda msg, data: self._event_filter(msg, data, generation),
+                )
+                self._listener = listener
+                listener.start()
+            except Exception:
+                self._active, self._drawing = False, False
+                self._listener = None
+                raise
+
+    def _event_filter(self, message, data, generation):
+        with self._lock:
+            # Returning False skips observer callbacks; it does not suppress
+            # the Windows event. Both normal/lower-integrity injected flags.
+            return (self._active and generation == self._generation
+                    and not (int(getattr(data, "flags", 0)) & 0x00000003))
+
+    def _click(self, x, y, button, pressed, injected=False, *, generation=None):
+        with self._lock:
+            if (not self._active or injected or button != self._buttons.left
+                    or generation is not None and generation != self._generation):
+                return
+            if pressed:
+                self._drawing = True
+                self._emit("press", x, y)
+            elif self._drawing:
+                self._drawing = False
+                self._emit("release", x, y)
+
+    def _move(self, x, y, injected=False, *, generation=None):
+        with self._lock:
+            if (self._active and self._drawing and not injected
+                    and (generation is None or generation == self._generation)):
+                self._emit("move", x, y)
+
+    def _emit(self, action, x, y):
+        try:
+            self._callback((action, *_screen_xy(x, y)))
+        except Exception:
+            OVERLAY_LOG.exception("The screen mouse event could not be queued.")
+
+    def stop(self):
+        with self._lock:
+            self._active, self._drawing = False, False
+            self._generation += 1
+            listener, self._listener = self._listener, None
+        if listener is not None:
+            listener.stop()
+
+
+def verify_screen_overlay(root) -> dict:
+    """Exercise native Windows hit testing using only our synthetic windows.
+
+    No mouse/keyboard events, screenshots, or global listeners are generated.
+    The controller should call this only from its deliberate Windows smoke test.
+    """
+    import tkinter as tk
+    from types import SimpleNamespace
+
+    if platform.system() != "Windows":
+        raise OverlayError("Native overlay verification requires Windows.")
+    api = _OverlayWindowsAPI()
+    width, height = api.primary_size()
+    if width < 240 or height < 240:
+        raise OverlayError("The Windows smoke-test display is too small.")
+    target = tk.Toplevel(root)
+    overlay = input_surface = None
+    events = []
+    try:
+        target.withdraw()
+        target.overrideredirect(True)
+        target.attributes("-topmost", True)
+        target.geometry("160x160+40+40")
+        target.configure(bg="#445566")
+        target.state("normal")
+        target.update_idletasks()
+        api.raise_without_activation(target.winfo_id())
+        root.update()
+        target_handle = api.root_handle(target.winfo_id())
+        geometry = CaptureGeometry(60, 60, 100, 100)
+        mask = np.zeros((100, 100), dtype=bool)
+        mask[20:80, 20:80] = True
+        mask[40:60, 40:60] = False
+        candidate = SimpleNamespace(id="synthetic-mask", mask=mask)
+        overlay = ScreenOverlay(root, style_api=api)
+        overlay.draw_masks([candidate], geometry, {candidate.id})
+        overlay.draw_trace([(70, 70), (150, 70)])
+        overlay.show()
+        root.update()
+        styles = api.styles(overlay.window.winfo_id())
+        required = api.WS_EX_LAYERED | api.WS_EX_TRANSPARENT | api.WS_EX_NOACTIVATE
+        if styles & required != required:
+            raise OverlayError("The visual overlay lacks its native passive styles.")
+        # Include a rendered red line, a rendered green mask edge, and a hole.
+        points = [(100, 70), (80, 100), (110, 110)]
+        if any(api.window_at(*point) != target_handle for point in points):
+            raise OverlayError("A visual annotation intercepted input intended for the target.")
+        record_input = lambda x, y: events.append((x, y))
+        input_surface = InputSurface(root, geometry, record_input,
+                                     record_input, record_input, style_api=api)
+        input_surface.show()
+        overlay.show()  # Put visible annotations above the input catcher too.
+        root.update()
+        input_handle = api.root_handle(input_surface.window.winfo_id())
+        if any(api.window_at(*point) != input_handle for point in points):
+            raise OverlayError("The ROI input surface does not catch mask-interior input.")
+        input_style = api.styles(input_surface.window.winfo_id())
+        if input_style & api.WS_EX_TRANSPARENT or not input_style & api.WS_EX_NOACTIVATE:
+            raise OverlayError("The ROI input surface has incorrect native window styles.")
+        if api.window_at(45, 45) != target_handle:
+            raise OverlayError("The ROI input surface extends beyond its selected bounds.")
+        input_surface.hide()
+        overlay.hide()
+        root.update()
+        if any(api.window_at(*point) != target_handle for point in points):
+            raise OverlayError("Hiding the screen surfaces did not restore the target window.")
+        if events:
+            raise OverlayError("Unexpected input arrived during the no-input overlay smoke test.")
+        return {"annotation_hit_transparent": True, "roi_input_intercepts": True,
+                "outside_roi_passes": True, "hidden_restores_target": True,
+                "desktop_events_sent": 0, "global_listeners_started": 0}
+    finally:
+        if input_surface is not None:
+            input_surface.close()
+        if overlay is not None:
+            overlay.close()
+        target.destroy()
+
+
+# ---------------- screen_app.py ----------------
+
+import logging
+from pathlib import Path
+import queue
+import threading
+import time
+
+import numpy as np
+
+
+
+SCREEN_LOG = logging.getLogger("saru.screen")
+
+
+def screen_changed_fraction(before, after, tolerance=12):
+    """Compare physical screen pixels without unsigned subtraction overflow."""
+    if before is None or after is None or before.shape != after.shape:
+        return 1.0
+    difference = np.abs(before.astype(np.int16) - after.astype(np.int16))
+    return float(np.mean(np.max(difference, axis=2) > tolerance))
+
+
+def screen_mask_at(candidates, geometry, x, y):
+    """Hit-test actual mask interiors, including holes and disconnected parts."""
+    if geometry is None or not geometry.contains(x, y):
+        return None
+    px, py = int(x - geometry.left), int(y - geometry.top)
+    # Prefer a smaller nested region when several proposals overlap the click.
+    for candidate in sorted(candidates, key=lambda item: item.area):
+        if candidate.mask.shape != (geometry.height, geometry.width):
+            raise ValueError("A displayed mask no longer matches the selected screen area.")
+        if candidate.mask[py, px]:
+            return candidate
+    return None
+
+
+def screen_model_points(candidates, geometry, spacing, picked=(), cancel=None):
+    """Sample the union once; model modes keep holes and avoid repeat clicks."""
+    mask = union_masks(candidates, (geometry.height, geometry.width))
+    local = sample_hex_grid(mask, spacing, inset=2, max_points=10000, cancel=cancel)
+    already = set(picked)
+    local = np.asarray([point for point in local if tuple(map(int, point)) not in already],
+                       dtype=np.int32).reshape(-1, 2)
+    screen = np.asarray([geometry.local_to_screen(int(x), int(y)) for x, y in local],
+                        dtype=np.int32).reshape(-1, 2)
+    return local, screen
+
+
+def screen_background_guard(candidates, geometry, spacing):
+    """Pixels outside selected regions and expected pick-marker margins.
+
+    This is a conservative scene-change heuristic, not image registration.
+    A tiny or empty remainder cannot establish that old proposals still align.
+    """
+    from scipy.ndimage import distance_transform_edt
+    selected = union_masks(candidates, (geometry.height, geometry.width))
+    background = distance_transform_edt(~selected) > max(8, int(spacing))
+    if np.count_nonzero(background) < max(64, int(.02 * background.size)):
+        return None
+    return background
+
+
+def screen_background_changed(before, after, background):
+    if before.shape != after.shape or background.shape != before.shape[:2]:
+        return 1.0
+    difference = np.max(np.abs(before.astype(np.int16)-after.astype(np.int16)), axis=2)
+    return float(np.mean(difference[background] > 12))
+
+
+class ScreenPickerApp:
+    """Default screen UI. ``mode`` is str; ``disabled`` is a Tk BooleanVar.
+
+    ``start_listeners=False`` constructs a passive panel for packaging checks;
+    it never starts global hooks or sends desktop input. The overlay is lazy.
+    """
+
+    def __init__(self, root, args, log_path, checkpoint_path, *, start_listeners=True):
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox
+        self.tk, self.ttk = tk, ttk
+        self.filedialog, self.messagebox = filedialog, messagebox
+        self.root, self.args, self.log_path = root, args, Path(log_path)
+        self.desktop, self.runner = DesktopAdapter(), TaskRunner()
+        self.events = queue.Queue()
+        self.overlay = self.input_surface = self.advanced = None
+        self.mouse_observer = self.hotkeys = None
+        self._listeners_requested = bool(start_listeners)
+        self._manual_gate = threading.Event()
+        self._input_lock = threading.Lock()
+        self._emergency_stop = threading.Event()
+        self._mouse_epoch = 0
+        self.mode = "manual"
+        self.closed = False
+        self.scheduled = set()
+        self.transition = False
+        self.hidden = False
+        self.job_kind = None
+        self.active_token = None
+        self.paused = False
+        self.manual_window = None
+        self.trace = []
+        self.trace_dirty = False
+        self.drawing = False
+        self.released = False
+        self.manual_baseline = None
+        self.manual_geometry = None
+        self.panel_bounds = None
+        self.geometry = self.target = self.rgb = self.reference = None
+        self.candidates, self.alternatives = [], []
+        self.alternative_index = 0
+        self.picked_points = set()
+        self.frame_id = 0
+        self.auto_remaining = 0
+        self.auto_history = []
+        self.recognizer = self.recognizer_config = None
+        self.input_kind = None
+        self.input_start = None
+        self._build_ui(checkpoint_path)
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Escape>", lambda event: self.stop())
+        root.bind("<Configure>", lambda event: self._remember_panel())
+        if start_listeners:
+            try:
+                self.hotkeys = GlobalHotkeys(self._hotkey, space_pause=True)
+                self.hotkeys.start()
+                self.mouse_observer = ManualMouseObserver(self._mouse_event)
+                self.mouse_observer.start()
+            except Exception as exc:
+                SCREEN_LOG.exception("Screen input hooks could not start")
+                if self.hotkeys is not None:
+                    self.hotkeys.stop()
+                if self.mouse_observer is not None:
+                    self.mouse_observer.stop()
+                self.hotkeys = self.mouse_observer = None
+                self.status.set(f"Screen input unavailable: {exc}")
+        self.root.after(30, self.poll)
+
+    def _build_ui(self, checkpoint_path):
+        tk, ttk, root = self.tk, self.ttk, self.root
+        root.title("SARU PICKER")
+        root.geometry("420x320")
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+        tk.Label(root, text="Mode", font=("Arial", 10)).pack(pady=5)
+        self.mode_var = tk.StringVar(value="manual")
+        modes = tk.Frame(root)
+        modes.pack(pady=5)
+        for mode in ("manual", "semi-auto", "auto"):
+            tk.Radiobutton(modes, text=mode, value=mode, variable=self.mode_var,
+                           indicatoron=False, width=10, font=("Arial", 10),
+                           command=lambda value=mode: self.set_mode(value)).pack(side="left", padx=5)
+        self.spacing = tk.IntVar(value=13)
+        tk.Scale(root, from_=5, to=25, orient="horizontal", label="Particle spacing",
+                 length=150, variable=self.spacing).pack(padx=10, pady=10)
+        self.disabled = tk.BooleanVar(value=True)
+        tk.Checkbutton(root, text="Disable Picking", variable=self.disabled,
+                       command=self.disabled_changed).pack(pady=5)
+        self.status = tk.StringVar(value="Manual Mode: Hold left mouse button to draw a shape.")
+        tk.Label(root, textvariable=self.status, font=("Arial", 8), wraplength=395,
+                 height=3).pack(pady=5)
+        self.model_controls = ttk.Frame(root, padding=(12, 0, 12, 0))
+        row = ttk.Frame(self.model_controls)
+        row.pack(fill="x")
+        ttk.Button(row, text="Select screen area", command=self.select_region).pack(side="left")
+        ttk.Button(row, text="Detect", command=self.detect).pack(side="left", padx=5)
+        ttk.Button(row, text="Advanced…", command=self.open_advanced).pack(side="right")
+        self.region_label = tk.StringVar(value="Select the micrograph area on the screen.")
+        ttk.Label(self.model_controls, textvariable=self.region_label, wraplength=390).pack(anchor="w", pady=4)
+        self.semi_controls = ttk.Frame(self.model_controls)
+        ttk.Button(self.semi_controls, text="Box prompt", command=self.box_prompt).pack(side="left")
+        ttk.Button(self.semi_controls, text="Next alternative", command=self.next_alternative).pack(side="left", padx=5)
+        self.auto_controls = ttk.Frame(self.model_controls)
+        self.frames, self.wait_seconds = tk.IntVar(value=1), tk.DoubleVar(value=5)
+        ttk.Label(self.auto_controls, text="Frames").pack(side="left")
+        ttk.Spinbox(self.auto_controls, from_=1, to=1000, textvariable=self.frames, width=4).pack(side="left", padx=3)
+        ttk.Label(self.auto_controls, text="Wait (s)").pack(side="left")
+        ttk.Spinbox(self.auto_controls, from_=1, to=60, textvariable=self.wait_seconds, width=4).pack(side="left", padx=3)
+        ttk.Button(self.auto_controls, text="Start auto", command=self.start_auto).pack(side="right")
+        self.model_note = ttk.Label(self.model_controls, wraplength=390)
+        self.model_note.pack(anchor="w", pady=5)
+        self.terminate_button = tk.Button(root, text="terminate", width=10, font=("Arial", 10), command=self.close)
+        self.terminate_button.pack(pady=10)
+        self.checkpoint = tk.StringVar(value=str(checkpoint_path))
+        self.model_type = tk.StringVar(value=getattr(self.args, "model_type", "vit_b"))
+        self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
+        self.grid_side = tk.IntVar(value=8)
+        self.click_delay = tk.DoubleVar(value=.08)
+
+    def ensure_overlay(self):
+        if self.overlay is None:
+            self.overlay = ScreenOverlay(self.root)
+        return self.overlay
+
+    def _remember_panel(self):
+        if self.hidden or self.closed:
+            return
+        try:
+            self.panel_bounds = (self.root.winfo_rootx(), self.root.winfo_rooty(),
+                                 self.root.winfo_width(), self.root.winfo_height())
+        except self.tk.TclError:
+            pass
+
+    def _in_panel(self, x, y):
+        if self.panel_bounds is None:
+            self._remember_panel()
+        if self.panel_bounds is None:
+            return False
+        left, top, width, height = self.panel_bounds
+        return left <= x < left + width and top <= y < top + height
+
+    def _mouse_event(self, record):
+        # pynput thread: no Tk calls and no mutable trace access.
+        with self._input_lock:
+            enabled, epoch = self._manual_gate.is_set(), self._mouse_epoch
+        if enabled:
+            kind, x, y = record
+            self.events.put(("mouse", epoch, kind, int(x), int(y)))
+
+    def _hotkey(self, action):
+        if action == "stop":
+            self._emergency_stop.set()
+            self._gate_manual()
+            if self.active_token is not None:
+                self.active_token.cancel()
+        self.events.put(("hotkey", action))
+
+    def _gate_manual(self):
+        with self._input_lock:
+            self._manual_gate.clear()
+            self._mouse_epoch += 1
+
+    def _sync_manual(self):
+        enabled = (self.mode == "manual" and not self.disabled.get() and not self.closed
+                   and self.mouse_observer is not None and self.hotkeys is not None
+                   and self.advanced is None and not self.released
+                   and not self._emergency_stop.is_set()
+                   and (self.drawing or (not self.transition and not self.runner.busy)))
+        with self._input_lock:
+            if enabled:
+                self._manual_gate.set()
+            else:
+                self._manual_gate.clear()
+
+    def _schedule(self, milliseconds, function):
+        generation = self.runner.generation
+        holder = []
+        def invoke():
+            self.scheduled.discard(holder[0])
+            if not self.closed and generation == self.runner.generation and not self._emergency_stop.is_set():
+                try:
+                    function()
+                except Exception as exc:
+                    self._error(exc)
+        holder.append(self.root.after(milliseconds, invoke))
+        self.scheduled.add(holder[0])
+
+    def _close_input(self):
+        if self.input_surface is not None:
+            self.input_surface.close()
+            self.input_surface = None
+        self.input_kind, self.input_start = None, None
+
+    def _hide_all(self, *, keep_mouse=False):
+        if not keep_mouse:
+            self._gate_manual()
+        self._remember_panel()
+        self._close_input()
+        if self.overlay is not None:
+            self.overlay.hide()
+        if self.advanced is not None:
+            self.advanced.withdraw()
+        self.hidden = True
+        self.root.withdraw()
+
+    def _show_panel(self):
+        self.hidden = False
+        # Unlike deiconify(), wm state does not request foreground activation
+        # on Windows. A restored panel must not steal focus during a stroke.
+        self.root.state("normal")
+        if self.advanced is not None:
+            self.advanced.state("normal")
+
+    def _idle(self):
+        if self.advanced is not None:
+            raise RuntimeError("Close model settings before starting a screen operation.")
+        if self.runner.busy or self.transition or self.auto_remaining or self.drawing:
+            raise RuntimeError("An operation is active. Press Escape to stop it first.")
+        if self.input_surface is not None and self.input_kind != "masks":
+            raise RuntimeError("Finish or cancel the screen selection first.")
+
+    def _live_ready(self):
+        if self.disabled.get():
+            raise ValueError("Uncheck Disable Picking to send picks to cryoSPARC.")
+        if self.hotkeys is None or self.mouse_observer is None:
+            raise RuntimeError("Global input hooks are unavailable. Restart the Windows application.")
+        delay = .10 if self.mode == "manual" else float(self.click_delay.get())
+        if not .02 <= delay <= 2:
+            raise ValueError("Click delay must be between 0.02 and 2 seconds.")
+        return delay
+
+    def _error(self, error):
+        SCREEN_LOG.error("Screen operation stopped: %s", error)
+        self.stop(message=str(error))
+        self.candidates, self.alternatives = [], []
+        self.reference = None
+
+    def set_mode(self, mode):
+        if mode not in {"manual", "semi-auto", "auto"}:
+            return
+        self.stop()
+        self.mode = mode
+        self.mode_var.set(mode)
+        self.candidates, self.alternatives = [], []
+        self.reference = self.rgb = None
+        self.picked_points.clear()
+        self.manual_window = None
+        self.semi_controls.pack_forget()
+        self.auto_controls.pack_forget()
+        if mode == "manual":
+            self.model_controls.pack_forget()
+            self.root.geometry("420x320")
+            self.status.set("Manual Mode: Hold left mouse button to draw a shape.")
+        else:
+            self.model_controls.pack(fill="x", before=self.terminate_button)
+            self.root.geometry("420x495")
+            if mode == "semi-auto":
+                self.semi_controls.pack(fill="x", before=self.model_note, pady=3)
+                self.model_note.configure(text="Green outlines are proposals. Click an intended region to pick it.")
+            else:
+                self.auto_controls.pack(fill="x", before=self.model_note, pady=3)
+                self.model_note.configure(text="Auto picks all proposals. Test semi-auto first. Space pauses; Escape stops.")
+            self.status.set("Select the screen area, then detect or start auto.")
+
+    def disabled_changed(self):
+        if self.disabled.get():
+            self.stop()
+            return
+        try:
+            self._live_ready()
+            if self.mode == "manual":
+                self.manual_window = None
+                self.status.set("Manual Mode: Hold left mouse button to draw a shape.")
+                self._sync_manual()
+            elif self.mode == "semi-auto":
+                self._present_masks()
+            else:
+                self.status.set("Auto ready. Select a screen area, then choose Start auto.")
+        except Exception as exc:
+            self._error(exc)
+
+    def _manual_input(self, epoch, kind, x, y):
+        if (epoch != self._mouse_epoch or self.mode != "manual" or self.disabled.get()
+                or not self._manual_gate.is_set()):
+            return
+        if kind == "press":
+            if self.drawing or self.runner.busy or self.transition or self._in_panel(x, y):
+                return
+            try:
+                target = self.desktop.target_at(x, y)
+                if self.desktop.is_own_window(target):
+                    return
+                if self.manual_window is not None and target != self.manual_window:
+                    return
+                if self.desktop.capture_target() != target:
+                    return
+                self.manual_window = target
+                width, height = self.desktop.size()
+                self.manual_geometry = CaptureGeometry(0, 0, width, height)
+                self.trace, self.drawing, self.released = [(x, y)], True, False
+                self.trace_dirty = True
+                self.manual_baseline = None
+                self._hide_all(keep_mouse=True)
+                # A clean baseline is captured before any red overlay is shown.
+                self.transition = True
+                def capture_baseline():
+                    self.transition = False
+                    def work(token):
+                        token.wait_until_ready()
+                        self.desktop.ensure_target(target)
+                        return self.desktop.screenshot()
+                    self._submit("manual baseline", work)
+                self._schedule(70, capture_baseline)
+            except Exception as exc:
+                self._error(exc)
+        elif self.drawing and kind in {"move", "release"}:
+            try:
+                if (self._in_panel(x, y) or not self.manual_geometry.contains(x, y)
+                        or not self.desktop.is_target_at(x, y, self.manual_window)):
+                    self._cancel_trace()
+                    return
+                if kind == "move":
+                    if self.trace[-1] != (x, y):
+                        self.trace.append((x, y))
+                    if len(self.trace) > 50000:
+                        raise ValueError("This trace is too long. Draw a smaller contour.")
+                    self.trace_dirty = True
+                else:
+                    self.released = True
+                    # Gate immediately, even if the baseline worker is pending.
+                    self._gate_manual()
+                    if self.manual_baseline is not None:
+                        self._finish_manual()
+            except Exception as exc:
+                self._error(exc)
+
+    def _cancel_trace(self):
+        self._gate_manual()
+        self.runner.invalidate()
+        self.transition = False
+        self.trace, self.drawing, self.released = [], False, False
+        self.trace_dirty = False
+        self.manual_baseline = None
+        if self.overlay is not None:
+            self.overlay.clear()
+            self.overlay.hide()
+        self._show_panel()
+        self.status.set("Trace cancelled outside the target. Draw the next shape.")
+
+    def _finish_manual(self):
+        self._gate_manual()
+        points, reference = tuple(self.trace), self.manual_baseline
+        target, spacing = self.manual_window, int(self.spacing.get())
+        self._live_ready()
+        delay = .10  # Preserve the original PyAutoGUI default pause in manual mode.
+        self.trace, self.drawing, self.released = [], False, False
+        self.trace_dirty = False
+        self.manual_baseline = None
+        if len(points) < 3:
+            self._show_panel()
+            if self.overlay is not None:
+                self.overlay.clear()
+                self.overlay.hide()
+            self._sync_manual()
+            return
+        self._hide_all()
+        self.transition = True
+        def begin():
+            self.transition = False
+            def work(token):
+                picks = legacy_contour_points(points, spacing, cancel=lambda: token.cancelled)
+                if not len(picks):
+                    return {"count": 0}
+                vertices = np.asarray(points, dtype=np.int64)
+                left, top = vertices.min(axis=0)
+                right, bottom = vertices.max(axis=0)
+                region = CaptureGeometry(int(left), int(top), int(right-left+1), int(bottom-top+1))
+                self.desktop.focus_target(target)
+                token.sleep(.10)
+                if self.desktop.window_under_roi(region) != target:
+                    raise RuntimeError("The contour is covered by another window.")
+                before = reference[region.top:region.top+region.height, region.left:region.left+region.width]
+                current = self.desktop.screenshot(region)
+                if screen_changed_fraction(before, current) > .03:
+                    raise RuntimeError("The micrograph moved while drawing. Draw the contour again.")
+                def click(x, y):
+                    self.desktop.ensure_target(target)
+                    self.desktop.click(x, y)
+                count = play_clicks(picks, click, region, token, delay=delay, max_clicks=10000,
+                                    progress=lambda done, total: self.events.put(("progress", token.generation, done, total)))
+                return {"count": count}
+            self._submit("manual picks", work)
+        self._schedule(70, begin)
+
+    def select_region(self):
+        try:
+            self._idle()
+            if self.mode == "manual":
+                return
+            width, height = self.desktop.size()
+            self._hide_all()
+            bounds = CaptureGeometry(0, 0, width, height)
+            self.input_kind = "region"
+            self.ensure_overlay().clear()
+            self.overlay.show()
+            self.input_surface = InputSurface(self.root, bounds, self._input_press,
+                                              self._input_move, self._input_release,
+                                              on_cancel=self.stop)
+            self.input_surface.show()
+        except Exception as exc:
+            self._error(exc)
+
+    def _input_press(self, x, y):
+        self.input_start = (x, y)
+
+    def _input_move(self, x, y):
+        if self.input_start is None or self.input_kind == "masks":
+            return
+        left, right = sorted((self.input_start[0], x))
+        top, bottom = sorted((self.input_start[1], y))
+        if right > left and bottom > top:
+            if self.input_kind == "region":
+                self.ensure_overlay().draw_region(CaptureGeometry(int(left), int(top), int(right-left), int(bottom-top)))
+            else:
+                self.ensure_overlay().draw_box((left, top, right, bottom))
+
+    def _input_release(self, x, y):
+        if self.input_start is None:
+            return
+        start, kind = self.input_start, self.input_kind
+        if kind == "masks":
+            self.input_start = None
+            # Complete the physical press/release pair while the catcher still
+            # owns it. A drag is not a mask selection.
+            if (x-start[0])**2 + (y-start[1])**2 <= 36:
+                first = screen_mask_at(self.candidates, self.geometry, *start)
+                last = screen_mask_at(self.candidates, self.geometry, x, y)
+                if first is not None and last is not None and first.id == last.id:
+                    self._semi_click(x, y)
+            return
+        bounds = self.geometry if kind == "box" else CaptureGeometry(0, 0, *self.desktop.size())
+        left, right = sorted((max(bounds.left, min(bounds.left+bounds.width-1, int(start[0]))),
+                              max(bounds.left, min(bounds.left+bounds.width-1, int(x)))))
+        top, bottom = sorted((max(bounds.top, min(bounds.top+bounds.height-1, int(start[1]))),
+                              max(bounds.top, min(bounds.top+bounds.height-1, int(y)))))
+        if right-left < (4 if kind == "box" else 32) or bottom-top < (4 if kind == "box" else 32):
+            return
+        self._hide_all()
+        if kind == "box":
+            box = (left-bounds.left, top-bounds.top, right-bounds.left, bottom-bounds.top)
+            self._start_detection(box=box)
+            return
+        region = CaptureGeometry(left, top, right-left+1, bottom-top+1)
+        self.transition = True
+        def complete():
+            self.transition = False
+            target = self.desktop.window_under_roi(region)
+            self.geometry, self.target = region, target
+            self.rgb = self.reference = None
+            self.candidates, self.alternatives = [], []
+            self.picked_points.clear()
+            self.region_label.set(f"Screen area: {region.width} × {region.height} px at {region.left}, {region.top}")
+            self._show_panel()
+            self.status.set("Screen area selected. Choose Detect or draw a Box prompt.")
+        self._schedule(90, complete)
+
+    def _model_config(self):
+        return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
+                                 device=self.device.get(), points_per_side=int(self.grid_side.get()))
+
+    def _get_recognizer(self, config):
+        if self.recognizer is None or self.recognizer_config != config:
+            if self.recognizer is not None:
+                self.recognizer.close()
+            self.recognizer = SamRecognizer(config)
+            self.recognizer_config = config
+        return self.recognizer
+
+    def detect(self):
+        try:
+            self._idle()
+            self._start_detection()
+        except Exception as exc:
+            self._error(exc)
+
+    def _start_detection(self, *, auto=False, box=None, expected=None):
+        if self.geometry is None or self.target is None:
+            raise ValueError("Select the micrograph screen area first.")
+        config, geometry, target = self._model_config(), self.geometry, self.target
+        self._hide_all()
+        self.transition = True
+        def begin():
+            self.transition = False
+            def work(token):
+                self.desktop.focus_target(target)
+                token.sleep(.12)
+                if self.desktop.window_under_roi(geometry) != target:
+                    raise RuntimeError("Another window covers the selected screen area.")
+                rgb = self.desktop.screenshot(geometry)
+                if expected is not None and screen_changed_fraction(expected, rgb) > .01:
+                    raise RuntimeError("The micrograph changed between automatic frames. Auto stopped.")
+                model = self._get_recognizer(config)
+                candidates = (model.prompt(rgb, box=box, cancel=lambda: token.cancelled) if box is not None
+                              else model.automatic(rgb, cancel=lambda: token.cancelled))
+                token.wait_until_ready()
+                self.desktop.ensure_target(target)
+                if screen_changed_fraction(rgb, self.desktop.screenshot(geometry)) > .03:
+                    raise RuntimeError("The micrograph moved during recognition. Detect again.")
+                return {"rgb": rgb, "candidates": candidates, "auto": auto, "prompt": box is not None}
+            self._submit("recognition", work)
+        self._schedule(90, begin)
+
+    def _present_masks(self):
+        self._show_panel()
+        self._close_input()
+        if self.mode == "manual" or self.geometry is None or not self.candidates:
+            return
+        overlay = self.ensure_overlay()
+        overlay.draw_masks(self.candidates, self.geometry, selected_ids=[c.id for c in self.candidates])
+        overlay.show()
+        if (self.mode == "semi-auto" and not self.disabled.get() and not self.runner.busy
+                and not self.transition and self.advanced is None):
+            self.input_kind = "masks"
+            self.input_surface = InputSurface(self.root, self.geometry, self._input_press,
+                                              self._input_move, self._input_release,
+                                              on_cancel=self.stop)
+            self.input_surface.show()
+        self.root.lift()
+        if self.advanced is not None:
+            self.advanced.lift()
+
+    def _semi_click(self, x, y):
+        try:
+            if self.mode != "semi-auto" or self.disabled.get() or self.runner.busy or self.transition:
+                return
+            candidate = screen_mask_at(self.candidates, self.geometry, x, y)
+            if candidate is not None:
+                self._start_model_picks([candidate])
+        except Exception as exc:
+            self._error(exc)
+
+    def box_prompt(self):
+        try:
+            self._idle()
+            if self.mode != "semi-auto" or self.geometry is None:
+                raise ValueError("In semi-auto mode, select the screen area first.")
+            self._hide_all()
+            self.input_kind = "box"
+            self.ensure_overlay().clear()
+            self.overlay.draw_region(self.geometry)
+            self.overlay.show()
+            self.input_surface = InputSurface(self.root, self.geometry, self._input_press,
+                                              self._input_move, self._input_release,
+                                              on_cancel=self.stop)
+            self.input_surface.show()
+        except Exception as exc:
+            self._error(exc)
+
+    def next_alternative(self):
+        if self.mode == "semi-auto" and self.alternatives and not self.runner.busy and not self.transition:
+            self.alternative_index = (self.alternative_index + 1) % len(self.alternatives)
+            self.candidates = [self.alternatives[self.alternative_index]]
+            self._present_masks()
+            self.status.set(f"Alternative {self.alternative_index+1}/{len(self.alternatives)}. Click the region to pick it.")
+
+    def _start_model_picks(self, candidates, *, auto=False):
+        delay = self._live_ready()
+        geometry, target, reference = self.geometry, self.target, self.reference
+        if geometry is None or target is None or reference is None:
+            raise ValueError("Detect the selected screen area before picking.")
+        candidates, picked = tuple(candidates), set(self.picked_points)
+        spacing, frame_id = int(self.spacing.get()), self.frame_id
+        self._hide_all()
+        self.transition = True
+        def begin():
+            self.transition = False
+            def work(token):
+                local, screen = screen_model_points(candidates, geometry, spacing, picked,
+                                                     cancel=lambda: token.cancelled)
+                if not len(screen):
+                    raise ValueError("This region has no new pick positions at the current spacing.")
+                self.desktop.focus_target(target)
+                token.sleep(.12)
+                if self.desktop.window_under_roi(geometry) != target:
+                    raise RuntimeError("Another window covers the micrograph.")
+                if screen_changed_fraction(reference, self.desktop.screenshot(geometry)) > .03:
+                    raise RuntimeError("The micrograph changed before picking. Detect again.")
+                background = screen_background_guard(candidates, geometry, spacing)
+                next_check = time.monotonic() + .75
+                def click(x, y):
+                    nonlocal next_check
+                    self.desktop.ensure_target(target)
+                    if background is not None and time.monotonic() >= next_check:
+                        current = self.desktop.screenshot(geometry)
+                        if screen_background_changed(reference, current, background) > .03:
+                            raise RuntimeError("The micrograph changed during picking. Detect again.")
+                        next_check = time.monotonic() + .75
+                    self.desktop.click(x, y)
+                def progress(done, total):
+                    self.events.put(("picked", token.generation, frame_id,
+                                     tuple(map(int, local[done-1])), done, total))
+                count = play_clicks(screen, click, geometry, token, delay=delay,
+                                    max_clicks=10000, progress=progress)
+                token.sleep(.12)
+                self.desktop.ensure_target(target)
+                after = self.desktop.screenshot(geometry)
+                if background is not None and screen_background_changed(reference, after, background) > .03:
+                    raise RuntimeError("The micrograph changed during picking. Detect again.")
+                return {"count": count, "ids": {c.id for c in candidates}, "reference": after,
+                        "auto": auto, "scene_verified": background is not None}
+            self._submit("model picks", work)
+        self._schedule(90, begin)
+
+    def start_auto(self):
+        try:
+            self._idle()
+            if self.mode != "auto":
+                return
+            self._live_ready()
+            count, wait = int(self.frames.get()), float(self.wait_seconds.get())
+            if not 1 <= count <= 1000 or not 1 <= wait <= 60:
+                raise ValueError("Choose 1–1000 frames and a load wait of 1–60 seconds.")
+            self.auto_remaining, self.auto_history, self.paused = count, [], False
+            self.hotkeys.enable_space_pause(True)
+            self._start_detection(auto=True)
+        except Exception as exc:
+            self._error(exc)
+
+    def _next_frame(self):
+        geometry, target = self.geometry, self.target
+        wait, history = float(self.wait_seconds.get()), tuple(self.auto_history)
+        self._hide_all()
+        def work(token):
+            self.desktop.focus_target(target)
+            token.wait_until_ready()
+            self.desktop.press_next("down")
+            token.sleep(wait)
+            first = self.desktop.screenshot(geometry)
+            token.sleep(.35)
+            second = self.desktop.screenshot(geometry)
+            if screen_changed_fraction(first, second) > .01:
+                raise RuntimeError("The next micrograph is still loading. Increase the wait time.")
+            if any(screen_changed_fraction(previous, second) < .02 for previous in history):
+                raise RuntimeError("The micrograph did not change or a recent image reappeared. Auto stopped.")
+            return second
+        self._submit("next frame", work)
+
+    def _submit(self, kind, function):
+        token = CancellationToken(self.runner.generation)
+        if self.paused:
+            token.pause()
+        self.active_token = token
+        if self._emergency_stop.is_set():
+            token.cancel()
+            raise CancelledOperation("Stop requested.")
+        try:
+            self.runner.submit(function, token=token)
+        except Exception:
+            self.active_token = None
+            raise
+        self.job_kind = kind
+        self.status.set(f"{kind.capitalize()}… Escape stops.")
+
+    def _result(self, kind, value):
+        if kind == "manual baseline":
+            if not self.drawing:
+                return
+            self.manual_baseline = value
+            if self.released:
+                self._finish_manual()
+            else:
+                self._show_panel()
+                self.ensure_overlay().draw_trace(self.trace)
+                self.overlay.show()
+                self.trace_dirty = False
+        elif kind == "manual picks":
+            if self.overlay is not None:
+                self.overlay.clear()
+                self.overlay.hide()
+            self._show_panel()
+            self.status.set(f"{value['count']} picks placed. Hold left mouse button to draw the next shape.")
+        elif kind == "recognition":
+            same_scene = self.reference is not None and screen_changed_fraction(self.reference, value["rgb"]) < .02
+            if not same_scene or value["auto"]:
+                self.picked_points.clear()
+            self.rgb = value["rgb"]
+            self.reference = self.rgb.copy()
+            self.frame_id += 1
+            self.alternatives = list(value["candidates"]) if value["prompt"] else []
+            self.alternative_index = 0
+            self.candidates = self.alternatives[:1] if value["prompt"] else list(value["candidates"])
+            if value["auto"]:
+                if not self.candidates:
+                    raise RuntimeError("No proposals found. Auto stopped for review.")
+                self.auto_history = (self.auto_history + [self.reference.copy()])[-20:]
+                self._start_model_picks(self.candidates, auto=True)
+            else:
+                self._present_masks()
+                if self.candidates:
+                    self.status.set(f"{len(self.candidates)} proposals. " + ("Uncheck Disable Picking to select on screen." if self.disabled.get()
+                                    else "Click an intended green region to pick it."))
+                else:
+                    self.status.set("No proposals. Try a tight Box prompt around a target.")
+        elif kind == "model picks":
+            if not value.get("scene_verified", True):
+                self.stop(message=f"{value['count']} picks placed. Too little unchanged background to verify alignment; select a larger area and Detect again.")
+                self.candidates, self.alternatives = [], []
+                self.reference = self.rgb = None
+                return
+            self.reference = value["reference"]
+            self.candidates = [c for c in self.candidates if c.id not in value["ids"]]
+            self.alternatives = []
+            if value["auto"]:
+                self.auto_history = (self.auto_history + [self.reference.copy()])[-20:]
+                self.auto_remaining -= 1
+                if self.auto_remaining:
+                    self._next_frame()
+                else:
+                    self.paused = False
+                    self.hotkeys.enable_space_pause(False)
+                    self._show_panel()
+                    self.status.set("Auto finished. Review the picks in cryoSPARC.")
+            else:
+                self._present_masks()
+                self.status.set(f"{value['count']} picks placed. Click another green region or detect again.")
+        elif kind == "next frame":
+            self.picked_points.clear()
+            self.reference = self.rgb = value
+            self._start_detection(auto=True, expected=value)
+
+    def pause(self):
+        if not self.runner.busy and not self.transition and not self.auto_remaining:
+            return
+        self.paused = not self.paused
+        if self.active_token is not None:
+            self.active_token.pause() if self.paused else self.active_token.resume()
+        self.status.set("Paused. Space/F8 resumes; Escape stops." if self.paused else "Resumed.")
+
+    def stop(self, *, message=None):
+        self._gate_manual()
+        self.runner.invalidate()
+        for identifier in tuple(self.scheduled):
+            self.root.after_cancel(identifier)
+        self.scheduled.clear()
+        self.transition = False
+        self.auto_remaining, self.paused = 0, False
+        self.drawing = self.released = False
+        self.trace, self.manual_baseline, self.manual_window = [], None, None
+        self.trace_dirty = False
+        self._close_input()
+        if self.overlay is not None:
+            self.overlay.clear()
+            self.overlay.hide()
+        if self.hotkeys is not None:
+            self.hotkeys.enable_space_pause(False)
+        self.disabled.set(True)
+        self._emergency_stop.clear()
+        self._show_panel()
+        self.status.set(message or "Picking disabled. Uncheck Disable Picking when ready.")
+
+    def poll(self):
+        if self.closed:
+            return
+        try:
+            for _ in range(4000):
+                item = self.events.get_nowait()
+                if item[0] == "mouse":
+                    self._manual_input(*item[1:])
+                elif item[0] == "hotkey":
+                    if item[1] == "stop":
+                        self.stop()
+                    elif item[1] == "pause" or (item[1] == "space_pause" and self.auto_remaining):
+                        self.pause()
+                elif item[0] == "progress" and item[1] == self.runner.generation:
+                    self.status.set(f"Picking: {item[2]} / {item[3]}. Escape stops.")
+                elif item[0] == "picked":
+                    if item[2] == self.frame_id:
+                        self.picked_points.add(item[3])
+                    if item[1] == self.runner.generation:
+                        self.status.set(f"Picking: {item[4]} / {item[5]}. Escape stops.")
+        except queue.Empty:
+            pass
+        for result in self.runner.poll_results():
+            kind = self.job_kind
+            self.active_token = None
+            if result.error is not None or result.cancelled:
+                if result.traceback_text:
+                    SCREEN_LOG.error("%s", result.traceback_text)
+                self._error("Cancelled." if result.cancelled or isinstance(result.error, (Cancelled, CancelledOperation)) else result.error)
+                continue
+            try:
+                self._result(kind, result.value)
+            except Exception as exc:
+                SCREEN_LOG.exception("Screen result handling failed")
+                self._error(exc)
+        if self.drawing and self.manual_baseline is not None and self.trace_dirty:
+            try:
+                self.ensure_overlay().draw_trace(self.trace)
+                if not self.overlay.visible:
+                    self.overlay.show()
+                self.trace_dirty = False
+            except Exception as exc:
+                self._error(exc)
+        self._sync_manual()
+        self.root.after(30, self.poll)
+
+    def open_advanced(self):
+        try:
+            if self.advanced is not None:
+                self.advanced.lift()
+                return
+            self._idle()
+            self._gate_manual()
+            self._close_input()
+            window = self.tk.Toplevel(self.root)
+            self.advanced = window
+            window.title("SARU Picker — model settings")
+            window.attributes("-topmost", True)
+            window.resizable(False, False)
+            frame = self.ttk.Frame(window, padding=12)
+            frame.pack(fill="both", expand=True)
+            self.ttk.Label(frame, text="SAM checkpoint").grid(row=0, column=0, sticky="w")
+            self.ttk.Entry(frame, textvariable=self.checkpoint, width=48).grid(row=1, column=0, columnspan=2, sticky="ew")
+            def browse():
+                path = self.filedialog.askopenfilename(parent=window, filetypes=[("SAM checkpoint", "*.pth")])
+                if path:
+                    self.checkpoint.set(path)
+                    for model_type in ("vit_b", "vit_l", "vit_h"):
+                        if model_type in Path(path).name:
+                            self.model_type.set(model_type)
+                            break
+            self.ttk.Button(frame, text="Browse…", command=browse).grid(row=1, column=2, padx=4)
+            for index, (label, variable, values) in enumerate((("Device", self.device, ("auto", "cpu", "cuda")),
+                                                               ("Model type", self.model_type, ("vit_b", "vit_l", "vit_h"))), 2):
+                self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
+                self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=10).grid(row=index, column=1)
+            for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
+                                                                        ("Click delay (seconds)", self.click_delay, .02, 2, .01)), 4):
+                self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
+                self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
+            def close_settings():
+                window.destroy()
+                self.advanced = None
+                self._gate_manual()
+                self._sync_manual()
+                if self.mode == "semi-auto":
+                    self._present_masks()
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=6, column=0, columnspan=3, pady=(10, 0))
+            window.protocol("WM_DELETE_WINDOW", close_settings)
+        except Exception as exc:
+            self._error(exc)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self._gate_manual()
+        self.runner.shutdown(wait=False)
+        for identifier in tuple(self.scheduled):
+            self.root.after_cancel(identifier)
+        self.scheduled.clear()
+        if self.mouse_observer is not None:
+            self.mouse_observer.stop()
+        if self.hotkeys is not None:
+            self.hotkeys.stop()
+        self._close_input()
+        if self.overlay is not None:
+            self.overlay.close()
+        if self.advanced is not None:
+            self.advanced.destroy()
+        self.root.destroy()
 
 
 # ---------------- app.py ----------------
@@ -1309,7 +3034,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -1441,20 +3166,27 @@ def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
     try:
         window.withdraw()
         args = argparse.Namespace(checkpoint=None, device="cpu", model_type="vit_b", image=None)
-        picker = PickerApp(window, args, log_path, start_hotkeys=False)
-        rgb = np.zeros((64, 96, 3), dtype=np.uint8)
-        rgb[:] = (85, 105, 125)
-        picker._set_image(rgb, description="Packaging smoke image")
-        mask = np.zeros(rgb.shape[:2], dtype=bool)
-        mask[12:52, 20:76] = True
-        picker._add_candidate(make_candidate(mask, source="smoke-test"), select=True)
+        picker = ScreenPickerApp(window, args, log_path, resolve_checkpoint(), start_listeners=False)
+        if (picker.mode != "manual" or not picker.disabled.get()
+                or picker.hotkeys is not None or picker.mouse_observer is not None
+                or picker.overlay is not None):
+            raise RuntimeError("The compact screen application did not start in passive manual mode.")
+        panel_layouts = {}
+        for mode in ("manual", "semi-auto", "auto"):
+            if picker.mode != mode:
+                picker.set_mode(mode)
+            window.state("normal")
+            window.update_idletasks()
+            width, height = window.winfo_width(), window.winfo_height()
+            button_bottom = picker.terminate_button.winfo_rooty() + picker.terminate_button.winfo_height()
+            if width != 420 or (mode == "manual" and height != 320):
+                raise RuntimeError("The original compact manual panel dimensions changed.")
+            if button_bottom > window.winfo_rooty() + height:
+                raise RuntimeError(f"The {mode} controls do not fit inside the floating panel.")
+            panel_layouts[mode] = [width, height]
+        window.withdraw()
         window.update_idletasks()
-        picker.render()
-        window.update_idletasks()
-        if (not picker.canvas.find_all() or not hasattr(picker, "photo")
-                or picker.photo.width() < 1 or picker.photo.height() < 1
-                or len(picker.table.get_children()) != 1 or picker.hotkeys is not None):
-            raise RuntimeError("The packaged application did not construct and render its review interface.")
+        overlay_checks = verify_screen_overlay(window)
         tk_version = str(window.tk.call("info", "patchlevel"))
     finally:
         if picker is not None:
@@ -1468,6 +3200,8 @@ def _smoke_windows_runtime(log_path: Path) -> dict[str, Any]:
         raise RuntimeError("Desktop dependencies are incomplete.")
     return {"tk_version": tk_version, "desktop_modules_imported": True,
             "full_application_constructed": True, "synthetic_mask_rendered": True,
+            "compact_manual_default": True, "panel_layouts": panel_layouts,
+            "screen_overlay": overlay_checks,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 
 
@@ -2496,8 +4230,9 @@ class PickerApp:
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="SARU Picker: prompted SAM and reviewed mask sampling.")
-    parser.add_argument("--image", help="Open an image in the GUI.")
+    parser = argparse.ArgumentParser(description="SARU Picker: manual and model-assisted picking directly over cryoSPARC.")
+    parser.add_argument("--review", action="store_true", help="Open the optional snapshot review editor instead of the screen overlay.")
+    parser.add_argument("--image", help="Open an image in the optional offline review editor.")
     parser.add_argument("--checkpoint", help="Explicit original SAM checkpoint (.pth); otherwise use the bundled model.")
     parser.add_argument("--model-type", choices=("vit_b", "vit_l", "vit_h"), default="vit_b")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -2564,7 +4299,10 @@ def _run_application(args, *, console_available: bool) -> int:
         enable_dpi_awareness()
         import tkinter as tk
         root = tk.Tk()
-        PickerApp(root, args, log_path)
+        if args.review or args.image:
+            PickerApp(root, args, log_path)
+        else:
+            ScreenPickerApp(root, args, log_path, checkpoint)
         root.mainloop()
         return 0
     except Exception as exc:

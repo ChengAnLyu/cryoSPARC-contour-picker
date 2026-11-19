@@ -1,6 +1,7 @@
 """Desktop regressions with in-memory backends; never touch the real screen."""
 
 from types import SimpleNamespace
+import os
 import unittest
 from unittest.mock import patch
 
@@ -77,6 +78,9 @@ class FakeWindows:
     def primary_size(self):
         return 800, 600
 
+    def process_id(self, handle):
+        return os.getpid() if handle == 22 else os.getpid() + 1
+
 
 class DesktopTests(unittest.TestCase):
     def setUp(self):
@@ -126,6 +130,23 @@ class DesktopTests(unittest.TestCase):
         self.windows.region_window = lambda x, y: 11 if x < 40 else 22
         with self.assertRaises(DesktopError):
             self.adapter.window_under_roi(region)
+
+    def test_manual_target_is_resolved_at_the_pointer_without_changing_focus(self):
+        self.windows.current = 22
+        self.assertEqual(self.adapter.target_at(20, 30), 11)
+        self.assertEqual(self.windows.current, 22)
+        self.assertTrue(self.adapter.is_target_at(20, 30, 11))
+        self.windows.region_window = lambda x, y: 22
+        self.assertFalse(self.adapter.is_target_at(20, 30, 11))
+        self.assertFalse(self.adapter.is_target_at(-1, 30, 11))
+        with self.assertRaises(DesktopError):
+            self.adapter.target_at(800, 30)
+
+    def test_own_windows_are_identified_without_sending_input(self):
+        self.assertTrue(self.adapter.is_own_window(22))
+        self.assertFalse(self.adapter.is_own_window(11))
+        self.assertEqual(self.backend.clicks, [])
+        self.assertEqual(self.backend.keys, [])
 
     def test_click_requires_captured_focused_target(self):
         with self.assertRaises(DesktopError):
@@ -216,6 +237,45 @@ class HotkeyTests(unittest.TestCase):
         listener.on_press("esc")
         self.assertEqual(self.events, ["stopped"])
         self.hotkeys.stop()  # Idempotent cleanup.
+
+    def test_space_is_consumed_only_during_auto_and_release_is_paired(self):
+        suppressed = []
+        holder = []
+        def factory(**callbacks):
+            listener = SimpleNamespace(**callbacks, start=lambda: None, stop=lambda: None,
+                                       suppress_event=lambda: suppressed.append(True))
+            holder.append(listener)
+            return listener
+        hotkeys = GlobalHotkeys(self.events.append, listener_factory=factory,
+                                key_enum=SimpleNamespace(esc="esc", f8="f8"),
+                                platform_name="Windows", space_pause=True)
+        hotkeys.start()
+        filt = holder[0].win32_event_filter
+        space = SimpleNamespace(vkCode=0x20, flags=0)
+        self.assertTrue(filt(0x0100, space))
+        self.assertTrue(filt(0x0101, space))
+        self.assertEqual(self.events, [])
+        hotkeys.enable_space_pause(True)
+        self.assertFalse(filt(0x0100, space))
+        self.assertFalse(filt(0x0100, space))
+        self.assertEqual(self.events, ["space_pause"])
+        hotkeys.enable_space_pause(False)
+        self.assertFalse(filt(0x0101, space))
+        self.assertEqual(len(suppressed), 3)
+        self.assertTrue(filt(0x0100, space))
+        # Starting auto while an ordinary Space press is held must not take
+        # ownership of its repeat or release from the underlying browser.
+        hotkeys.enable_space_pause(True)
+        self.assertTrue(filt(0x0100, space))
+        self.assertTrue(filt(0x0101, space))
+        self.assertFalse(filt(0x0100, space))
+        self.assertFalse(filt(0x0101, space))
+        self.assertEqual(self.events, ["space_pause", "space_pause"])
+        self.assertTrue(filt(0x0100, SimpleNamespace(vkCode=0x41, flags=0)))
+        hotkeys.enable_space_pause(True)
+        self.assertTrue(filt(0x0100, SimpleNamespace(vkCode=0x20, flags=0x10)))
+        self.assertEqual(self.events, ["space_pause", "space_pause"])
+        hotkeys.stop()
 
 
 class DpiTests(unittest.TestCase):

@@ -1,87 +1,95 @@
-# SARU Picker 2
+# SARU Picker 2.1
 
-Review segmentation masks on a captured image, then place a hexagonal grid of picks in cryoSPARC.
+SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the image viewer, with its existing layout and controls. A compact, always-on-top **SARU PICKER** panel selects manual, semi-auto, or auto mode.
 
-## Windows desktop application
+## Windows application
 
-The Windows CPU build creates **`SARU-Picker-Setup-2.0.0-win64.exe`** with Python, dependencies, and the SAM ViT-B model included. Once that build has passed its installation checks, users can install it and open **SARU Picker** from the Start menu without setting up Python or model files. See [Windows application instructions](WINDOWS_APP.md) and [build instructions](packaging/README.md). The build workflow uploads a verified installer as a GitHub Actions artifact; it does not publish a release automatically.
+The CPU installer is named **SARU-Picker-Setup-2.1.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
 
-The source application is also available as **`main.py`**: put it alongside `sam_vit_b_01ec64.pth`, or select that checkpoint using Browse. Modular source and regression tests are included for development.
+Version 2.1 restores the original direct-screen workflow. The earlier version 2.0 opened a separate snapshot editor by default; that editor is now optional.
 
-The workflow now uses a **snapshot preview**. Manual drawing and SAM prompts happen in that preview; they do not send mouse clicks to cryoSPARC. Actual picking is a separate action after mask review. Original SAM generates segmentation proposals; it has not been trained here to classify the intended inner capsid region.
+## Manual mode — original interaction
 
-## Running from Python source
+1. Keep cryoSPARC's picking view on the primary Windows monitor.
+2. Choose **manual** and uncheck **Disable Picking**.
+3. Hold the left mouse button and draw a contour directly over the micrograph. A red outline follows the pointer.
+4. Release the button. The app fills the contour with picks in cryoSPARC and becomes ready for the next contour.
 
-Use 64-bit Python **3.12** with Tcl/Tk support. The application syntax requires Python 3.10 or later. Windows desktop playback and CUDA execution still require validation on the user's computer; installer smoke tests exercise the interface and synthetic inference without controlling cryoSPARC.
+Manual mode requires no screen-area selection, model, image import, mask acceptance, or separate pick button. The original panel controls remain: the three mode buttons, **Particle spacing** slider (5–25 screen pixels, default 13), **Disable Picking**, status, and **terminate**.
 
-In a Windows terminal opened in the extracted folder:
+Manual pick placement preserves the original contour bounding-box origin, integer hexagonal row spacing, alternating half-spacing offset, polygon boundary rule, zero inset, and approximately 0.10-second click cadence. The implementation now uses a worker and queued drawing events to keep the panel responsive. Generated clicks are excluded from the contour listener.
+
+## Semi-auto mode
+
+1. Choose **semi-auto**.
+2. Use **Select screen area** and drag around the micrograph on the actual screen. Keep browser toolbars and other controls outside this area.
+3. Choose **Detect**. The model reads a clean screenshot internally and draws green proposal outlines over cryoSPARC.
+4. Uncheck **Disable Picking** when ready. Click inside an intended green region. After the mouse button is released, the overlay hides and the app places the picks directly into cryoSPARC.
+5. Select another proposal, or run **Detect** again on the current view.
+
+Use **Box prompt** to drag a tight box around an intended region directly on screen. **Next alternative** cycles the model's alternatives; click the displayed region to pick it. Prompting does not require a separate image editor.
+
+The model uses the selected screen area, replacing the original hardcoded MICRO_REGION. Mask-interior selection respects holes and disconnected components. Model modes sample the union of accepted masks with a two-pixel inset and avoid repeating grid positions already picked in the same capture.
+
+## Auto mode
+
+Choose **auto**, select the screen area, set **Frames** and **Wait (s)**, uncheck **Disable Picking**, and choose **Start auto**. One frame is the default. For additional frames, the app picks the current proposals, sends **Down** to the captured cryoSPARC window, waits, and checks that a new stable image appeared.
+
+Auto mode accepts all model proposals. Original SAM has not been trained here to recognize the intended inner capsid region. Check representative images in semi-auto mode before using an automatic run.
+
+The app stops on errors, empty proposals, changed or repeated images, lost target focus, or insufficient stable background to verify remaining masks. Image-change checks are heuristics, not image registration. Keep the image zoom and position fixed during recognition and picking.
+
+## Screen controls and behavior
+
+- **Escape** disables picking and cancels active or pending work.
+- **Space** pauses/resumes an active auto run. Its press/release pair is consumed only during that run so it cannot scroll the browser underneath the picks.
+- **F8** is an additional pause/resume key.
+- **Disable Picking** removes the input-catching layer so cryoSPARC receives ordinary interaction again.
+- **terminate** closes the application and its listeners.
+
+Visible annotations are passive. A separate, nearly transparent input surface catches ROI selection, box prompts, and semi-auto mask clicks. All picker windows are hidden before screenshots and generated clicks. The underlying screen is never replaced by a required snapshot editor.
+
+Live control currently supports the primary Windows monitor. Moving the micrograph or changing zoom requires a fresh detection. Up to 10,000 generated clicks are allowed per operation. Cancellation is checked between clicks; an active native model forward pass must finish before its cancelled result can be discarded.
+
+## Model settings
+
+**Advanced…** in model modes exposes checkpoint selection, model type, CPU/CUDA device selection, automatic proposal grid density, and model-mode click delay. The installer supplies the checkpoint automatically and contains CPU PyTorch. A source installation can use a compatible CUDA PyTorch build.
+
+The model and image embeddings are reused where possible. Packaging and the restored screen workflow do not train the recognition model or establish biological recognition accuracy.
+
+## Running from source
+
+Use Python 3.12 x64 with Tcl/Tk and Git. Create a virtual environment and install:
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-For **CPU inference**, the torch/torchvision combination exercised in offline validation is:
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
-```
-
-For an NVIDIA GPU, install the matching CUDA torch/torchvision pair from the [official PyTorch selector](https://pytorch.org/get-started/locally/) instead of the CPU command. Keep both packages from the same installation source. Official paired CPU commands are also listed in [PyTorch's version instructions](https://pytorch.org/get-started/previous-versions/).
-
-Install original SAM and launch:
-
-```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-sam.txt
 .\.venv\Scripts\python.exe main.py
 ```
 
-Git must be available on PATH for the pinned SAM requirement. It uses the [official original SAM repository](https://github.com/facebookresearch/segment-anything), fixed at commit `dca509fe793f601edb92606367a655c15ac00fdf`. The weights are not included in this code bundle; reuse the supplied `sam_vit_b_01ec64.pth`. Choose model type `vit_b`. SAM2 or micro-sam2 checkpoints require different loading code.
+The source distribution does not include the large checkpoint. Put sam_vit_b_01ec64.pth beside main.py or select it in Advanced. The [official SAM source](https://github.com/facebookresearch/segment-anything) is pinned by requirements-sam.txt.
 
-In an existing environment, `python main.py` starts the standalone file. Developers can instead run `python app.py` from this folder. Manual drawing and offline review do not require loading SAM. If Tkinter is unavailable, install Python with Tcl/Tk support; `python -m tkinter` should open its demonstration window.
+## Optional offline tools
 
-## Capture, segment, and review
+`python main.py --review` opens the separate snapshot editor. `--image my_micrograph.png` opens an image there for offline work. These are optional; ordinary launching uses the screen overlay.
 
-1. Open cryoSPARC's picking view on the **primary Windows monitor**. Set its image position and zoom.
-2. Click **Select screen region (3 s)**. Activate cryoSPARC during the countdown, then drag around the micrograph on the captured desktop. Recapture uses the same region. An image opened with **Open image** supports offline analysis only. Use a display-ready 8-bit export; raw 16-bit and floating-point images are rejected instead of silently clipping their intensity values.
-3. Choose **Manual contour** to trace a region in the preview, or **Box around target** to draw a tight box around an intended inner region. Add **Foreground point (+)** or **Background point (−)** prompts as needed; right-click also adds a negative point.
-4. Click **Segment prompt**. Review the yellow preview, use **Next alternative** if necessary, and click **Accept mask** for the intended region. Repeat for other regions.
-5. **Generate automatic proposals** offers unclassified masks. Select or deselect them in the table or with the selection tool. Green means selected; yellow means a proposal. A high predicted IoU estimates mask quality, not confidence that it is a capsid.
-
-The worker reuses the loaded model and caches the image embedding for repeated prompts. Device `auto` chooses CUDA when available, otherwise CPU. The default automatic proposal grid is 8 per side; increasing it may recover missed objects but adds work.
-
-## Sampling and live playback
-
-Spacing defaults to **13 captured-image pixels**, with a **2-pixel boundary inset**. Resizing the preview does not change that spacing. The grid samples the union of selected bitmap masks, preserving holes and avoiding duplicate points from overlapping masks. Coordinates are screen/capture pixels, without physical pixel-size calibration.
-
-Review the point count, enable **live desktop clicks**, and choose **Pick selected masks**. Live playback requires a fresh screen capture and working global hotkeys. Opened image files cannot send desktop clicks. The application hides its preview, focuses the captured window, checks for image drift, and verifies target focus during playback. Keep cryoSPARC's image position and zoom fixed: drift checks are a heuristic, not image registration.
-
-Click delay defaults to **0.08 seconds**. PyAutoGUI's additional default pause is disabled so this setting controls timing; its corner fail-safe remains enabled. Each operation is limited to **10,000 grid points**. Increase spacing or reduce the selection if the limit is exceeded. The preview draws at most the first 3,000 points but reports the full count.
-
-**F8 pauses/resumes; Escape stops.** Cancellation is checked between clicks and during waits. An active native model forward pass cannot be interrupted immediately; its result is discarded after cancellation. Errors stop the run rather than silently advancing. Review and save the resulting picks using cryoSPARC.
-
-## Optional automatic batch
-
-After checking proposals on representative images, enable **Accept all automatic proposals**, choose a finite frame count and load delay, then select **Run bounded auto batch**. This explicitly accepts the model's proposals without reviewing each frame. The current next-image key is **Down**. The run stops on errors, no candidates, unstable loading, or a detected unchanged/recently repeated image. It is not evidence of reliable target recognition.
-
-## Exports and offline command line
-
-**Export image, masks and points** writes an aligned clean image, union mask, separate masks, `points.csv`, and `review.json`. Selection metadata records user review, not expert-verified ground truth. CSV columns are capture pixels and, for screen captures, corresponding screen pixels. These are not calibrated micrograph coordinates or direct cryoSPARC `.cs` imports. Export accepted masks before playback, which marks them as already picked.
-
-Example headless segmentation of an 8-bit micrograph export, using a box in input-image pixel coordinates:
+Headless segmentation remains available, with no desktop input:
 
 ```powershell
-python main.py --segment-image my_micrograph.png --checkpoint sam_vit_b_01ec64.pth --device cpu --box 195 120 370 265 --output example_result
+python main.py --segment-image my_micrograph.png --checkpoint sam_vit_b_01ec64.pth --device cpu --box 195 120 370 265 --output result
 ```
 
-Add repeatable point prompts such as `--point 290 190 1` or `--point 185 230 0`. Coordinates refer to the input image. CLI output uses the highest predicted-IoU prompted alternative, or all automatic proposals when no prompts are provided. It is explicitly **unreviewed** and sends no desktop events.
+Exports are bitmap masks and capture/screen pixel coordinates, not calibrated micrograph coordinates or direct cryoSPARC .cs imports.
 
-## Diagnostics and development
+## Validation and diagnostics
 
 ```powershell
-python main.py --diagnostics
 python -m unittest discover -s tests
+python main.py --diagnostics --report diagnostics.json
 ```
 
-Run tests from this folder with the environment's Python. Logs rotate in `%LOCALAPPDATA%\SARU_Picker\saru_picker.log` on Windows and `~/.saru_picker/saru_picker.log` elsewhere (`~` is the user's home directory). Include diagnostics and the relevant log when reporting a failure. The tested core dependency versions were NumPy 2.3.5, Pillow 13.0.0, and SciPy 1.17.0; the requirement ranges are compatibility bounds, not a claim that every combination was exercised. Improving automatic target recognition requires representative expert labels and evaluation on held-out micrographs.
+The Windows build tests the compact panel, native overlay hit testing, image processing, compiled torchvision operations, and real synthetic SAM inference. It then installs, tests, and uninstalls the package. These checks use synthetic windows and images and send no clicks or keys to cryoSPARC. Live picking alignment still needs a check on the intended workstation.
+
+Logs are in %LOCALAPPDATA%\SARU_Picker on Windows and ~/.saru_picker elsewhere. The build and dependency manifest records the exact installer inputs.

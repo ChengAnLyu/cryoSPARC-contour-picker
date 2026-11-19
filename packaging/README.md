@@ -3,7 +3,7 @@
 This directory turns the source into an installed Windows x64 application. The
 installer includes the Python interpreter, Tcl/Tk, CPU PyTorch/torchvision,
 desktop automation libraries, and the original SAM ViT-B weights. End users
-install `SARU-Picker-Setup-2.0.0-win64.exe` and open **SARU Picker** from the Start
+install `SARU-Picker-Setup-2.1.0-win64.exe` and open **SARU Picker** from the Start
 menu or desktop shortcut. The installed application does not download models.
 
 The source archive is not itself an installer. A successful Windows workflow
@@ -81,7 +81,7 @@ Microsoft runtime DLLs and torch's OpenMP dependencies; missing DLLs fail the
 build even if the build machine has a global runtime installation.
 
 The executable's `--smoke-test --report <absolute-path>` command checks image
-processing, torchvision's native NMS operation, a hidden Tk window, Windows
+processing, torchvision's native NMS operation, the compact panel, native screen-overlay hit testing, Windows
 desktop imports, and a real CPU SAM inference using a synthetic image. It sends
 no mouse clicks or keyboard input. Both the exit code and the individual JSON
 check results must pass. Its purpose is deployment validation, not measurement
@@ -122,7 +122,7 @@ acceptance test until those steps have actually been completed.
 Build outputs:
 
 - `dist/SARU_Picker/`: full portable application directory.
-- `artifacts/SARU-Picker-Setup-2.0.0-win64.exe`: Windows installer.
+- `artifacts/SARU-Picker-Setup-2.1.0-win64.exe`: Windows installer.
 - `artifacts/frozen-smoke-test.json`: frozen application validation.
 - `artifacts/installed-smoke-test.json`: installation validation when requested.
 - `artifacts/build-manifest.json`: versions, source commit, and model checksum.

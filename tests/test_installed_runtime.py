@@ -231,7 +231,7 @@ class SmokeAndLaunchTests(unittest.TestCase):
         with patch.dict(sys.modules, {"tkinter": tkinter}), \
              patch.object(app, "setup_logging", return_value=Path("app.log")), \
              patch.object(app, "enable_dpi_awareness"), \
-             patch.object(app, "PickerApp", side_effect=RuntimeError("initialization failed")), \
+             patch.object(app, "ScreenPickerApp", side_effect=RuntimeError("initialization failed")), \
              patch.object(app, "show_startup_error") as dialog, \
              self.assertLogs("saru_picker", level="ERROR"):
             result = app.main([])
