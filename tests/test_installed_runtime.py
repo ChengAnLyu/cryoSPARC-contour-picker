@@ -31,7 +31,7 @@ class RuntimePathTests(unittest.TestCase):
                 with patch.object(sys, "frozen", True, create=True), \
                      patch.object(sys, "_MEIPASS", str(bundle), create=True), \
                      patch.object(sys, "executable", str(base / "installed" / "SARU Picker.exe")):
-                    self.assertEqual(app.resolve_checkpoint(), model)
+                    self.assertEqual(app.resolve_checkpoint().resolve(), model.resolve())
             finally:
                 os.chdir(previous)
 
@@ -52,13 +52,15 @@ class RuntimePathTests(unittest.TestCase):
             base = Path(directory)
             model = base / app.DEFAULT_CHECKPOINT
             model.write_bytes(b"sidecar")
+            # Windows temp directories may use an 8.3 alias such as RUNNER~1.
+            # Compare canonical locations while still requiring the exact file.
             with patch.object(sys, "frozen", False, create=True), \
                  patch.object(app, "__file__", str(base / "app.py")):
-                self.assertEqual(app.resolve_checkpoint(), model)
+                self.assertEqual(app.resolve_checkpoint().resolve(), model.resolve())
             with patch.object(sys, "frozen", True, create=True), \
                  patch.object(sys, "_MEIPASS", str(base / "_internal"), create=True), \
                  patch.object(sys, "executable", str(base / "SARU Picker.exe")):
-                self.assertEqual(app.resolve_checkpoint(), model)
+                self.assertEqual(app.resolve_checkpoint().resolve(), model.resolve())
 
     def test_windows_state_uses_local_app_data_instead_of_install_folder(self):
         with tempfile.TemporaryDirectory() as directory, \
