@@ -52,3 +52,7 @@ The learned option is experimental: development evaluation found higher coverage
 ## Distribution
 
 The runtime accepts a bounded numeric JSON schema and rejects mismatched dimensions, unsupported feature names and invalid parameter values. It does not deserialize executable model objects. The public source/build contains the inference code and synthetic validation fixtures. Private training images, annotations and trained profiles are delivered separately and are not committed to the public repository.
+
+## Large-only output filter in 2.7.1
+
+The 2.7.0 80-example profile is reused unchanged. Automatic `capsid` and `capsid-learned` output now has a minimum **3,500 foreground pixels per connected component**, after all existing refinement and carbon checks. Holes are excluded from area. Disconnected small components cannot pool area, and rejected components are never restored as a fallback. The limit is adjustable in Advanced settings or with `--min-capsid-area`; 0 disables it. This is an output constraint, not a newly trained model or a claim that every sufficiently large region is a capsid. It can omit true small targets and incomplete visible fragments of large targets. Prompt generation is unchanged so compact seeds can still produce large capsid contours.

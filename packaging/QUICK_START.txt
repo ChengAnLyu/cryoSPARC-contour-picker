@@ -1,4 +1,4 @@
-SARU Picker 2.7.0 — Windows CPU edition
+SARU Picker 2.7.1 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -118,3 +118,10 @@ If the program exits unexpectedly, preserve saru_picker.log, startup.log and
 native_fault.log in this folder. Native-fault logs are normally empty.
 Third-party notices and model information: installed _internal folder
 Optional snapshot review editor: launch with --review
+
+LARGE-ONLY AUTOMATIC DETECTION (2.7.1)
+Both capsid profiles now skip final connected regions below 3,500 screen pixels.
+Advanced > Minimum capsid area (screen px²) changes this cutoff; 0 allows all
+sizes. Zoom changes apparent size. Manual drawing and Box prompts are unchanged.
+Changing recognition settings clears old proposals; choose Detect again.
+This is a size-filter update using the unchanged 80-example appearance profile.

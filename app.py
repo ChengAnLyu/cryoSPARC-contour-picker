@@ -34,7 +34,8 @@ from capsid_prior import load_profile, resolve_profile_path, score_image
 from carbon_support import detect_carbon_edges, guard_proposals
 
 from recognition import (
-    Candidate, RecognitionConfig, RecognitionError, Cancelled, SamRecognizer,
+    Candidate, RecognitionConfig, RecognitionError, Cancelled, SamRecognizer, DEFAULT_MIN_CAPSID_AREA_PX,
+    _filter_capsid_area,
     make_candidate, polygon_mask, union_masks, sample_hex_grid, validate_rgb,
 )
 from execution import (
@@ -47,7 +48,7 @@ from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fr
 from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -162,6 +163,20 @@ def _smoke_image_processing() -> dict[str, Any]:
     proposal[20:44, 24:72] = True
     if filter_capsid_proposals(blank, [{"segmentation": proposal}]):
         raise RuntimeError("Uniform-image capsid rejection failed.")
+    # Exercise the exact final size gate in source, frozen and installed builds.
+    # A disjoint small island or a nearly-large ring must not pool area to pass.
+    components = np.zeros((200, 220), dtype=bool)
+    components[10:60, 10:80] = True  # Exactly 3,500 foreground pixels.
+    components[80:110, 10:110] = True  # 3,000-pixel island.
+    components[120:180, 120:180] = True
+    components[140:151, 140:151] = False  # Ring has 3,479 foreground pixels.
+    sized, size_evidence = _filter_capsid_area(
+        [{"segmentation": components}], DEFAULT_MIN_CAPSID_AREA_PX)
+    expected = np.zeros_like(components)
+    expected[10:60, 10:80] = True
+    if (DEFAULT_MIN_CAPSID_AREA_PX != 3500 or len(sized) != 1
+            or not np.array_equal(sized[0]["segmentation"], expected)):
+        raise RuntimeError("Automatic capsid size filtering failed its component/holes check.")
     core = np.zeros((80, 100), dtype=bool)
     core[10:70, 10:90] = True
     core[10:18, 40:50] = False
@@ -204,6 +219,10 @@ def _smoke_image_processing() -> dict[str, Any]:
             "capsid_uniform_scene_rejected": True,
             "capsid_polygon_fitting": True,
             "polygon_exclusions_preserved": True,
+            "capsid_size_filter": {"status": "ok", "default_minimum_area_px": DEFAULT_MIN_CAPSID_AREA_PX,
+                                   "disconnected_small_islands_rejected": True,
+                                   "holes_excluded_from_area": True, "exact_boundary_retained": True,
+                                   "diagnostics": size_evidence},
             "carbon_guard": {"status": "ok", "detected_edges": len(context.segments),
                              "rejected_film_contours": guard["rejected_count"],
                              "nearby_capsid_preserved": True}}
@@ -1050,6 +1069,49 @@ def _smoke_manual_strokes(picker) -> dict[str, Any]:
         picker.set_mode(previous_mode)
 
 
+def _smoke_advanced_settings(picker, percent, screenshot_dir=None):
+    """Check the actual native size control and settings close callback."""
+    picker.open_advanced()
+    picker.root.update()
+    window = picker.advanced
+    if window is None or not window.winfo_viewable():
+        raise RuntimeError("Advanced settings did not open.")
+    width, height = window.winfo_width(), window.winfo_height()
+    if (width < window.winfo_reqwidth() or height < window.winfo_reqheight()
+            or width > window.winfo_screenwidth() or height > window.winfo_screenheight() - 48):
+        raise RuntimeError(f"Advanced settings do not fit the screen at {percent}%: "
+                           f"actual={width}x{height}, requested={window.winfo_reqwidth()}x{window.winfo_reqheight()}")
+    widgets, pending = [], list(window.winfo_children())
+    while pending:
+        widget = pending.pop()
+        widgets.append(widget)
+        pending.extend(widget.winfo_children())
+    for widget in widgets:
+        if not widget.winfo_ismapped():
+            raise RuntimeError("An Advanced settings control is not mapped.")
+        x, y = widget.winfo_rootx()-window.winfo_rootx(), widget.winfo_rooty()-window.winfo_rooty()
+        if x < 0 or y < 0 or x+widget.winfo_width() > width or y+widget.winfo_height() > height:
+            raise RuntimeError("An Advanced settings control is clipped.")
+    controls = [w for w in widgets if w.winfo_class() == 'TSpinbox'
+                and str(w.cget('textvariable')) == str(picker.min_capsid_area)]
+    done = [w for w in widgets if w.winfo_class() == 'TButton' and str(w.cget('text')) == 'Done']
+    if len(controls) != 1 or len(done) != 1 or picker._model_config().min_capsid_area_px != 3500:
+        raise RuntimeError("The default minimum capsid area is not exposed correctly.")
+    record = {'status':'ok', 'scale_percent':percent, 'window_size':[width,height],
+              'default_minimum_area_px':3500, 'all_controls_mapped_and_inside_window':True}
+    if screenshot_dir is not None:
+        record['screenshot'] = _smoke_panel_screenshot(
+            window, Path(screenshot_dir)/f'settings-{percent}.png')
+    picker.min_capsid_area.set('5000')
+    done[0].invoke()
+    picker.root.update()
+    if picker.advanced is not None or picker._model_config().min_capsid_area_px != 5000:
+        raise RuntimeError("Advanced size-setting edit did not close and apply.")
+    picker.min_capsid_area.set('3500')
+    record['edit_and_done_callback_verified'] = True
+    return record
+
+
 def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None) -> dict[str, Any]:
     # These are native Windows widgets at simulated Tk font/layout scales. The
     # Windows monitor's DPI setting is never changed. Each fresh interpreter is
@@ -1109,10 +1171,12 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                     panel_layouts[mode] = normal["panel_size"]
                 picker.status.set(initial_status)
                 _smoke_settle_panel(picker)
+            settings_check = _smoke_advanced_settings(picker, percent, screenshot_dir)
             tk_version = str(window.tk.call("info", "patchlevel"))
             scale_checks.append({"scale_percent": percent, "requested_dpi": requested_dpi,
                                  "native_tk_scaling_before_test": original_scaling,
-                                 "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts})
+                                 "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts,
+                                 "advanced_settings":settings_check})
             if overlay_checks is None:
                 overlay_checks = verify_screen_overlay(window)
                 icon_checks = windows_application_icon_status(window)
@@ -1607,7 +1671,8 @@ class PickerApp:
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
                                  device=self.device.get(), points_per_side=int(self.grid_side.get()),
-                                 automatic_profile=getattr(self.args, "automatic_profile", "capsid"))
+                                 automatic_profile=getattr(self.args, "automatic_profile", "capsid"),
+                                 min_capsid_area_px=getattr(self.args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX))
 
     def _get_recognizer(self, config):
         # Called only by the serialized worker.
@@ -2229,6 +2294,8 @@ def build_parser():
     parser.add_argument("--points-per-side", type=int, default=8)
     parser.add_argument("--automatic-profile", choices=("capsid", "capsid-learned", "generic"), default="capsid",
                         help="capsid keeps the existing filter; capsid-learned selects the optional experimental profile; generic returns unclassified SAM proposals.")
+    parser.add_argument("--min-capsid-area", type=int, default=DEFAULT_MIN_CAPSID_AREA_PX, metavar="PIXELS",
+                        help="Minimum connected capsid area in native screenshot pixels for automatic detection (default: 3500; 0 allows all sizes). Manual, explicit prompts, and generic detection are unchanged.")
     parser.add_argument("--spacing", type=int, default=13)
     parser.add_argument("--inset", type=float, default=2)
     parser.add_argument("--output", type=Path, help="Headless segmentation output directory; defaults to writable user data when installed.")
@@ -2256,7 +2323,8 @@ def _run_application(args, *, console_available: bool) -> int:
             output = args.output or (user_state_directory() / "exports" / "saru_output"
                                     if getattr(sys, "frozen", False) else Path("saru_output"))
             config = RecognitionConfig(str(checkpoint), model_type=args.model_type, device=args.device,
-                                       points_per_side=args.points_per_side, automatic_profile=args.automatic_profile)
+                                       points_per_side=args.points_per_side, automatic_profile=args.automatic_profile,
+                                       min_capsid_area_px=args.min_capsid_area)
             rgb = load_rgb_file(args.segment_image)
             recognizer = SamRecognizer(config)
             try:

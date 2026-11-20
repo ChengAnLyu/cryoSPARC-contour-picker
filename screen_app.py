@@ -21,7 +21,8 @@ from desktop import DesktopAdapter, GlobalHotkeys
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskRunner, play_clicks
 from manual_sampling import legacy_contour_points, mask_contour_points
 from micrograph_navigation import NoNewMicrographError, wait_for_next_micrograph
-from recognition import Cancelled, RecognitionConfig, SamRecognizer, union_masks
+from recognition import (Cancelled, RecognitionConfig, SamRecognizer, union_masks,
+                         DEFAULT_MIN_CAPSID_AREA_PX)
 from screen_overlay import (ScreenOverlay, InputSurface, ManualMouseObserver,
                             keep_control_panel_above, control_panel_bounds)
 
@@ -316,6 +317,7 @@ class ScreenPickerApp:
         self.model_type = tk.StringVar(value=getattr(self.args, "model_type", "vit_b"))
         self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
         self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
+        self.min_capsid_area = tk.StringVar(value=str(getattr(self.args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX)))
         self.grid_side = tk.IntVar(value=8)
         self.click_delay = tk.DoubleVar(value=DEFAULT_CLICK_DELAY)
         for variable in (self.status, self.region_label):
@@ -699,7 +701,27 @@ class ScreenPickerApp:
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
                                  device=self.device.get(), points_per_side=int(self.grid_side.get()),
-                                 automatic_profile=self.automatic_profile.get())
+                                 automatic_profile=self.automatic_profile.get(),
+                                 min_capsid_area_px=int(self.min_capsid_area.get()))
+
+    def _apply_model_settings(self, previous_config):
+        """Validate settings and retire contours made with an older detector.
+
+        Keep actual pick history and its scene reference: changing a size limit
+        must not make a repeated detection place duplicate picks on this image.
+        """
+        current = self._model_config()
+        if current == previous_config:
+            return False
+        self._close_input()
+        self.candidates, self.alternatives = [], []
+        self.alternative_index = 0
+        self.frame_id += 1
+        if self.overlay is not None:
+            self.overlay.hide()
+            self.overlay.clear()
+        self.status.set("Detection settings changed. Choose Detect to refresh the contours.")
+        return True
 
     def _get_recognizer(self, config):
         if self.recognizer is None or self.recognizer_config != config:
@@ -1211,6 +1233,7 @@ class ScreenPickerApp:
                 self.advanced.lift()
                 return
             self._idle()
+            previous_config = self._model_config()
             self._gate_manual()
             self._close_input()
             window = self.tk.Toplevel(self.root)
@@ -1220,6 +1243,7 @@ class ScreenPickerApp:
             window.resizable(False, False)
             frame = self.ttk.Frame(window, padding=12)
             frame.pack(fill="both", expand=True)
+            settings_wrap = max(410, round(410 * self.root.winfo_fpixels("1i") / 96))
             self.ttk.Label(frame, text="SAM checkpoint").grid(row=0, column=0, sticky="w")
             self.ttk.Entry(frame, textvariable=self.checkpoint, width=48).grid(row=1, column=0, columnspan=2, sticky="ew")
             def browse():
@@ -1237,21 +1261,29 @@ class ScreenPickerApp:
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=18 if label == "Detection profile" else 10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
-                                                                        ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01)), 5):
+                                                                        ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01),
+                                                                        ("Minimum capsid area (screen px²)", self.min_capsid_area, 0, 1000000, 500)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
             def close_settings():
+                try:
+                    self._apply_model_settings(previous_config)
+                except (ValueError, self.tk.TclError) as exc:
+                    self.messagebox.showerror("SARU Picker", str(exc), parent=window)
+                    return
                 window.destroy()
                 self.advanced = None
                 self._gate_manual()
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Label(frame, text="capsid: existing dense-interior filter (default).\ncapsid-learned: learned capsids — experimental; review contours.\ngeneric: all SAM regions.", wraplength=410).grid(
-                row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Label(frame, text="capsid: existing dense-interior filter (default).\ncapsid-learned: learned capsids — experimental; review contours.\ngeneric: all SAM regions.", wraplength=settings_wrap).grid(
+                row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Label(frame, text="Both capsid profiles skip regions below the minimum area. 3,500 px² is the large-only default; 0 allows all sizes. Screen zoom changes apparent size. Manual and Box prompt selections are unchanged.",
+                           wraplength=settings_wrap).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
             self.ttk.Label(frame, text="Click delay is in seconds. 0 removes the added wait; increase it if cryoSPARC misses picks.",
-                           wraplength=410).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=9, column=0, columnspan=3, pady=(10, 0))
+                           wraplength=settings_wrap).grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=11, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)

@@ -1,5 +1,6 @@
 """Offline regression tests: no desktop automation, model download, or GPU."""
 import contextlib
+from dataclasses import replace
 import importlib
 import math
 from pathlib import Path
@@ -15,7 +16,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from recognition import (
-    Cancelled, RecognitionConfig, RecognitionError, SamRecognizer,
+    Cancelled, DEFAULT_MIN_CAPSID_AREA_PX, RecognitionConfig, RecognitionError, SamRecognizer,
+    _filter_capsid_area,
     filter_candidates, make_candidate, polygon_mask, sample_hex_grid,
     union_masks, validate_rgb,
 )
@@ -167,7 +169,7 @@ class FakePredictor:
 
 
 def fake_loaded_recognizer(profile="generic"):
-    recognizer = SamRecognizer(RecognitionConfig("unused", automatic_profile=profile))
+    recognizer = SamRecognizer(RecognitionConfig("unused", automatic_profile=profile, min_capsid_area_px=0))
     recognizer._torch = types.SimpleNamespace(inference_mode=contextlib.nullcontext)
     recognizer._predictor = FakePredictor()
     return recognizer
@@ -385,7 +387,7 @@ class LearnedAutomaticProfileTests(unittest.TestCase):
         path = Path(directory) / 'capsid-profile.json'
         path.write_text(json.dumps(profile))
         rgb, core, proposals = synthetic_core()
-        recognizer = SamRecognizer(RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile="capsid-learned"))
+        recognizer = SamRecognizer(RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile="capsid-learned", min_capsid_area_px=0))
         recognizer._torch = types.SimpleNamespace(inference_mode=contextlib.nullcontext)
         class Predictor(FakePredictor):
             def predict(self, **kwargs):
@@ -446,7 +448,7 @@ class LearnedAutomaticProfileTests(unittest.TestCase):
         from test_capsid import synthetic_core
         with tempfile.TemporaryDirectory() as directory:
             recognizer, rgb, _, _ = self._recognizer(directory)
-            recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'))
+            recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), min_capsid_area_px=0)
             _, _, proposals = synthetic_core()
             recognizer._generator = types.SimpleNamespace(generate=lambda rgb: proposals)
             with patch('recognition.score_image', side_effect=AssertionError('Default mode invoked learned profile')):
@@ -478,7 +480,7 @@ class LearnedAutomaticProfileTests(unittest.TestCase):
         for mode in ('capsid', 'capsid-learned'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 recognizer, rgb, _, _ = self._recognizer(directory)
-                recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode)
+                recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode, min_capsid_area_px=0)
                 _, _, parents = synthetic_core()
                 recognizer._generator = types.SimpleNamespace(generate=lambda image: parents)
                 first = np.zeros(rgb.shape[:2], bool)
@@ -516,7 +518,7 @@ class LearnedAutomaticProfileTests(unittest.TestCase):
         for mode in ('capsid', 'capsid-learned'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 recognizer, rgb, _, _ = self._recognizer(directory)
-                recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode)
+                recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode, min_capsid_area_px=0)
                 _, _, parents = synthetic_core()
                 recognizer._generator = types.SimpleNamespace(generate=lambda image: parents)
                 with patch('recognition.guard_proposals', side_effect=Cancelled('stop carbon pass')):
@@ -543,6 +545,145 @@ class LearnedAutomaticProfileTests(unittest.TestCase):
                 recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode)
                 with patch('recognition.detect_carbon_edges', side_effect=AssertionError('automatic guard invoked')):
                     self.assertTrue(recognizer.prompt(rgb, box=(30, 20, 99, 77)))
+
+
+class LargeCapsidAreaTests(unittest.TestCase):
+    @staticmethod
+    def masks():
+        exact = np.zeros((160, 240), bool)
+        exact[20:70, 20:120] = True
+        small = exact.copy()
+        small[20, 20] = False
+        larger = exact.copy()
+        larger[70, 20] = True
+        return small, exact, larger
+
+    def test_default_and_invalid_area_configuration(self):
+        self.assertEqual(DEFAULT_MIN_CAPSID_AREA_PX, 3500)
+        self.assertEqual(RecognitionConfig('unused').min_capsid_area_px, DEFAULT_MIN_CAPSID_AREA_PX)
+        self.assertEqual(RecognitionConfig('unused', min_capsid_area_px=0).min_capsid_area_px, 0)
+        for value in (-1, True, False, 1.5, '5000', None, float('nan'), float('inf')):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'min_capsid_area_px'):
+                RecognitionConfig('unused', min_capsid_area_px=value)
+
+    def test_inclusive_threshold_uses_pixels_and_preserves_unchanged_records(self):
+        records = [{'segmentation': mask} for mask in self.masks()]
+        kept, summary = _filter_capsid_area(records, 5000)
+        self.assertEqual(len(kept), 2)
+        self.assertIs(kept[0], records[1])
+        self.assertIs(kept[1], records[2])
+        self.assertEqual(summary['rejected_small_components'], 1)
+        self.assertEqual(summary['removed_small_pixels'], 4999)
+        unchanged, disabled = _filter_capsid_area(records, 0)
+        self.assertIs(unchanged, records)
+        self.assertFalse(disabled['enabled'])
+
+    def test_disconnected_small_parts_cannot_pool_and_holes_do_not_count(self):
+        disconnected = np.zeros((180, 280), bool)
+        disconnected[10:60, 10:70] = True
+        disconnected[90:140, 180:240] = True
+        holed = np.zeros_like(disconnected)
+        holed[20:100, 20:100] = True
+        holed[40:80, 40:80] = False  # 6,400 bounding pixels, only4,800 mask pixels.
+        kept, summary = _filter_capsid_area([{'segmentation': disconnected}, {'segmentation': holed}], 5000)
+        self.assertEqual(kept, [])
+        self.assertEqual(summary['rejected_small_components'], 3)
+        self.assertEqual(summary['removed_small_pixels'], 10800)
+
+    def test_eligible_components_are_separate_keep_holes_and_have_no_new_cap(self):
+        mask = np.zeros((200, 300), bool)
+        mask[10:90, 10:90] = True
+        mask[30:40, 30:40] = False
+        mask[110:160, 180:280] = True
+        mask[170:180, 10:20] = True
+        original = {'segmentation': mask, 'capsid_evidence': {'appearance_score_mean': .8}}
+        kept, summary = _filter_capsid_area([original], 5000)
+        self.assertEqual([int(item['segmentation'].sum()) for item in kept], [6300, 5000])
+        self.assertFalse(kept[0]['segmentation'][30:40, 30:40].any())
+        self.assertFalse(np.any(kept[0]['segmentation'] & kept[1]['segmentation']))
+        self.assertEqual(summary['split_proposals'], 1)
+        self.assertNotIn('area_filter', original['capsid_evidence'])
+        repeated = [{'segmentation': kept[0]['segmentation']}] * 25
+        self.assertEqual(len(_filter_capsid_area(repeated, 5000)[0]), 25)
+
+    def test_component_filter_cancellation_cannot_return_partial_output(self):
+        calls = 0
+        def cancel():
+            nonlocal calls
+            calls += 1
+            return calls == 3
+        records = [{'segmentation': self.masks()[1]}] * 2
+        with self.assertRaises(Cancelled):
+            _filter_capsid_area(records, 5000, cancel)
+
+    @contextlib.contextmanager
+    def automatic_fixture(self, mode, records, minimum=5000):
+        recognizer = fake_loaded_recognizer(mode)
+        recognizer.config = replace(recognizer.config, min_capsid_area_px=minimum)
+        calls = []
+        def generate(rgb):
+            calls.append('generate')
+            return [{'segmentation': self.masks()[1]}]
+        recognizer._generator = types.SimpleNamespace(generate=generate)
+        profile = types.SimpleNamespace(describe=lambda: {'status': 'loaded'}) if mode == 'capsid-learned' else None
+        refiner = 'recognition.filter_capsid_with_profile' if profile else 'recognition.filter_capsid_proposals'
+        def guard(context, proposals, **kwargs):
+            self.assertIs(proposals, records)
+            calls.append('carbon')
+            return proposals, {'enabled': True}
+        with patch.object(recognizer, '_get_appearance_profile', return_value=profile), \
+             patch('recognition.score_image', return_value=np.ones((160, 240), np.float32)), \
+             patch('recognition.capsid_guided_prompts', return_value=[{'box': [10, 10, 130, 100], 'point': [40, 40]}]), \
+             patch(refiner, return_value=records), \
+             patch('recognition.detect_carbon_edges', return_value=object()), \
+             patch('recognition.guard_proposals', side_effect=guard):
+            yield recognizer, np.full((160, 240, 3), 125, np.uint8), calls
+
+    def test_both_automatic_capsid_modes_filter_final_masks_and_cache_empty_without_fallback(self):
+        records = [{'segmentation': mask} for mask in self.masks()]
+        for mode in ('capsid', 'capsid-learned'):
+            with self.subTest(mode=mode), self.automatic_fixture(mode, records) as (recognizer, image, calls):
+                result = recognizer.automatic(image)
+                self.assertEqual(sorted(c.area for c in result), [5000, 5001])
+                self.assertEqual(recognizer.last_detection['capsid_area_filter']['minimum_area_px'], 5000)
+                self.assertEqual(calls.count('carbon'), 1)
+                recognizer.config = replace(recognizer.config, min_capsid_area_px=10000)
+                self.assertEqual(recognizer.automatic(image), [])
+                work = (len(calls), recognizer._predictor.predict_calls)
+                self.assertEqual(recognizer.automatic(image.copy()), [])
+                self.assertEqual((len(calls), recognizer._predictor.predict_calls), work)
+                self.assertEqual(recognizer.last_detection['selected_contours'], 0)
+
+    def test_area_setting_change_invalidates_same_image_result_cache(self):
+        records = [{'segmentation': mask} for mask in self.masks()]
+        with self.automatic_fixture('capsid', records, minimum=0) as (recognizer, image, calls):
+            self.assertEqual(len(recognizer.automatic(image)), 3)
+            recognizer.config = replace(recognizer.config, min_capsid_area_px=5000)
+            self.assertEqual(len(recognizer.automatic(image)), 2)
+            self.assertEqual(calls.count('generate'), 2)
+            self.assertEqual(recognizer._automatic_config, recognizer.config)
+
+    def test_wrong_refined_geometry_is_not_hidden_by_small_size(self):
+        records = [{'segmentation': np.ones((5, 5), bool)}]
+        with self.automatic_fixture('capsid', records) as (recognizer, image, _):
+            with self.assertRaisesRegex(RecognitionError, 'wrong image dimensions'):
+                recognizer.automatic(image)
+            self.assertIsNone(recognizer._automatic_result)
+
+    def test_generic_and_explicit_prompts_keep_small_masks(self):
+        image = np.full((20, 30, 3), 125, np.uint8)
+        mask = np.zeros((20, 30), bool)
+        mask[2:8, 2:8] = True
+        recognizer = fake_loaded_recognizer('generic')
+        recognizer.config = replace(recognizer.config, min_capsid_area_px=5000)
+        recognizer._generator = types.SimpleNamespace(generate=lambda rgb: [{'segmentation': mask}])
+        with patch('recognition._filter_capsid_area', side_effect=AssertionError('automatic size filter invoked')):
+            self.assertEqual(recognizer.automatic(image)[0].area, 36)
+            for mode in ('generic', 'capsid', 'capsid-learned'):
+                recognizer = fake_loaded_recognizer(mode)
+                recognizer.config = replace(recognizer.config, min_capsid_area_px=5000)
+                results = recognizer.prompt(image, box=(1, 1, 12, 12))
+                self.assertEqual(sorted(c.area for c in results), [4, 36, 81])
 
 
 if __name__ == "__main__":

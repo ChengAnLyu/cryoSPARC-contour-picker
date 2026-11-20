@@ -481,6 +481,7 @@ class WindowsScaleCoverageTests(unittest.TestCase):
              patch.object(app, "resolve_checkpoint", return_value=Path("model.pth")), \
              patch.object(app, "ScreenPickerApp", side_effect=make_picker), \
              patch.object(app, "_smoke_panel_layout", side_effect=measure), \
+             patch.object(app, "_smoke_advanced_settings", return_value={"status":"ok"}) as settings, \
              patch.object(app, "windows_application_icon_status", return_value={"small_icon": True, "large_icon": True}), \
              patch.object(app, "_smoke_repeated_screen_picks", return_value={"contours_completed": 3}) as repeated, \
              patch.object(app, "_smoke_micrograph_cycle", return_value={"continuous_auto": {"down_keys": 3}}) as cycle, \
@@ -489,6 +490,7 @@ class WindowsScaleCoverageTests(unittest.TestCase):
             result = app._smoke_windows_runtime(Path("app.log"))
         expected_scales = [96 * percent / 100 / 72 for percent in (100, 125, 150, 200)]
         self.assertEqual(constructions, expected_scales)
+        self.assertEqual(settings.call_count, 4)
         self.assertEqual(len(measured), 4 * 3 * 2)
         for scale in expected_scales:
             self.assertEqual({(mode, case) for value, mode, case, _ in measured if value == scale},

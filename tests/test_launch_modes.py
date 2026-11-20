@@ -26,6 +26,12 @@ class LaunchModeTests(unittest.TestCase):
         screen.assert_called_once()
         self.assertIs(screen.call_args.args[0], root)
         self.assertEqual(screen.call_args.args[3], Path("bundled-model.pth"))
+        self.assertEqual(screen.call_args.args[1].min_capsid_area, 3500)
+        review.assert_not_called()
+
+    def test_size_filter_override_is_available_without_changing_launch_mode(self):
+        _, screen, review = self.launch(["--min-capsid-area", "8000"])
+        self.assertEqual(screen.call_args.args[1].min_capsid_area, 8000)
         review.assert_not_called()
 
     def test_snapshot_editor_is_explicitly_optional(self):

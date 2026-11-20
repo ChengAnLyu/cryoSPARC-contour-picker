@@ -1,12 +1,16 @@
-# SARU Picker 2.7.0 for Windows
+# SARU Picker 2.7.1 for Windows
 
-Install **SARU-Picker-Setup-2.7.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.7.1-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
 to the installed application, its EXE and its shortcuts. The setup EXE itself
 uses the public geometric icon. Setup also works without the optional sidecars,
 using that fallback for the installed app.
+
+## Version 2.7.1: skip small automatic capsids
+
+Both automatic capsid profiles now discard connected regions smaller than **3,500 screen pixels** after contour refinement. Set **Advanced → Minimum capsid area (screen px²)** to adjust the cutoff; **0** disables this additional limit. This is screenshot area, so changing cryoSPARC zoom changes the apparent size. Cropping the selected screen rectangle does not change the absolute cutoff, although existing relative-area limits still apply. Manual drawing and explicit Box prompts remain available for intentional small targets. Blank results cause no picks; continuous auto then follows the existing next-micrograph behavior. The 80-example appearance weights and SAM checkpoint are unchanged.
 
 ## Version 2.7.0 update
 

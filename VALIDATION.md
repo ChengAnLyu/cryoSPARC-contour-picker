@@ -1,3 +1,9 @@
+# Version 2.7.1 validation scope
+
+This patch adds a configurable final connected-component size gate for both automatic capsid modes. The default is 3,500 foreground screen pixels; holes do not count, disconnected fragments cannot pool area, and an empty result has no fallback to small contours. Manual drawing, explicit prompts, generic detection, proposal generation, SAM weights and the private 80-example appearance weights are retained. Targeted tests cover threshold boundaries, disconnected components, holes, invalid settings, both detectors, empty results, and retiring stale displayed contours after settings changes while preserving actual picks.
+
+Private size-filter evaluation replays the exact production gate on the frozen 2.7.0 held-out masks; it does not represent 80 new SAM runs or newly trained folds. Runtime inference is checked separately. Supplied screenshot outlines are measured as observed detections; a screenshot already containing green contours is not a clean micrograph. Partial-positive examples cannot establish full precision or complete recall. The current release guide contains exact retention and removal measurements.
+
 # Version 2.7.0 validation scope
 
 Version 2.7.0 adds multi-deck training provenance, optional positive interiors

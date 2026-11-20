@@ -19,12 +19,14 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw
+from scipy import ndimage as ndi
 
 from capsid import filter_capsid_proposals, capsid_guided_prompts, filter_capsid_with_profile
 from capsid_prior import resolve_profile_path, load_profile, score_image
 from carbon_support import detect_carbon_edges, guard_proposals
 
 CancelCheck = Callable[[], bool] | None
+DEFAULT_MIN_CAPSID_AREA_PX = 3500
 
 
 class RecognitionError(RuntimeError):
@@ -58,6 +60,7 @@ class RecognitionConfig:
     prefer_smaller: bool = True
     automatic_profile: str = "capsid"
     capsid_prior_path: str | None = None
+    min_capsid_area_px: int = DEFAULT_MIN_CAPSID_AREA_PX
 
     def __post_init__(self) -> None:
         if self.model_type not in {"vit_b", "vit_l", "vit_h"}:
@@ -68,6 +71,9 @@ class RecognitionConfig:
             raise ValueError("automatic_profile must be capsid, capsid-learned, or generic.")
         if self.capsid_prior_path is not None and (not isinstance(self.capsid_prior_path, str) or not self.capsid_prior_path.strip()):
             raise ValueError("capsid_prior_path must be a nonempty path string or None.")
+        if (isinstance(self.min_capsid_area_px, bool)
+                or not isinstance(self.min_capsid_area_px, int) or self.min_capsid_area_px < 0):
+            raise ValueError("min_capsid_area_px must be a nonnegative integer; 0 disables the size filter.")
         for name in ("cpu_threads", "points_per_side"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -225,6 +231,57 @@ def filter_candidates(candidates: Iterable[Candidate], config: RecognitionConfig
     return sorted(kept, key=lambda c: (c.bbox[1], c.bbox[0], c.id))
 
 
+def _filter_capsid_area(proposals, minimum_area_px: int, cancel: CancelCheck = None):
+    """Keep large final connected contours; never pool disconnected small pieces.
+
+    This runs only after automatic capsid refinement and carbon rejection.
+    Holes stay excluded, and an unchanged single component keeps its original
+    mask object. Upstream proposal bounds remain in the capsid refiners; this
+    final filter does not impose another cap on already eligible components.
+    """
+    summary = {'enabled': minimum_area_px > 0, 'minimum_area_px': minimum_area_px,
+               'units': 'screen pixels', 'input_count': len(proposals),
+               'connected_components': 0, 'rejected_small_components': 0,
+               'removed_small_pixels': 0, 'empty_proposals': 0,
+               'split_proposals': 0, 'retained_count': 0}
+    if not minimum_area_px:
+        summary['retained_count'] = len(proposals)
+        return proposals, summary
+    retained = []
+    for record in proposals:
+        _check_cancel(cancel)
+        mask = _validate_mask(record['segmentation'])
+        labels, count = ndi.label(mask)  # Four-connected, as in both capsid refiners.
+        sizes = np.bincount(labels.ravel(), minlength=count + 1)
+        summary['connected_components'] += count
+        if not count:
+            summary['empty_proposals'] += 1
+            continue
+        eligible = np.flatnonzero(sizes[1:] >= minimum_area_px) + 1
+        small = sizes[1:] < minimum_area_px
+        summary['rejected_small_components'] += int(np.count_nonzero(small))
+        summary['removed_small_pixels'] += int(sizes[1:][small].sum())
+        if count > 1 and len(eligible):
+            summary['split_proposals'] += 1
+        for label in eligible:
+            _check_cancel(cancel)
+            if count == 1:
+                retained.append(record)
+                continue
+            component = labels == label
+            evidence = dict(record.get('capsid_evidence') or {})
+            evidence['area_filter'] = {'minimum_area_px': minimum_area_px,
+                                      'source_area': int(sizes[1:].sum()),
+                                      'source_component_count': count,
+                                      'component_area': int(sizes[label]),
+                                      'inherited_evidence_applies_to_source_mask': True}
+            retained.append({**record, 'segmentation': component,
+                             'area': int(sizes[label]), 'bbox': list(_bbox(component)),
+                             'capsid_evidence': evidence})
+    summary['retained_count'] = len(retained)
+    return retained, summary
+
+
 class SamRecognizer:
     """One worker's reusable model; call serially, never from a Tk callback.
 
@@ -240,6 +297,7 @@ class SamRecognizer:
         self._generator = None
         self._predictor_image_key: str | None = None
         self._automatic_image_key: str | None = None
+        self._automatic_config: RecognitionConfig | None = None
         self._automatic_result: list[Candidate] | None = None
         self.last_detection: dict | None = None
         self._appearance_profile = None
@@ -435,7 +493,8 @@ class SamRecognizer:
         rgb = validate_rgb(rgb)
         _check_cancel(cancel)
         key = _image_key(rgb)
-        if key == self._automatic_image_key and self._automatic_result is not None:
+        if (key == self._automatic_image_key and self._automatic_result is not None
+                and self._automatic_config == self.config):
             return list(self._automatic_result)
         profile = self._get_appearance_profile()
         started = time.perf_counter()
@@ -494,6 +553,8 @@ class SamRecognizer:
             refinement_started = time.perf_counter()
             carbon_seconds = 0.0
             carbon_summary = {"enabled": False}
+            area_seconds = 0.0
+            area_summary = {'enabled': False, 'minimum_area_px': 0, 'reason': 'generic profile'}
             if is_capsid:
                 if profile is not None:
                     raw = filter_capsid_with_profile(
@@ -514,6 +575,13 @@ class SamRecognizer:
                     context, raw, check_cancel=lambda: _check_cancel(cancel))
                 carbon_summary["enabled"] = True
                 carbon_seconds = time.perf_counter() - carbon_started
+                for item in raw:
+                    _check_cancel(cancel)
+                    if _validate_mask(item['segmentation']).shape != rgb.shape[:2]:
+                        raise RecognitionError("A refined capsid mask has the wrong image dimensions.")
+                area_started = time.perf_counter()
+                raw, area_summary = _filter_capsid_area(raw, self.config.min_capsid_area_px, cancel)
+                area_seconds = time.perf_counter() - area_started
             candidates = []
             evidence = {}
             for item in raw:
@@ -542,8 +610,9 @@ class SamRecognizer:
                 "sam_proposals": raw_count, "selected_contours": len(result),
                 "appearance_model": appearance,
                 "carbon_guard": carbon_summary,
+                "capsid_area_filter": area_summary,
                 "timing_seconds": {"appearance": feature_seconds, "guided_proposals": proposal_seconds,
-                                   "sam": sam_seconds, "carbon_guard": carbon_seconds,
+                                   "sam": sam_seconds, "carbon_guard": carbon_seconds, "capsid_area_filter": area_seconds,
                                    "refinement": time.perf_counter() - refinement_started,
                                    "total_including_initial_model_load": time.perf_counter() - started},
                 "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
@@ -554,6 +623,7 @@ class SamRecognizer:
                          if is_capsid else "Unclassified generic SAM proposals."),
             }
             self._automatic_image_key, self._automatic_result = key, result
+            self._automatic_config = self.config
             return list(result)
         except (Cancelled, RecognitionError):
             raise
@@ -569,6 +639,7 @@ class SamRecognizer:
         torch, device = self._torch, self.device
         self._model = self._predictor = self._generator = None
         self._predictor_image_key = self._automatic_image_key = None
+        self._automatic_config = None
         self._automatic_result = None
         self.last_detection = None
         self._torch, self.device = None, None

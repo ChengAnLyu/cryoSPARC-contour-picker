@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.7.0: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 2.7.1: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
@@ -1581,9 +1581,11 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw
+from scipy import ndimage as ndi
 
 
 CancelCheck = Callable[[], bool] | None
+DEFAULT_MIN_CAPSID_AREA_PX = 3500
 
 
 class RecognitionError(RuntimeError):
@@ -1617,6 +1619,7 @@ class RecognitionConfig:
     prefer_smaller: bool = True
     automatic_profile: str = "capsid"
     capsid_prior_path: str | None = None
+    min_capsid_area_px: int = DEFAULT_MIN_CAPSID_AREA_PX
 
     def __post_init__(self) -> None:
         if self.model_type not in {"vit_b", "vit_l", "vit_h"}:
@@ -1627,6 +1630,9 @@ class RecognitionConfig:
             raise ValueError("automatic_profile must be capsid, capsid-learned, or generic.")
         if self.capsid_prior_path is not None and (not isinstance(self.capsid_prior_path, str) or not self.capsid_prior_path.strip()):
             raise ValueError("capsid_prior_path must be a nonempty path string or None.")
+        if (isinstance(self.min_capsid_area_px, bool)
+                or not isinstance(self.min_capsid_area_px, int) or self.min_capsid_area_px < 0):
+            raise ValueError("min_capsid_area_px must be a nonnegative integer; 0 disables the size filter.")
         for name in ("cpu_threads", "points_per_side"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -1784,6 +1790,57 @@ def filter_candidates(candidates: Iterable[Candidate], config: RecognitionConfig
     return sorted(kept, key=lambda c: (c.bbox[1], c.bbox[0], c.id))
 
 
+def _filter_capsid_area(proposals, minimum_area_px: int, cancel: CancelCheck = None):
+    """Keep large final connected contours; never pool disconnected small pieces.
+
+    This runs only after automatic capsid refinement and carbon rejection.
+    Holes stay excluded, and an unchanged single component keeps its original
+    mask object. Upstream proposal bounds remain in the capsid refiners; this
+    final filter does not impose another cap on already eligible components.
+    """
+    summary = {'enabled': minimum_area_px > 0, 'minimum_area_px': minimum_area_px,
+               'units': 'screen pixels', 'input_count': len(proposals),
+               'connected_components': 0, 'rejected_small_components': 0,
+               'removed_small_pixels': 0, 'empty_proposals': 0,
+               'split_proposals': 0, 'retained_count': 0}
+    if not minimum_area_px:
+        summary['retained_count'] = len(proposals)
+        return proposals, summary
+    retained = []
+    for record in proposals:
+        _check_cancel(cancel)
+        mask = _validate_mask(record['segmentation'])
+        labels, count = ndi.label(mask)  # Four-connected, as in both capsid refiners.
+        sizes = np.bincount(labels.ravel(), minlength=count + 1)
+        summary['connected_components'] += count
+        if not count:
+            summary['empty_proposals'] += 1
+            continue
+        eligible = np.flatnonzero(sizes[1:] >= minimum_area_px) + 1
+        small = sizes[1:] < minimum_area_px
+        summary['rejected_small_components'] += int(np.count_nonzero(small))
+        summary['removed_small_pixels'] += int(sizes[1:][small].sum())
+        if count > 1 and len(eligible):
+            summary['split_proposals'] += 1
+        for label in eligible:
+            _check_cancel(cancel)
+            if count == 1:
+                retained.append(record)
+                continue
+            component = labels == label
+            evidence = dict(record.get('capsid_evidence') or {})
+            evidence['area_filter'] = {'minimum_area_px': minimum_area_px,
+                                      'source_area': int(sizes[1:].sum()),
+                                      'source_component_count': count,
+                                      'component_area': int(sizes[label]),
+                                      'inherited_evidence_applies_to_source_mask': True}
+            retained.append({**record, 'segmentation': component,
+                             'area': int(sizes[label]), 'bbox': list(_bbox(component)),
+                             'capsid_evidence': evidence})
+    summary['retained_count'] = len(retained)
+    return retained, summary
+
+
 class SamRecognizer:
     """One worker's reusable model; call serially, never from a Tk callback.
 
@@ -1799,6 +1856,7 @@ class SamRecognizer:
         self._generator = None
         self._predictor_image_key: str | None = None
         self._automatic_image_key: str | None = None
+        self._automatic_config: RecognitionConfig | None = None
         self._automatic_result: list[Candidate] | None = None
         self.last_detection: dict | None = None
         self._appearance_profile = None
@@ -1994,7 +2052,8 @@ class SamRecognizer:
         rgb = validate_rgb(rgb)
         _check_cancel(cancel)
         key = _image_key(rgb)
-        if key == self._automatic_image_key and self._automatic_result is not None:
+        if (key == self._automatic_image_key and self._automatic_result is not None
+                and self._automatic_config == self.config):
             return list(self._automatic_result)
         profile = self._get_appearance_profile()
         started = time.perf_counter()
@@ -2053,6 +2112,8 @@ class SamRecognizer:
             refinement_started = time.perf_counter()
             carbon_seconds = 0.0
             carbon_summary = {"enabled": False}
+            area_seconds = 0.0
+            area_summary = {'enabled': False, 'minimum_area_px': 0, 'reason': 'generic profile'}
             if is_capsid:
                 if profile is not None:
                     raw = filter_capsid_with_profile(
@@ -2073,6 +2134,13 @@ class SamRecognizer:
                     context, raw, check_cancel=lambda: _check_cancel(cancel))
                 carbon_summary["enabled"] = True
                 carbon_seconds = time.perf_counter() - carbon_started
+                for item in raw:
+                    _check_cancel(cancel)
+                    if _validate_mask(item['segmentation']).shape != rgb.shape[:2]:
+                        raise RecognitionError("A refined capsid mask has the wrong image dimensions.")
+                area_started = time.perf_counter()
+                raw, area_summary = _filter_capsid_area(raw, self.config.min_capsid_area_px, cancel)
+                area_seconds = time.perf_counter() - area_started
             candidates = []
             evidence = {}
             for item in raw:
@@ -2101,8 +2169,9 @@ class SamRecognizer:
                 "sam_proposals": raw_count, "selected_contours": len(result),
                 "appearance_model": appearance,
                 "carbon_guard": carbon_summary,
+                "capsid_area_filter": area_summary,
                 "timing_seconds": {"appearance": feature_seconds, "guided_proposals": proposal_seconds,
-                                   "sam": sam_seconds, "carbon_guard": carbon_seconds,
+                                   "sam": sam_seconds, "carbon_guard": carbon_seconds, "capsid_area_filter": area_seconds,
                                    "refinement": time.perf_counter() - refinement_started,
                                    "total_including_initial_model_load": time.perf_counter() - started},
                 "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
@@ -2113,6 +2182,7 @@ class SamRecognizer:
                          if is_capsid else "Unclassified generic SAM proposals."),
             }
             self._automatic_image_key, self._automatic_result = key, result
+            self._automatic_config = self.config
             return list(result)
         except (Cancelled, RecognitionError):
             raise
@@ -2128,6 +2198,7 @@ class SamRecognizer:
         torch, device = self._torch, self.device
         self._model = self._predictor = self._generator = None
         self._predictor_image_key = self._automatic_image_key = None
+        self._automatic_config = None
         self._automatic_result = None
         self.last_detection = None
         self._torch, self.device = None, None
@@ -4741,6 +4812,7 @@ class ScreenPickerApp:
         self.model_type = tk.StringVar(value=getattr(self.args, "model_type", "vit_b"))
         self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
         self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
+        self.min_capsid_area = tk.StringVar(value=str(getattr(self.args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX)))
         self.grid_side = tk.IntVar(value=8)
         self.click_delay = tk.DoubleVar(value=DEFAULT_CLICK_DELAY)
         for variable in (self.status, self.region_label):
@@ -5124,7 +5196,27 @@ class ScreenPickerApp:
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
                                  device=self.device.get(), points_per_side=int(self.grid_side.get()),
-                                 automatic_profile=self.automatic_profile.get())
+                                 automatic_profile=self.automatic_profile.get(),
+                                 min_capsid_area_px=int(self.min_capsid_area.get()))
+
+    def _apply_model_settings(self, previous_config):
+        """Validate settings and retire contours made with an older detector.
+
+        Keep actual pick history and its scene reference: changing a size limit
+        must not make a repeated detection place duplicate picks on this image.
+        """
+        current = self._model_config()
+        if current == previous_config:
+            return False
+        self._close_input()
+        self.candidates, self.alternatives = [], []
+        self.alternative_index = 0
+        self.frame_id += 1
+        if self.overlay is not None:
+            self.overlay.hide()
+            self.overlay.clear()
+        self.status.set("Detection settings changed. Choose Detect to refresh the contours.")
+        return True
 
     def _get_recognizer(self, config):
         if self.recognizer is None or self.recognizer_config != config:
@@ -5636,6 +5728,7 @@ class ScreenPickerApp:
                 self.advanced.lift()
                 return
             self._idle()
+            previous_config = self._model_config()
             self._gate_manual()
             self._close_input()
             window = self.tk.Toplevel(self.root)
@@ -5645,6 +5738,7 @@ class ScreenPickerApp:
             window.resizable(False, False)
             frame = self.ttk.Frame(window, padding=12)
             frame.pack(fill="both", expand=True)
+            settings_wrap = max(410, round(410 * self.root.winfo_fpixels("1i") / 96))
             self.ttk.Label(frame, text="SAM checkpoint").grid(row=0, column=0, sticky="w")
             self.ttk.Entry(frame, textvariable=self.checkpoint, width=48).grid(row=1, column=0, columnspan=2, sticky="ew")
             def browse():
@@ -5662,21 +5756,29 @@ class ScreenPickerApp:
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=18 if label == "Detection profile" else 10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
-                                                                        ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01)), 5):
+                                                                        ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01),
+                                                                        ("Minimum capsid area (screen px²)", self.min_capsid_area, 0, 1000000, 500)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
             def close_settings():
+                try:
+                    self._apply_model_settings(previous_config)
+                except (ValueError, self.tk.TclError) as exc:
+                    self.messagebox.showerror("SARU Picker", str(exc), parent=window)
+                    return
                 window.destroy()
                 self.advanced = None
                 self._gate_manual()
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Label(frame, text="capsid: existing dense-interior filter (default).\ncapsid-learned: learned capsids — experimental; review contours.\ngeneric: all SAM regions.", wraplength=410).grid(
-                row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Label(frame, text="capsid: existing dense-interior filter (default).\ncapsid-learned: learned capsids — experimental; review contours.\ngeneric: all SAM regions.", wraplength=settings_wrap).grid(
+                row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Label(frame, text="Both capsid profiles skip regions below the minimum area. 3,500 px² is the large-only default; 0 allows all sizes. Screen zoom changes apparent size. Manual and Box prompt selections are unchanged.",
+                           wraplength=settings_wrap).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
             self.ttk.Label(frame, text="Click delay is in seconds. 0 removes the added wait; increase it if cryoSPARC misses picks.",
-                           wraplength=410).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=9, column=0, columnspan=3, pady=(10, 0))
+                           wraplength=settings_wrap).grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=11, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)
@@ -5758,7 +5860,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -5873,6 +5975,20 @@ def _smoke_image_processing() -> dict[str, Any]:
     proposal[20:44, 24:72] = True
     if filter_capsid_proposals(blank, [{"segmentation": proposal}]):
         raise RuntimeError("Uniform-image capsid rejection failed.")
+    # Exercise the exact final size gate in source, frozen and installed builds.
+    # A disjoint small island or a nearly-large ring must not pool area to pass.
+    components = np.zeros((200, 220), dtype=bool)
+    components[10:60, 10:80] = True  # Exactly 3,500 foreground pixels.
+    components[80:110, 10:110] = True  # 3,000-pixel island.
+    components[120:180, 120:180] = True
+    components[140:151, 140:151] = False  # Ring has 3,479 foreground pixels.
+    sized, size_evidence = _filter_capsid_area(
+        [{"segmentation": components}], DEFAULT_MIN_CAPSID_AREA_PX)
+    expected = np.zeros_like(components)
+    expected[10:60, 10:80] = True
+    if (DEFAULT_MIN_CAPSID_AREA_PX != 3500 or len(sized) != 1
+            or not np.array_equal(sized[0]["segmentation"], expected)):
+        raise RuntimeError("Automatic capsid size filtering failed its component/holes check.")
     core = np.zeros((80, 100), dtype=bool)
     core[10:70, 10:90] = True
     core[10:18, 40:50] = False
@@ -5915,6 +6031,10 @@ def _smoke_image_processing() -> dict[str, Any]:
             "capsid_uniform_scene_rejected": True,
             "capsid_polygon_fitting": True,
             "polygon_exclusions_preserved": True,
+            "capsid_size_filter": {"status": "ok", "default_minimum_area_px": DEFAULT_MIN_CAPSID_AREA_PX,
+                                   "disconnected_small_islands_rejected": True,
+                                   "holes_excluded_from_area": True, "exact_boundary_retained": True,
+                                   "diagnostics": size_evidence},
             "carbon_guard": {"status": "ok", "detected_edges": len(context.segments),
                              "rejected_film_contours": guard["rejected_count"],
                              "nearby_capsid_preserved": True}}
@@ -6761,6 +6881,49 @@ def _smoke_manual_strokes(picker) -> dict[str, Any]:
         picker.set_mode(previous_mode)
 
 
+def _smoke_advanced_settings(picker, percent, screenshot_dir=None):
+    """Check the actual native size control and settings close callback."""
+    picker.open_advanced()
+    picker.root.update()
+    window = picker.advanced
+    if window is None or not window.winfo_viewable():
+        raise RuntimeError("Advanced settings did not open.")
+    width, height = window.winfo_width(), window.winfo_height()
+    if (width < window.winfo_reqwidth() or height < window.winfo_reqheight()
+            or width > window.winfo_screenwidth() or height > window.winfo_screenheight() - 48):
+        raise RuntimeError(f"Advanced settings do not fit the screen at {percent}%: "
+                           f"actual={width}x{height}, requested={window.winfo_reqwidth()}x{window.winfo_reqheight()}")
+    widgets, pending = [], list(window.winfo_children())
+    while pending:
+        widget = pending.pop()
+        widgets.append(widget)
+        pending.extend(widget.winfo_children())
+    for widget in widgets:
+        if not widget.winfo_ismapped():
+            raise RuntimeError("An Advanced settings control is not mapped.")
+        x, y = widget.winfo_rootx()-window.winfo_rootx(), widget.winfo_rooty()-window.winfo_rooty()
+        if x < 0 or y < 0 or x+widget.winfo_width() > width or y+widget.winfo_height() > height:
+            raise RuntimeError("An Advanced settings control is clipped.")
+    controls = [w for w in widgets if w.winfo_class() == 'TSpinbox'
+                and str(w.cget('textvariable')) == str(picker.min_capsid_area)]
+    done = [w for w in widgets if w.winfo_class() == 'TButton' and str(w.cget('text')) == 'Done']
+    if len(controls) != 1 or len(done) != 1 or picker._model_config().min_capsid_area_px != 3500:
+        raise RuntimeError("The default minimum capsid area is not exposed correctly.")
+    record = {'status':'ok', 'scale_percent':percent, 'window_size':[width,height],
+              'default_minimum_area_px':3500, 'all_controls_mapped_and_inside_window':True}
+    if screenshot_dir is not None:
+        record['screenshot'] = _smoke_panel_screenshot(
+            window, Path(screenshot_dir)/f'settings-{percent}.png')
+    picker.min_capsid_area.set('5000')
+    done[0].invoke()
+    picker.root.update()
+    if picker.advanced is not None or picker._model_config().min_capsid_area_px != 5000:
+        raise RuntimeError("Advanced size-setting edit did not close and apply.")
+    picker.min_capsid_area.set('3500')
+    record['edit_and_done_callback_verified'] = True
+    return record
+
+
 def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None) -> dict[str, Any]:
     # These are native Windows widgets at simulated Tk font/layout scales. The
     # Windows monitor's DPI setting is never changed. Each fresh interpreter is
@@ -6820,10 +6983,12 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                     panel_layouts[mode] = normal["panel_size"]
                 picker.status.set(initial_status)
                 _smoke_settle_panel(picker)
+            settings_check = _smoke_advanced_settings(picker, percent, screenshot_dir)
             tk_version = str(window.tk.call("info", "patchlevel"))
             scale_checks.append({"scale_percent": percent, "requested_dpi": requested_dpi,
                                  "native_tk_scaling_before_test": original_scaling,
-                                 "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts})
+                                 "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts,
+                                 "advanced_settings":settings_check})
             if overlay_checks is None:
                 overlay_checks = verify_screen_overlay(window)
                 icon_checks = windows_application_icon_status(window)
@@ -7318,7 +7483,8 @@ class PickerApp:
     def _model_config(self):
         return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
                                  device=self.device.get(), points_per_side=int(self.grid_side.get()),
-                                 automatic_profile=getattr(self.args, "automatic_profile", "capsid"))
+                                 automatic_profile=getattr(self.args, "automatic_profile", "capsid"),
+                                 min_capsid_area_px=getattr(self.args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX))
 
     def _get_recognizer(self, config):
         # Called only by the serialized worker.
@@ -7940,6 +8106,8 @@ def build_parser():
     parser.add_argument("--points-per-side", type=int, default=8)
     parser.add_argument("--automatic-profile", choices=("capsid", "capsid-learned", "generic"), default="capsid",
                         help="capsid keeps the existing filter; capsid-learned selects the optional experimental profile; generic returns unclassified SAM proposals.")
+    parser.add_argument("--min-capsid-area", type=int, default=DEFAULT_MIN_CAPSID_AREA_PX, metavar="PIXELS",
+                        help="Minimum connected capsid area in native screenshot pixels for automatic detection (default: 3500; 0 allows all sizes). Manual, explicit prompts, and generic detection are unchanged.")
     parser.add_argument("--spacing", type=int, default=13)
     parser.add_argument("--inset", type=float, default=2)
     parser.add_argument("--output", type=Path, help="Headless segmentation output directory; defaults to writable user data when installed.")
@@ -7967,7 +8135,8 @@ def _run_application(args, *, console_available: bool) -> int:
             output = args.output or (user_state_directory() / "exports" / "saru_output"
                                     if getattr(sys, "frozen", False) else Path("saru_output"))
             config = RecognitionConfig(str(checkpoint), model_type=args.model_type, device=args.device,
-                                       points_per_side=args.points_per_side, automatic_profile=args.automatic_profile)
+                                       points_per_side=args.points_per_side, automatic_profile=args.automatic_profile,
+                                       min_capsid_area_px=args.min_capsid_area)
             rgb = load_rgb_file(args.segment_image)
             recognizer = SamRecognizer(config)
             try:

@@ -1,10 +1,12 @@
-# SARU Picker 2.7.0
+# SARU Picker 2.7.1
 
 SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the image viewer, with its existing layout and controls. A compact, always-on-top **SARU PICKER** panel selects manual, semi-auto, or auto mode.
 
 ## Windows application
 
-The CPU installer is named **SARU-Picker-Setup-2.7.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+The CPU installer is named **SARU-Picker-Setup-2.7.1-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+
+Version 2.7.1 excludes small automatically detected capsid regions by default. Both **capsid** and **capsid-learned** require each final connected region to contain at least **3,500 native screen pixels**. Change **Advanced → Minimum capsid area (screen px²)** to adjust this for your zoom; **0** restores all sizes. The cutoff counts actual foreground pixels, excludes holes, and never combines disconnected small fragments to pass the limit. It is applied after contour refinement, so surviving contours keep their original boundaries. Empty detection results stay empty. Manual contours, explicit Box prompts, and generic SAM proposals retain their existing behavior. Changing recognition settings retires old displayed contours and requires Detect again while retaining actual pick history. This release keeps the 2.7.0 learned weights; no retraining is claimed.
 
 Version 2.7.0 supports the updated private appearance profile trained with examples 1–80. The training utility records both source decks, holds every screenshot out during development evaluation, and supports conservative positive interiors from small marked groups as well as balanced sampling across examples. Recognition now derives compact prompt regions when an attached extension would otherwise prevent SAM from outlining a capsid; the stricter final shape and carbon checks still apply. Large-capsid coverage and contour boundaries have priority in the private model comparison. The delivered model and its remaining limitations are documented in the private guide. The screen controls, manual gesture, picking speed, and neural-network architecture are retained.
 
@@ -14,7 +16,7 @@ Version 2.6.0 replaces the temporary annotation window between semi-auto contour
 
 For a custom-icon download, **extract the complete ZIP before running setup**. Keep `app-icon.png` and `app-icon.ico` beside the setup EXE during installation. Setup copies this artwork into the installed application and updates its EXE and shortcut icons. Personal artwork is distributed with the private download rather than committed to the public source tree. Running setup without these optional files uses the repository's geometric fallback icon.
 
-If the download includes **capsid-profile.json**, keep it beside setup as well. Installation places this learned appearance profile next to the bundled SAM model; **Advanced → Detection profile → capsid-learned** selects the experimental learned detector. The default **capsid** detector is unchanged even when the sidecar is installed. The public installer without that optional profile retains the earlier texture-based detector. See [profile installation and validation limits](CAPSID_PROFILE.md).
+If the download includes **capsid-profile.json**, keep it beside setup as well. Installation places this learned appearance profile next to the bundled SAM model; **Advanced → Detection profile → capsid-learned** selects the experimental learned detector. The default **capsid** detector uses its existing appearance heuristic and the same new size cutoff; installing the sidecar does not select the learned mode. The public installer without that optional profile retains the earlier texture-based detector. See [profile installation and validation limits](CAPSID_PROFILE.md).
 
 ## Manual mode — original interaction
 

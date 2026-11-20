@@ -194,6 +194,7 @@ def app_state(mode="manual"):
     app.checkpoint, app.model_type = Variable("supplied-model.pth"), Variable("vit_b")
     app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(DEFAULT_CLICK_DELAY)
     app.automatic_profile = Variable("capsid")
+    app.min_capsid_area = Variable("3500")
     app.frames, app.wait_seconds = Variable(0), Variable(10.0)
     app.closed = app.transition = app.paused = False
     app._fit_after = None
@@ -221,6 +222,37 @@ def app_state(mode="manual"):
 
 
 class ScreenGeometryTests(unittest.TestCase):
+    def test_size_setting_retires_stale_contours_but_preserves_actual_picks(self):
+        app = app_state("semi-auto")
+        app.min_capsid_area.set("0")
+        previous = app._model_config()
+        candidate = make_candidate(np.ones((70, 80), bool))
+        app.candidates, app.alternatives = [candidate], [candidate]
+        app.overlay.draw_masks([candidate], app.geometry)
+        app.picked_points.add((12, 18))
+        reference = app.reference
+        app.min_capsid_area.set("5000")
+        self.assertTrue(app._apply_model_settings(previous))
+        self.assertEqual(app.candidates, [])
+        self.assertEqual(app.alternatives, [])
+        self.assertEqual(app.overlay.masks, [])
+        self.assertEqual(app.picked_points, {(12, 18)})
+        self.assertIs(app.reference, reference)
+        self.assertEqual(app._model_config().min_capsid_area_px, 5000)
+        self.assertIn("Detect", app.status.get())
+
+    def test_invalid_size_setting_cannot_retire_or_accept_current_contours(self):
+        app = app_state("semi-auto")
+        previous = app._model_config()
+        candidate = make_candidate(np.ones((70, 80), bool))
+        app.candidates = [candidate]
+        for invalid in ("-1", "nan", "4999.5", ""):
+            with self.subTest(invalid=invalid):
+                app.min_capsid_area.set(invalid)
+                with self.assertRaises(ValueError):
+                    app._apply_model_settings(previous)
+                self.assertEqual(app.candidates, [candidate])
+
     def test_previous_pick_coordinates_reject_fractional_nan_and_out_of_bounds(self):
         geometry = CaptureGeometry(100, 100, 80, 70)
         candidate = make_candidate(np.ones((70, 80), bool))
