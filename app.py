@@ -1087,17 +1087,44 @@ def _smoke_windows_work_area() -> tuple[int, int, int, int]:
     return bounds
 
 
-def _smoke_position_fixture(window, work_area) -> str:
-    """Choose one test position; retain the application's requested size.
+def _smoke_position_fixture(window, work_area) -> dict[str, Any]:
+    """Place a mapped fixture once without size, focus or z-order changes.
 
     Fresh Tk roots and settings windows otherwise use Windows' cascaded
     placement. That moving origin can put a later, larger scale off-screen.
-    Position fixtures before their first native layout/capture check, never
-    in response to a failed check or between pixel-validation frames.
+    A Tk geometry request made before mapping can be superseded by the native
+    wrapper's initial placement. The caller first maps and pumps the window;
+    use its actual outer HWND before the first layout/capture validation.
+    Never reposition in response to a failed check or between capture frames.
     """
-    geometry = f"+{work_area[0] + 16}+{work_area[1] + 16}"
-    window.geometry(geometry)
-    return geometry
+    import ctypes
+    from ctypes import wintypes
+
+    if window.state() != "normal" or not window.winfo_viewable():
+        raise RuntimeError("Native UI fixture must already be mapped before placement.")
+    user32 = ctypes.windll.user32
+    ancestor = user32.GetAncestor
+    ancestor.argtypes, ancestor.restype = [wintypes.HWND, wintypes.UINT], wintypes.HWND
+    position = user32.SetWindowPos
+    position.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                        ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    position.restype = wintypes.BOOL
+    handle = int(ancestor(int(window.winfo_id()), 2) or 0)  # GA_ROOT: native outer wrapper.
+    if not handle:
+        raise RuntimeError("Native UI fixture has no outer Windows handle.")
+    before = control_panel_bounds(window)
+    left, top = work_area[0] + 16, work_area[1] + 16
+    flags = 0x0001 | 0x0004 | 0x0010  # NOSIZE | NOZORDER | NOACTIVATE.
+    if not position(handle, None, left, top, 0, 0, flags):
+        raise RuntimeError("Could not position the native UI fixture.")
+    window.update()  # Dispatch this one move's Configure event before validation.
+    after = control_panel_bounds(window)
+    if after[:2] != (left, top) or after[2:] != before[2:]:
+        raise RuntimeError(f"Native UI fixture placement did not preserve its requested origin/size: "
+                           f"before={before}, after={after}, requested_origin={(left, top)}.")
+    return {"method": "SetWindowPos", "requested_outer_origin": [left, top],
+            "native_bounds_before": list(before), "native_bounds_after": list(after),
+            "flags": flags, "size_unchanged": True, "mapped_before_placement": True}
 
 
 def _smoke_assert_work_area(window, work_area) -> dict[str, Any]:
@@ -1121,10 +1148,10 @@ def _smoke_advanced_settings(picker, percent, screenshot_dir=None, *, work_area=
     window = picker.advanced
     if window is None:
         raise RuntimeError("Advanced settings did not open.")
-    fixture_position = _smoke_position_fixture(window, work_area)
     picker.root.update()
     if not window.winfo_viewable():
         raise RuntimeError("Advanced settings did not open.")
+    fixture_position = _smoke_position_fixture(window, work_area)
     screen_bounds = _smoke_assert_work_area(window, work_area)
     width, height = window.winfo_width(), window.winfo_height()
     if width < window.winfo_reqwidth() or height < window.winfo_reqheight():
@@ -1148,7 +1175,7 @@ def _smoke_advanced_settings(picker, percent, screenshot_dir=None, *, work_area=
         raise RuntimeError("The default minimum capsid area is not exposed correctly.")
     record = {'status':'ok', 'scale_percent':percent, 'window_size':[width,height],
               'default_minimum_area_px':3500, 'all_controls_mapped_and_inside_window':True,
-              'fixture_position_geometry':fixture_position, 'screen_bounds':screen_bounds}
+              'fixture_position':fixture_position, 'screen_bounds':screen_bounds}
     if screenshot_dir is not None:
         record['screenshot'] = _smoke_panel_screenshot(
             window, Path(screenshot_dir)/f'settings-{percent}.png')
@@ -1198,8 +1225,9 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                     or picker.hotkeys is not None or picker.mouse_observer is not None
                     or picker.overlay is not None):
                 raise RuntimeError("The compact screen application did not start in passive manual mode.")
-            fixture_position = _smoke_position_fixture(window, work_area)
             window.state("normal")
+            _smoke_settle_panel(picker)
+            fixture_position = _smoke_position_fixture(window, work_area)
             layouts = {}
             for mode in ("manual", "semi-auto", "auto"):
                 if picker.mode != mode:
@@ -1231,7 +1259,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
             scale_checks.append({"scale_percent": percent, "requested_dpi": requested_dpi,
                                  "native_tk_scaling_before_test": original_scaling,
                                  "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts,
-                                 "fixture_position_geometry": fixture_position,
+                                 "fixture_position": fixture_position,
                                  "advanced_settings":settings_check})
             if overlay_checks is None:
                 overlay_checks = verify_screen_overlay(window)
@@ -1265,7 +1293,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
             "full_application_constructed": True, "synthetic_mask_rendered": True,
             "compact_manual_default": True, "panel_layouts": panel_layouts,
             "fixture_work_area_bbox": list(work_area),
-            "fixture_placement_method": "Position-only placement before native layout validation; complete native frames must fit the Windows work area. No resize or retry-to-pass.",
+            "fixture_placement_method": "One native SetWindowPos after initial mapping, before layout validation; NOSIZE|NOZORDER|NOACTIVATE. Complete native frames must fit the Windows work area. No resize or retry-to-pass.",
             "layout_scaling_method": "Native Windows Tk widgets; pixels-per-point set before construction to simulate 100/125/150/200% of 96 DPI. Windows monitor scaling is unchanged.",
             "layout_scale_checks": scale_checks,
             "screen_overlay": overlay_checks,
