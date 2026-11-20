@@ -14,7 +14,7 @@ from recognition import make_candidate
 from micrograph_navigation import NoNewMicrographError, MicrographLoadTimeoutError
 from screen_app import (ScreenPickerApp, screen_changed_fraction, screen_mask_at, screen_model_points, screen_model_batches,
                         screen_background_guard, screen_background_changed, screen_region_overlaps_panel,
-                        DEFAULT_MODEL_CLICK_DELAY)
+                        DEFAULT_CLICK_DELAY)
 
 
 class Variable:
@@ -80,6 +80,9 @@ class Surface:
         self.traces = []
     def draw_trace(self, points):
         self.traces.append(tuple(points))
+    def begin_trace(self, points):
+        self.clear()
+        self.draw_trace(points)
     def draw_masks(self, candidates, geometry, selected_ids=(), preview=None):
         self.masks = list(candidates)
     def draw_region(self, geometry):
@@ -173,6 +176,7 @@ def app_state(mode="manual"):
     app.desktop = Desktop(app)
     app.overlay = Surface()
     app.input_surface = app.advanced = None
+    app._picking_menu = None
     app.mouse_observer = Mock()
     app.hotkeys = Mock()
     app._manual_gate = threading.Event()
@@ -184,7 +188,7 @@ def app_state(mode="manual"):
     app.disabled, app.spacing = Variable(False), Variable(13)
     app.status, app.region_label = Variable(""), Variable("")
     app.checkpoint, app.model_type = Variable("supplied-model.pth"), Variable("vit_b")
-    app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(DEFAULT_MODEL_CLICK_DELAY)
+    app.device, app.grid_side, app.click_delay = Variable("cpu"), Variable(8), Variable(DEFAULT_CLICK_DELAY)
     app.automatic_profile = Variable("capsid")
     app.frames, app.wait_seconds = Variable(0), Variable(10.0)
     app.closed = app.transition = app.paused = False
@@ -404,12 +408,27 @@ class ScreenControllerTests(unittest.TestCase):
         app._manual_input(0, "press", 150, 100)  # outside client bounds, own native HWND
         self.assertIsNone(app.manual_window)
         self.assertFalse(app.drawing)
+
+    def test_manual_press_prepares_clean_trace_before_mapping_overlay(self):
+        app = app_state()
+        old = ((150, 110), (210, 110), (210, 155), (150, 155))
+        app.overlay.traces = [old]
+        previous_show = app.overlay.show
+        def show_only_clean_trace():
+            self.assertEqual(app.overlay.traces, [((180, 130),)])
+            previous_show()
+        app.overlay.show = show_only_clean_trace
+        app._manual_input(0, "press", 180, 130)
+        self.assertTrue(app.overlay.visible)
+        self.assertEqual(app.trace, [(180, 130)])
         self.assertFalse(app.root.hidden)
 
-    def test_manual_is_independent_of_model_delay_settings(self):
+    def test_manual_uses_shared_speed_without_reading_model_settings(self):
         app = app_state()
-        app.click_delay.set("unfinished model setting")
-        self.assertEqual(app._live_ready(), .1)
+        app.click_delay.set(.005)
+        app.grid_side.set("unfinished model setting")
+        app.checkpoint.set("")
+        self.assertEqual(app._live_ready(), .005)
 
     def test_manual_release_immediately_submits_original_grid_with_panel_visible(self):
         app = app_state()
@@ -431,7 +450,7 @@ class ScreenControllerTests(unittest.TestCase):
         app.desktop.focus_target = Mock(side_effect=AssertionError("Manual must not change focus"))
         with patch("screen_app.play_clicks", wraps=__import__("execution").play_clicks) as playback:
             result = app.runner.finish()
-        self.assertEqual(playback.call_args.kwargs["delay"], .1)
+        self.assertEqual(playback.call_args.kwargs["delay"], DEFAULT_CLICK_DELAY)
         self.assertEqual(app.desktop.clicks, [tuple(p) for p in legacy_contour_points(polygon, 13)])
         self.assertEqual(app.desktop.captures, [], "Manual mode must never take screenshots")
         app._result("manual picks", result)
@@ -1208,11 +1227,82 @@ class ScreenControllerTests(unittest.TestCase):
         app.poll()
         self.assertEqual(app.picked_points, set())
 
-    def test_fast_model_default_does_not_change_manual_playback_delay(self):
-        app = app_state("semi-auto")
-        self.assertEqual(app._live_ready(), .03)
-        app.mode = "manual"
-        self.assertEqual(app._live_ready(), .10)
+    def test_all_modes_share_fast_default_and_configurable_maximum_speed(self):
+        self.assertEqual(DEFAULT_CLICK_DELAY, .01)
+        app = app_state()
+        for delay in (DEFAULT_CLICK_DELAY, 0, .005, .05, 2):
+            app.click_delay.set(delay)
+            for mode in ("manual", "semi-auto", "auto"):
+                with self.subTest(delay=delay, mode=mode):
+                    app.mode = mode
+                    self.assertEqual(app._live_ready(), delay)
+
+    def test_all_modes_reject_invalid_shared_delays_before_playback(self):
+        app = app_state()
+        for delay in (-.01, 2.01, float("nan"), float("inf"), "unfinished"):
+            app.click_delay.set(delay)
+            for mode in ("manual", "semi-auto", "auto"):
+                with self.subTest(delay=delay, mode=mode):
+                    app.mode = mode
+                    with self.assertRaises(ValueError):
+                        app._live_ready()
+        self.assertEqual(app.desktop.clicks, [])
+
+    def test_manual_maximum_speed_keeps_original_grid_and_panel(self):
+        app = app_state()
+        app.click_delay.set(0)
+        app.trace = [(150, 110), (210, 110), (210, 155), (150, 155)]
+        polygon = tuple(app.trace)
+        app.manual_window = 42
+        app._finish_manual()
+        with patch("screen_app.play_clicks", wraps=__import__("execution").play_clicks) as playback:
+            app.runner.finish()
+        self.assertEqual(playback.call_args.kwargs["delay"], 0)
+        self.assertEqual(app.desktop.clicks, [tuple(p) for p in legacy_contour_points(polygon, 13)])
+        self.assertFalse(app.root.hidden)
+
+    def test_manual_speed_shortcut_opens_shared_settings_without_mode_change(self):
+        app = app_state()
+        app.open_advanced = Mock()
+        self.assertEqual(app._open_picking_speed(), "break")
+        app.open_advanced.assert_called_once_with()
+        self.assertEqual(app.mode, "manual")
+        self.assertEqual(app.root.callbacks, {})
+        self.assertFalse(app.root.hidden)
+
+    def test_panel_context_menu_exposes_picking_speed_and_f9(self):
+        app = app_state()
+        menu = Mock()
+        app.tk.Menu = Mock(return_value=menu)
+        app.open_advanced = Mock()
+        event = SimpleNamespace(x_root=35, y_root=45)
+        self.assertEqual(app._show_picking_menu(event), "break")
+        menu.add_command.assert_called_once_with(label="Picking speed…", accelerator="F9",
+                                                 command=app._open_picking_speed)
+        menu.tk_popup.assert_called_once_with(35, 45)
+        menu.grab_release.assert_called_once_with()
+        menu.add_command.call_args.kwargs["command"]()
+        app.open_advanced.assert_called_once_with()
+
+    def test_speed_entry_points_do_not_interrupt_active_work(self):
+        for state in ("worker", "transition", "auto", "drawing", "selection", "closed"):
+            with self.subTest(state=state):
+                app = app_state()
+                app.open_advanced, app.stop = Mock(), Mock()
+                app.tk.Menu = Mock()
+                if state == "worker":
+                    app.runner.busy = True
+                elif state == "auto":
+                    app.auto_remaining = -1
+                elif state == "selection":
+                    app.input_surface, app.input_kind = Surface(), "region"
+                else:
+                    setattr(app, state, True)
+                self.assertEqual(app._open_picking_speed(), "break")
+                self.assertEqual(app._show_picking_menu(SimpleNamespace(x_root=35, y_root=45)), "break")
+                app.open_advanced.assert_not_called()
+                app.tk.Menu.assert_not_called()
+                app.stop.assert_not_called()
 
     def test_start_auto_reuses_exact_displayed_contours_without_redetecting(self):
         app = app_state("auto")

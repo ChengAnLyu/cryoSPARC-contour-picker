@@ -255,6 +255,48 @@ class ScreenSurfaceTests(unittest.TestCase):
         overlay.clear()
         self.assertEqual(overlay.canvas.items, [])
 
+    def test_new_manual_stroke_retires_hidden_surface_before_showing(self):
+        overlay = ScreenOverlay(self.root, **self.options)
+        overlay.begin_trace([(110, 205), (121, 217), (140, 230)])
+        overlay.show()
+        previous_window, previous_canvas = overlay.window, overlay.canvas
+        self.assertTrue(previous_canvas.items)
+        overlay.hide()
+        # Completion deletes logical Canvas items while the native surface
+        # is withdrawn; its previously painted buffer can still be retained.
+        overlay.clear()
+        overlay.begin_trace([(310, 305)])
+        self.assertTrue(previous_window.destroyed)
+        self.assertIsNot(overlay.window, previous_window)
+        self.assertIsNot(overlay.canvas, previous_canvas)
+        self.assertEqual(overlay.canvas.items, [])
+        self.assertFalse(overlay.visible, "Begin prepares a clean surface without mapping it")
+        self.assertNotIn(("state", "normal"), overlay.window.calls)
+        overlay.show()
+        self.assertNotEqual(overlay.window.handle, previous_window.handle)
+        self.assertTrue(overlay.visible)
+        self.assertEqual(self.styles.raised[-1], self.root.winfo_id())
+        self.assertFalse(overlay.closed)
+
+    def test_manual_surface_replacement_does_not_accumulate_live_windows(self):
+        overlay = ScreenOverlay(self.root, **self.options)
+        for index in range(6):
+            overlay.begin_trace([(100+index, 200), (120+index, 220)])
+            overlay.show()
+            self.assertEqual(sum(not window.destroyed for window in self.root.windows), 1)
+            overlay.hide()
+        overlay.close()
+        self.assertTrue(all(window.destroyed for window in self.root.windows))
+
+    def test_begin_trace_rejects_invalid_points_without_retiring_existing_surface(self):
+        overlay = ScreenOverlay(self.root, **self.options)
+        overlay.begin_trace([(100, 200), (120, 220)])
+        previous = overlay.window
+        with self.assertRaises((ValueError, OverlayError)):
+            overlay.begin_trace([(float("nan"), 200)])
+        self.assertIs(overlay.window, previous)
+        self.assertFalse(previous.destroyed)
+
     def test_input_uses_nonzero_alpha_without_color_key_and_root_coordinates(self):
         events = []
         surface = InputSurface(self.root, CaptureGeometry(100, 200, 80, 90),

@@ -386,6 +386,7 @@ class WindowsScaleCoverageTests(unittest.TestCase):
              patch.object(app, "windows_application_icon_status", return_value={"small_icon": True, "large_icon": True}), \
              patch.object(app, "_smoke_repeated_screen_picks", return_value={"contours_completed": 3}) as repeated, \
              patch.object(app, "_smoke_micrograph_cycle", return_value={"continuous_auto": {"down_keys": 3}}) as cycle, \
+             patch.object(app, "_smoke_manual_strokes", return_value={"strokes_completed": 2}) as manual, \
              patch.object(app, "verify_screen_overlay", side_effect=verify_overlay) as overlay:
             result = app._smoke_windows_runtime(Path("app.log"))
         expected_scales = [96 * percent / 100 / 72 for percent in (100, 125, 150, 200)]
@@ -409,8 +410,10 @@ class WindowsScaleCoverageTests(unittest.TestCase):
         overlay.assert_called_once_with(windows[0])
         repeated.assert_called_once_with(pickers[0])
         cycle.assert_called_once_with(pickers[0])
+        manual.assert_called_once_with(pickers[0])
         self.assertEqual(result["repeated_semi_auto_contours"]["contours_completed"], 3)
         self.assertEqual(result["micrograph_navigation_cycle"]["continuous_auto"]["down_keys"], 3)
+        self.assertEqual(result["consecutive_manual_strokes"]["strokes_completed"], 2)
         modules["pyautogui"].click.assert_not_called()
         self.assertEqual(result["desktop_events_sent"], 0)
         self.assertEqual(result["global_listeners_started"], 0)

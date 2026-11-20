@@ -45,7 +45,7 @@ from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fr
 from screen_overlay import control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -718,6 +718,186 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
         picker.set_mode(previous_mode)
 
 
+def _smoke_manual_strokes(picker) -> dict[str, Any]:
+    """Check fresh manual surfaces and playback without native input events.
+
+    Synthetic hook records enter the real controller queue. Real Tk surfaces
+    and the actual worker are exercised, but all generated picks terminate in
+    the memory adapter. This verifies window replacement and Canvas contents;
+    it is not a recording of every Windows compositor frame.
+    """
+    import threading
+
+    root = picker.root
+    previous_mode = picker.mode
+    previous_desktop, previous_hotkeys, previous_mouse = (picker.desktop, picker.hotkeys,
+                                                         picker.mouse_observer)
+    previous_delay, previous_spacing = float(picker.click_delay.get()), int(picker.spacing.get())
+    if previous_delay != .01:
+        raise RuntimeError("The new application did not start with the shared 0.01-second click delay.")
+    picker.set_mode("manual")
+    _smoke_settle_panel(picker)
+    panel_identity = int(root.winfo_id())
+    width, height = root.winfo_screenwidth(), root.winfo_screenheight()
+    occupied = control_panel_bounds(root)
+    geometry = next((CaptureGeometry(x, y, 240, 160)
+                     for x, y in ((width-260, 30), (width-260, height-190),
+                                  (20, height-190), (20, 30))
+                     if x >= 0 and y >= 0
+                     and not screen_region_overlaps_panel(CaptureGeometry(x, y, 240, 160), occupied)), None)
+    if geometry is None:
+        raise RuntimeError("No free screen area for the consecutive-manual-stroke UI check.")
+
+    class Hooks:
+        def enable_space_pause(self, enabled):
+            pass
+        def stop(self):
+            pass
+
+    class MemoryDesktop:
+        def __init__(self):
+            self.clicks, self.thread_ids, self.bound = [], set(), None
+        def target_at(self, x, y):
+            if not geometry.contains(x, y):
+                raise RuntimeError("The synthetic manual press escaped the test area.")
+            return 12345
+        def is_own_window(self, target):
+            return False
+        def size(self):
+            return width, height
+        def bind_target(self, target):
+            if target != 12345:
+                raise RuntimeError("Unexpected synthetic manual target.")
+            self.bound = target
+        def click(self, x, y):
+            if self.bound != 12345 or not geometry.contains(x, y):
+                raise RuntimeError("A synthetic manual pick escaped the bound target.")
+            if ((picker.overlay is not None and picker.overlay.visible)
+                    or (picker.input_surface is not None and picker.input_surface.visible)):
+                raise RuntimeError("A screen layer remained visible during manual playback.")
+            self.thread_ids.add(threading.get_ident())
+            self.clicks.append((int(x), int(y)))
+
+    desktop = MemoryDesktop()
+
+    def panel_visible():
+        if (int(root.winfo_id()) != panel_identity or root.state() != "normal"
+                or not root.winfo_viewable()
+                or not root.tk.getboolean(root.attributes("-topmost"))):
+            raise RuntimeError("The persistent control panel changed or disappeared during a manual stroke.")
+
+    def pump_until(predicate, label, *, seconds=10):
+        deadline = time.monotonic() + seconds
+        while True:
+            root.update()
+            panel_visible()
+            if predicate():
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"{label} did not complete: {picker.status.get()}")
+            time.sleep(.005)
+
+    left, top = geometry.left, geometry.top
+    strokes = [
+        [(left+10, top+20), (left+70, top+20), (left+70, top+80), (left+10, top+80)],
+        [(left+130, top+30), (left+210, top+30), (left+210, top+115), (left+130, top+115)],
+    ]
+    # Independent fixtures for the original spacing=20 lattice: row height 17,
+    # odd-row shift 10, excluded top/left and included bottom/right boundaries.
+    expected_local = [
+        [(20, 37), (40, 37), (60, 37), (30, 54), (50, 54), (70, 54),
+         (20, 71), (40, 71), (60, 71)],
+        [(140, 47), (160, 47), (180, 47), (200, 47),
+         (150, 64), (170, 64), (190, 64), (210, 64),
+         (140, 81), (160, 81), (180, 81), (200, 81),
+         (150, 98), (170, 98), (190, 98), (210, 98),
+         (140, 115), (160, 115), (180, 115), (200, 115)],
+    ]
+    expected = [[(left+x, top+y) for x, y in points] for points in expected_local]
+    surfaces, counts = [], []
+    delays = {}
+    try:
+        picker.desktop, picker.hotkeys, picker.mouse_observer = desktop, Hooks(), Hooks()
+        for delay in (previous_delay, 0.0):
+            values = {}
+            for mode in ("manual", "semi-auto", "auto"):
+                picker.set_mode(mode)
+                picker.disabled.set(False)
+                picker.click_delay.set(delay)
+                values[mode] = picker._live_ready()
+            if set(values.values()) != {delay}:
+                raise RuntimeError("Click pacing is not shared by all picking modes.")
+            delays["default" if delay else "zero"] = values
+        picker.set_mode("manual")
+        picker.disabled.set(False)
+        picker.spacing.set(20)
+        picker._sync_manual()
+        _smoke_settle_panel(picker)
+        # Paint an old trace before stroke 1, then hide it, reproducing the
+        # surface lifecycle that previously reused a layered backing store.
+        overlay = picker.ensure_overlay()
+        overlay.draw_trace(strokes[1])
+        overlay.show()
+        root.update()
+        overlay.hide()
+        root.update()
+        for index, points in enumerate(strokes):
+            picker.click_delay.set(previous_delay if index == 0 else 0.0)
+            previous_window, previous_canvas = overlay.window, overlay.canvas
+            offset = len(desktop.clicks)
+            picker._mouse_event(("press", *points[0]))
+            pump_until(lambda: picker.drawing, f"Manual stroke {index+1} press")
+            if (overlay is not picker.overlay or overlay.window is previous_window
+                    or overlay.canvas is previous_canvas or previous_window.winfo_exists()
+                    or previous_canvas.winfo_exists() or not overlay.visible
+                    or overlay.canvas.find_all()):
+                raise RuntimeError(f"Manual stroke {index+1} reused old surface geometry.")
+            surfaces.append({"tk_window": str(overlay.window),
+                             "native_window": int(overlay.window.winfo_id()),
+                             "previous_window_destroyed": True,
+                             "initial_canvas_empty": True})
+            for point in points[1:]:
+                picker._mouse_event(("move", *point))
+            coordinates = [float(value) for point in points for value in point]
+            pump_until(lambda: list(overlay.canvas.coords("trace")) == coordinates,
+                       f"Manual stroke {index+1} drawing")
+            if (len(overlay.canvas.find_all()) != 1
+                    or len(overlay.canvas.find_withtag("trace")) != 1):
+                raise RuntimeError("Manual drawing contains geometry outside the current trace.")
+            picker._mouse_event(("release", *points[0]))
+            pump_until(lambda: (not picker.drawing and not picker.released
+                               and not picker.runner.busy and not picker.transition
+                               and picker._manual_gate.is_set()),
+                       f"Manual stroke {index+1} playback")
+            if desktop.clicks[offset:] != expected[index]:
+                raise RuntimeError(f"Manual stroke {index+1} changed the original lattice or pick order.")
+            if picker.disabled.get() or overlay.visible or overlay.canvas.find_all():
+                raise RuntimeError("Manual playback did not return to a clean, enabled drawing state.")
+            counts.append(len(desktop.clicks)-offset)
+        if len(desktop.thread_ids) != 1 or threading.get_ident() in desktop.thread_ids:
+            raise RuntimeError("Manual picking did not use the serialized background worker.")
+        return {"strokes_completed": len(counts), "picks_per_stroke": counts,
+                "total_test_picks": len(desktop.clicks), "manual_grid_and_order_unchanged": True,
+                "shared_delays_by_mode": delays, "stroke_delays_seconds": [previous_delay, 0.0],
+                "fresh_annotation_surface_per_stroke": True, "surfaces": surfaces,
+                "only_current_trace_geometry": True, "panel_identity_preserved": True,
+                "panel_visible_throughout": True, "real_worker_and_hook_queue": True,
+                "desktop_events_sent": 0,
+                "note": "Real Tk surfaces/controller/worker with synthetic hook records and an in-memory click sink. "
+                        "Verifies fresh native windows and Canvas contents, not every compositor frame or live cryoSPARC."}
+    finally:
+        picker.stop()
+        if not picker.runner.shutdown(wait=True, timeout=5):
+            raise RuntimeError("Manual-stroke test worker did not terminate.")
+        picker.runner.poll_results()
+        picker.runner = TaskRunner()
+        picker.desktop, picker.hotkeys, picker.mouse_observer = (previous_desktop,
+                                                               previous_hotkeys, previous_mouse)
+        picker.click_delay.set(previous_delay)
+        picker.spacing.set(previous_spacing)
+        picker.set_mode(previous_mode)
+
+
 def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None) -> dict[str, Any]:
     # These are native Windows widgets at simulated Tk font/layout scales. The
     # Windows monitor's DPI setting is never changed. Each fresh interpreter is
@@ -731,6 +911,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
     overlay_checks = None
     repeated_contours = None
     micrograph_cycle = None
+    manual_strokes = None
     icon_checks = None
     tk_version = None
     long_status = ("Recognition is running on the selected screen area.\n"
@@ -787,6 +968,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                     raise RuntimeError(f"The native application icon or bundled artwork is missing: "
                                        f"native={icon_checks}, assets="
                                        f"{[(str(path), path.is_file()) for path in application_icon_paths()]}")
+                manual_strokes = _smoke_manual_strokes(picker)
                 repeated_contours = _smoke_repeated_screen_picks(picker)
                 micrograph_cycle = _smoke_micrograph_cycle(picker)
         finally:
@@ -816,6 +998,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
             "application_icon": icon_checks,
             "repeated_semi_auto_contours": repeated_contours,
             "micrograph_navigation_cycle": micrograph_cycle,
+            "consecutive_manual_strokes": manual_strokes,
             "desktop_events_sent": 0, "global_listeners_started": 0}
 
 

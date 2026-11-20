@@ -1,6 +1,6 @@
-# SARU Picker 2.4 for Windows
+# SARU Picker 2.5 for Windows
 
-Install **SARU-Picker-Setup-2.4.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.5.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
@@ -10,7 +10,7 @@ using that fallback for the installed app.
 
 ## Work directly over cryoSPARC
 
-The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer. The panel stays visible during drawing, detection and picking, and sizes itself to fit its controls and Windows text scaling. The terminate button has a reserved footer. Version 2.4 preserves these UI fixes and the original manual picking path.
+The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer. The panel stays visible during drawing, detection and picking, and sizes itself to fit its controls and Windows text scaling. The terminate button has a reserved footer. Version 2.5 preserves the original manual gesture and spacing while sharing faster click pacing across all modes. A new manual stroke clears the previous outline before its new trace appears, with the panel retained.
 
 | Mode | Screen interaction |
 | --- | --- |
@@ -22,7 +22,9 @@ The normal application is the original compact floating control panel. cryoSPARC
 
 In auto mode, **Limit (0=all)** accepts 0–1000. Zero continues until stopped or until another micrograph cannot be verified; a positive number includes the current image and images with no detections. Empty images are skipped. **Load (s)** is the maximum time to wait for a changed, stable image, default 10 seconds; the app continues sooner when loading completes. A navigation attempt sends Down once. An unchanged/end-of-list view, a recently repeated image, a loading timeout, or loss of target focus stops the cycle.
 
-Semi-auto and auto default to **0.03 seconds between clicks**, adjustable from 0.02 to 2 seconds in Advanced. Manual mode retains its 0.10-second cadence. The faster setting retains per-click cancellation, focus/position checks, and the mouse fail-safe. In a synthetic 200-pick diagnostic, playback changed from **20.885 to 6.597 seconds**; this used simulated adapter and scene-check costs, excluded inference/loading, and did not measure a live cryoSPARC browser. See [validation details](VALIDATION.md#version-240-navigation-and-picking-speed).
+Manual, semi-auto and auto share a **0.01-second default click delay**. Set **0.00** for no added inter-click delay, or increase the value if the browser misses picks. Open settings using **Advanced…** in model modes, **F9** while the SARU panel has focus, or a right-click on the panel followed by **Picking speed…**. The manual panel layout stays compact.
+
+Zero delay still yields between clicks, and per-click cancellation, focus/position checks and the mouse fail-safe remain active. Actual accepted-pick throughput depends on Windows and cryoSPARC; this setting does not speed up model inference or image loading. See [version 2.5 validation scope](VALIDATION.md#version-250-shared-picking-speed-and-manual-outline-cleanup). The earlier 2.4 synthetic timing results are retained as historical evidence.
 
 Escape stops and disables picking. Space pauses/resumes an active auto run; F8 is an additional pause key. Keep cryoSPARC on the primary monitor and keep its micrograph zoom and position fixed during recognition and playback.
 

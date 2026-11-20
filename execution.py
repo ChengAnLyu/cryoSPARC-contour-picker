@@ -13,6 +13,7 @@ import math
 from numbers import Integral, Real
 import queue
 import threading
+import time
 import traceback
 from typing import Any, Callable, Iterable
 
@@ -357,8 +358,10 @@ def play_clicks(
     propagates immediately; a caller must not advance to another image after
     such an error. Progress callbacks execute on the caller's worker thread.
 
-    ``delay`` is the wait *between* clicks. The click adapter should disable
-    additional automatic pauses while leaving its fail-safe enabled.
+    ``delay`` is the wait *between* clicks. Zero removes the configured wait
+    but yields the worker between events so the GUI/input threads can process
+    Stop and pause requests. The click adapter should disable additional
+    automatic pauses while leaving its fail-safe enabled.
     """
     if not callable(click_fn):
         raise TypeError("click_fn must be callable.")
@@ -402,5 +405,11 @@ def play_clicks(
             progress(completed, total)
         token.check_cancelled()
         if completed < total:
-            token.sleep(delay)
+            if delay:
+                token.sleep(delay)
+            else:
+                # Event.wait(0) does not yield a busy worker. Release its time
+                # slice without imposing a fixed delay; the next iteration
+                # still checks cancellation/pause before sending any input.
+                time.sleep(0)
     return completed

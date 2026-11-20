@@ -3,6 +3,7 @@
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from execution import (
     CancelledOperation,
@@ -98,6 +99,25 @@ class ClickTests(unittest.TestCase):
             self.play([(100, 200), (101, 201)], click_fn=click)
         self.assertIs(context.exception, failure)
         self.assertEqual(self.clicks, [(100, 200)])
+
+    def test_zero_delay_yield_allows_stop_before_the_next_click(self):
+        # Simulate the GUI handling Stop as soon as the fast worker yields.
+        # No queued batch may continue to send input after that cancellation.
+        with patch("execution.time.sleep", side_effect=lambda seconds: self.token.cancel()) as sleep:
+            with self.assertRaises(CancelledOperation):
+                self.play([(100, 200), (101, 201), (102, 202)], delay=0)
+        self.assertEqual(self.clicks, [(100, 200)])
+        sleep.assert_called_once_with(0)
+
+    def test_zero_delay_keeps_order_and_progress_without_trailing_wait(self):
+        progress = []
+        with patch("execution.time.sleep") as sleep:
+            count = self.play([(100, 200), (101, 201), (102, 202)], delay=0,
+                              progress=lambda done, total: progress.append((done, total)))
+        self.assertEqual(count, 3)
+        self.assertEqual(self.clicks, [(100, 200), (101, 201), (102, 202)])
+        self.assertEqual(progress, [(1, 3), (2, 3), (3, 3)])
+        self.assertEqual([call.args for call in sleep.call_args_list], [(0,), (0,)])
 
     def test_pause_then_cancel_never_releases_a_click(self):
         self.token.pause()

@@ -360,6 +360,27 @@ class ScreenOverlay(_ScreenSurface):
             self.canvas.delete("all")
         self._mask_photo = None
 
+    def begin_trace(self, screen_xy):
+        """Start a manual stroke on a fresh native annotation surface.
+
+        A withdrawn layered window can retain its last painted pixels even
+        after Canvas items were deleted while it was hidden. Mapping it again
+        before the new Canvas repaint can briefly expose the previous stroke.
+        Retiring only that temporary window avoids reusing its backing store;
+        the persistent control panel is never hidden or recreated.
+        """
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen overlay is closed.")
+        # Validate before retiring the old surface so bad input has no effect.
+        points = [_screen_xy(*point) for point in screen_xy]
+        if self.window is not None:
+            self.hide()
+            self.clear()
+            self.window.destroy()
+            self.window = self.canvas = None
+        self.draw_trace(points)
+
     def draw_trace(self, screen_xy):
         self._ensure()
         points = [_screen_xy(*point) for point in screen_xy]

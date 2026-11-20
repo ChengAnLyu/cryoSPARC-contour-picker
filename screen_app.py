@@ -27,7 +27,7 @@ from screen_overlay import (ScreenOverlay, InputSurface, ManualMouseObserver,
 
 
 SCREEN_LOG = logging.getLogger("saru.screen")
-DEFAULT_MODEL_CLICK_DELAY = .03
+DEFAULT_CLICK_DELAY = .01
 
 
 def screen_changed_fraction(before, after, tolerance=12):
@@ -193,6 +193,7 @@ class ScreenPickerApp:
         self.desktop, self.runner = DesktopAdapter(), TaskRunner()
         self.events = queue.Queue()
         self.overlay = self.input_surface = self.advanced = None
+        self._picking_menu = None
         self.mouse_observer = self.hotkeys = None
         self._listeners_requested = bool(start_listeners)
         self._manual_gate = threading.Event()
@@ -233,6 +234,9 @@ class ScreenPickerApp:
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Escape>", lambda event: self.stop())
         root.bind("<Configure>", lambda event: self._remember_panel())
+        # These shortcuts belong to the control panel, never a global hook.
+        root.bind("<F9>", self._open_picking_speed)
+        root.bind("<Button-3>", self._show_picking_menu)
         if start_listeners:
             try:
                 self.hotkeys = GlobalHotkeys(self._hotkey, space_pause=True)
@@ -313,7 +317,7 @@ class ScreenPickerApp:
         self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
         self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
         self.grid_side = tk.IntVar(value=8)
-        self.click_delay = tk.DoubleVar(value=DEFAULT_MODEL_CLICK_DELAY)
+        self.click_delay = tk.DoubleVar(value=DEFAULT_CLICK_DELAY)
         for variable in (self.status, self.region_label):
             identifier = variable.trace_add("write", self._queue_panel_fit)
             self._variable_traces.append((variable, identifier))
@@ -444,7 +448,7 @@ class ScreenPickerApp:
 
     def _idle(self):
         if self.advanced is not None:
-            raise RuntimeError("Close model settings before starting a screen operation.")
+            raise RuntimeError("Close settings before starting a screen operation.")
         if self.runner.busy or self.transition or self.auto_remaining or self.drawing:
             raise RuntimeError("An operation is active. Press Escape to stop it first.")
         if self.input_surface is not None and self.input_kind != "masks":
@@ -455,9 +459,9 @@ class ScreenPickerApp:
             raise ValueError("Uncheck Disable Picking to send picks to cryoSPARC.")
         if self.hotkeys is None or self.mouse_observer is None:
             raise RuntimeError("Global input hooks are unavailable. Restart the Windows application.")
-        delay = .10 if self.mode == "manual" else float(self.click_delay.get())
-        if not .02 <= delay <= 2:
-            raise ValueError("Click delay must be between 0.02 and 2 seconds.")
+        delay = float(self.click_delay.get())
+        if not 0 <= delay <= 2:
+            raise ValueError("Click delay must be between 0 and 2 seconds.")
         return delay
 
     def _error(self, error):
@@ -546,7 +550,7 @@ class ScreenPickerApp:
                 self.manual_geometry = CaptureGeometry(0, 0, width, height)
                 self.trace, self.drawing, self.released = [(x, y)], True, False
                 self.trace_dirty = True
-                self.ensure_overlay().draw_trace(self.trace)
+                self.ensure_overlay().begin_trace(self.trace)
                 self.overlay.show()
                 self._show_panel()
             except Exception as exc:
@@ -586,8 +590,7 @@ class ScreenPickerApp:
         self._gate_manual()
         points = tuple(self.trace)
         target, spacing = self.manual_window, int(self.spacing.get())
-        self._live_ready()
-        delay = .10  # Preserve the original PyAutoGUI default pause in manual mode.
+        delay = self._live_ready()
         self.trace, self.drawing, self.released = [], False, False
         self.trace_dirty = False
         self.manual_window = None
@@ -1169,6 +1172,36 @@ class ScreenPickerApp:
                 self._error(exc)
         self._sync_manual()
 
+    def _settings_available(self):
+        """Panel settings access must not interrupt or focus over active work."""
+        if self.closed:
+            return False
+        if self.advanced is not None:
+            return True
+        try:
+            self._idle()
+        except RuntimeError:
+            return False
+        return True
+
+    def _open_picking_speed(self, event=None):
+        if self._settings_available():
+            self.open_advanced()
+        return "break"
+
+    def _show_picking_menu(self, event):
+        if not self._settings_available():
+            return "break"
+        if self._picking_menu is None:
+            self._picking_menu = self.tk.Menu(self.root, tearoff=False)
+            self._picking_menu.add_command(label="Picking speed…", accelerator="F9",
+                                           command=self._open_picking_speed)
+        try:
+            self._picking_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._picking_menu.grab_release()
+        return "break"
+
     def open_advanced(self):
         try:
             if self.advanced is not None:
@@ -1179,7 +1212,7 @@ class ScreenPickerApp:
             self._close_input()
             window = self.tk.Toplevel(self.root)
             self.advanced = window
-            window.title("SARU Picker — model settings")
+            window.title("SARU Picker — settings")
             window.attributes("-topmost", True)
             window.resizable(False, False)
             frame = self.ttk.Frame(window, padding=12)
@@ -1201,7 +1234,7 @@ class ScreenPickerApp:
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
-                                                                        ("Model click delay (seconds)", self.click_delay, .02, 2, .01)), 5):
+                                                                        ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
             def close_settings():
@@ -1213,7 +1246,9 @@ class ScreenPickerApp:
                     self._present_masks()
             self.ttk.Label(frame, text="capsid: dense interiors; generic: all SAM regions", wraplength=410).grid(
                 row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=8, column=0, columnspan=3, pady=(10, 0))
+            self.ttk.Label(frame, text="Click delay is in seconds. 0 removes the added wait; increase it if cryoSPARC misses picks.",
+                           wraplength=410).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=9, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)

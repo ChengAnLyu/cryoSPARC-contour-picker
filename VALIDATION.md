@@ -180,3 +180,58 @@ capture, model inference, image loading and UI handoff. The simulated costs
 are controlled assumptions rather than measurements of those operations.
 Browser response and workstation timing determine the practical contour time.
 
+---
+
+## Version 2.5.0 shared picking speed and manual outline cleanup
+
+This section records the 2.5.0 behavior and its validation scope. The earlier
+test counts, recognition measurements and 2.4.0 playback benchmark remain
+historical results. They do not establish the throughput or test count of
+version 2.5.0. This release uses the existing recognition checkpoint and does
+not claim improved biological recognition accuracy.
+
+### Shared click pacing
+
+Manual, semi-auto and auto now use the same click-delay setting, defaulting
+to **0.01 seconds**. Previously, manual used approximately 0.10 seconds and
+the model modes defaulted to 0.03 seconds. A value of **0.00** removes the
+configured inter-click wait. Playback still yields execution between clicks
+at zero delay, checks for cancellation, and retains the target-focus,
+point-obscuration and mouse fail-safe checks.
+
+The setting is available through **Advanced…** in model modes, **F9** while
+the SARU panel has focus, or right-clicking the panel and choosing
+**Picking speed…**. The compact manual control layout and its original
+hold-draw-release gesture are retained. Manual point generation keeps its
+original bounding-box origin, integer row spacing, alternating offset,
+polygon boundary rule and zero inset.
+
+The configured delay is only one part of elapsed contour time. Browser event
+handling, native input delivery, scheduling and guard checks still take time.
+Model detection and micrograph loading are separate operations. A setting of
+zero is not evidence that the browser registers every submitted click or that
+throughput has no limit. Live verification on the intended workstation is
+needed to choose the lowest reliable delay.
+
+### Previous-outline flash
+
+Before a new manual trace is displayed, the temporary native annotation
+surface is recreated. This removes the previous surface's retained pixels
+instead of relying only on deleting its canvas items before showing it again.
+The control panel itself is retained and stays visible. This change concerns
+the drawing surface lifecycle; it does not change manual sampling geometry.
+
+### Evidence to distinguish
+
+Source regressions and synthetic UI fixtures can check shared delay routing,
+zero-delay cancellation, generated-click exclusion, repeated strokes and
+the annotation surface lifecycle. Native Windows checks can verify overlay
+stacking, hit testing and visibility. Neither type of fixture by itself
+measures accepted picks in a real cryoSPARC browser.
+
+Any 2.5.0 timing results must identify the exact input count, delay settings,
+hardware or simulated costs, and whether input was sent to a real browser.
+Source, frozen and installed reports from the release workflow establish
+which gates actually ran and passed; no new test count or measured speedup
+is inferred from the changed default alone.
+
