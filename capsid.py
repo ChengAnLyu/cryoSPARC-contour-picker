@@ -623,9 +623,39 @@ def _profile_shape(mask: np.ndarray, check_cancel=None) -> tuple[bool, dict[str,
     return solidity >= .72, evidence
 
 
+def _compact_prompt_seeds(part, bounds, image_shape, min_area, check_cancel=None):
+    """Remove thick attachments before asking SAM for a compact object's mask."""
+    radius = max(4, min(24, round(math.sqrt(int(part.sum())) * .15)))
+    padded = np.pad(ndi.binary_fill_holes(part), radius)
+    if bounds[0].start == 0:
+        padded[:radius, radius:-radius] = True
+    if bounds[0].stop == image_shape[0]:
+        padded[-radius:, radius:-radius] = True
+    if bounds[1].start == 0:
+        padded[radius:-radius, :radius] = True
+    if bounds[1].stop == image_shape[1]:
+        padded[radius:-radius, -radius:] = True
+    _capsid_check(check_cancel)
+    opened = ndi.binary_opening(padded, iterations=radius)[radius:-radius, radius:-radius] & part
+    labels, count = ndi.label(opened)
+    for label in range(1, count + 1):
+        _capsid_check(check_cancel)
+        seed = labels == label
+        if int(seed.sum()) < min_area:
+            continue
+        accepted, evidence = _profile_shape(seed, check_cancel)
+        if accepted:
+            yield seed, {**evidence, 'compact_seed_opening_radius': radius}
+
+
 def _profile_components(support: np.ndarray, min_area: int, max_area: float,
-                        check_cancel=None):
-    """Remove bounded thin extensions, then assess each remaining component."""
+                        check_cancel=None, *, allow_provisional=False):
+    """Assess components, optionally deferring modest concavity to SAM boxes.
+
+    Final masks always use the strict default. A provisional prompt may have
+    an attached dense neighbour; SAM must separate it before final refinement.
+    All area, elongation, occupancy and thickness checks still apply.
+    """
     labels, count = ndi.label(support)
     # Object IDs, rather than any positive pixel inside a bounding box, keep
     # nested/disconnected components separate when their boxes overlap.
@@ -658,16 +688,27 @@ def _profile_components(support: np.ndarray, min_area: int, max_area: float,
             if int(part.sum()) < min_area:
                 continue
             accepted, evidence = _profile_shape(part, check_cancel)
-            if not accepted:
-                continue
-            mask = np.zeros_like(support)
-            mask[bounds] = part
-            yield mask, evidence
+            if accepted:
+                if allow_provisional:
+                    evidence = {**evidence, 'prompt_only': True, 'provisional': False,
+                                'prompt_solidity_threshold': .72, 'final_solidity_threshold': .72}
+                mask = np.zeros_like(support)
+                mask[bounds] = part
+                yield mask, evidence
+            elif allow_provisional and 'filled_support_solidity' in evidence:
+                for seed, shape in _compact_prompt_seeds(part, bounds, support.shape, min_area, check_cancel):
+                    shape = {**shape, 'prompt_only': True, 'provisional': True,
+                             'rough_support_solidity': evidence['filled_support_solidity'],
+                             'prompt_solidity_threshold': .72, 'final_solidity_threshold': .72}
+                    mask = np.zeros_like(support)
+                    mask[bounds] = seed
+                    yield mask, shape
 
 
 def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
                           max_area_ratio=.40, max_prompts=24, check_cancel=None):
-    """Bounded automatic SAM boxes from learned positive appearance support."""
+    """Bounded SAM boxes, prioritizing compact support before provisional boxes."""
+    _capsid_check(check_cancel)
     scores = np.asarray(scores)
     if scores.ndim != 2 or not scores.size or not np.isfinite(scores).all():
         raise ValueError('Capsid appearance scores must be a finite two-dimensional image.')
@@ -679,10 +720,12 @@ def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
     min_area = max(64, math.ceil(min_area_ratio * scores.size))
     max_area = max_area_ratio * scores.size
     support = ndi.binary_closing(scores >= .5, iterations=4, border_value=1)
+    _capsid_check(check_cancel)
     support &= scores > 0
     support = ndi.binary_opening(support, iterations=3, border_value=0)
     proposals = []
-    for mask, shape in _profile_components(support, min_area, max_area, check_cancel):
+    for mask, shape in _profile_components(support, min_area, max_area, check_cancel,
+                                           allow_provisional=True):
         _capsid_check(check_cancel)
         x, y, width, height = _capsid_bbox(mask)
         margin = max(6, min(24, round(max(width, height) * .12)))
@@ -694,7 +737,9 @@ def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
         rank = float(np.mean(scores[mask]) * math.sqrt(mask.sum()))
         proposals.append({'box': box, 'point': [int(cx), int(cy)], 'rank': rank,
                           'support_area': int(mask.sum()), 'shape': shape})
-    return sorted(proposals, key=lambda item: item['rank'], reverse=True)[:max_prompts]
+    # Existing eligible prompts retain their order and budget. New provisional
+    # boxes only fill unused slots, even if a broad component has a high rank.
+    return sorted(proposals, key=lambda item: (item['shape']['provisional'], -item['rank']))[:max_prompts]
 
 
 def _profile_pool_offer(pool, record, serial):

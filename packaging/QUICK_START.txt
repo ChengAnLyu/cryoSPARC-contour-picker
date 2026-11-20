@@ -1,4 +1,4 @@
-SARU Picker 2.6.1 — Windows CPU edition
+SARU Picker 2.7.0 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -75,6 +75,11 @@ browser still need time to process picks; detection and image loading are
 separate. Use the lowest setting that registers reliably on your workstation.
 
 DETECTION
+The private 2.7.0 profile is trained with examples 1-80. Model selection gives
+large capsids and their contour boundaries priority; small-target gains are
+secondary. Compact interior seeds can recover capsids whose attached support
+previously prevented a SAM query. Final shape and carbon checks still apply.
+
 The default capsid profile retains the earlier texture heuristic. The
 capsid-learned option uses the experimental appearance model to locate dense
 granular interiors and guide SAM; it requires capsid-profile.json. Polygonal

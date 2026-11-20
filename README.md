@@ -1,12 +1,14 @@
-# SARU Picker 2.6.1
+# SARU Picker 2.7.0
 
 SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the image viewer, with its existing layout and controls. A compact, always-on-top **SARU PICKER** panel selects manual, semi-auto, or auto mode.
 
 ## Windows application
 
-The CPU installer is named **SARU-Picker-Setup-2.6.1-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+The CPU installer is named **SARU-Picker-Setup-2.7.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
 
-Version 2.6.1 adds a shared carbon-boundary check to the two capsid detection modes. It uses long image-context edges to identify support-boundary artifacts while retaining compact neighboring objects. The learned appearance profile is unchanged; this update does not retrain SAM or infer that every region on carbon is unwanted. Manual drawing, generic SAM proposals and explicit box prompts retain their original behavior.
+Version 2.7.0 supports the updated private appearance profile trained with examples 1–80. The training utility records both source decks, holds every screenshot out during development evaluation, and supports conservative positive interiors from small marked groups as well as balanced sampling across examples. Recognition now derives compact prompt regions when an attached extension would otherwise prevent SAM from outlining a capsid; the stricter final shape and carbon checks still apply. Large-capsid coverage and contour boundaries have priority in the private model comparison. The delivered model and its remaining limitations are documented in the private guide. The screen controls, manual gesture, picking speed, and neural-network architecture are retained.
+
+Version 2.6.1 introduced the shared carbon-boundary check used by both capsid detection modes. It uses long image-context edges to identify support-boundary artifacts while retaining compact neighboring objects. That release retained the earlier learned weights; the 2.7.0 private package supplies a newly trained appearance profile. Neither update retrains SAM or assumes that every region on carbon is unwanted. Manual drawing, generic SAM proposals and explicit box prompts retain their original behavior.
 
 Version 2.6.0 replaces the temporary annotation window between semi-auto contour selections so a completed contour is not remapped from an old painted buffer. It also supports an optional [learned capsid appearance profile](CAPSID_PROFILE.md). The compact panel, original manual gesture and spacing, polygonal regions, **Next micrograph**, continuous auto cycle and private custom icons are retained. All three picking modes retain the shared **0.01-second default** and **0.00-second option with no added inter-click delay**. Auto completes one contour before the next. The optional snapshot editor remains available with `--review`.
 

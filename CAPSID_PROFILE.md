@@ -1,6 +1,6 @@
 # Experimental learned capsid appearance profile
 
-SARU Picker 2.6 can use a locally trained capsid appearance profile alongside the existing SAM ViT-B checkpoint. The floating panel, manual drawing, contour selection and click executor remain the same. The appearance profile is separate from SAM; installing it does not fine-tune or replace SAM's weights.
+SARU Picker 2.7 can use a locally trained capsid appearance profile alongside the existing SAM ViT-B checkpoint. The floating panel, manual drawing, contour selection and click executor remain the same. The appearance profile is separate from SAM; installing it does not fine-tune or replace SAM's weights.
 
 ## Install and select
 
@@ -26,6 +26,20 @@ Positive-unlabeled learning is an appropriate reference for this incomplete-labe
 - [Kiryo et al., Non-negative PU learning (2017)](https://arxiv.org/abs/1703.00593).
 
 Selecting only the most confident positives introduces selection bias. The positive prevalence used by PU learning is also an assumption. Consequently, this profile's bounded score must not be described as a calibrated probability that a region is a capsid.
+
+## Training with additional examples in 2.7.0
+
+The private 2.7.0 update combines examples 1–40 and 41–80. Every clean screenshot contributes unlabeled samples; positive supervision comes only from supplied markings. Unmarked screenshots remain unlabeled. Model metadata records both source-deck hashes, the exact manifest, grouped folds, feature and trainer source hashes, and the actual training cases. The installed profile is fitted using all 80 examples after internal comparison with the previous profile.
+
+The training utility accepts `--positive-policy substantial` for the earlier substantial-cluster policy or `--positive-policy all-marked` to retain usable interiors from small confidently marked groups. Both policies erode the reconstructed marked regions by six pixels before selecting positive samples. `--positive-sampling pixel` retains the original pixel sampling; `--positive-sampling case-balanced` gives each screenshot with usable positives equal expected positive-batch weight. Case balancing reuses scarce pixels more often; it does not create additional independent observations. The full profile and every fold record per-case sampling counts, with separate per-row draw evidence for the private reproducibility archive.
+
+Evaluation holds each example out once and keeps visually overlapping crops together. The original 40 and added 40 are evaluated separately, using training-only feature normalizers. Original micrograph and acquisition-session identities were not supplied, so screenshot grouping is a limited substitute. Candidate selection prioritizes large marked targets and their contour boundaries, checks selected area and actual final contours, and reports small marked regions as a secondary measure. Marked extent is a size proxy, not a physical capsid measurement. The private release guide reports the selected policy, observed improvements and remaining failures. These comparisons are internal development evidence, not an independent accuracy benchmark.
+
+## Compact proposals for attached regions in 2.7.0
+
+A strongly scored capsid can be connected to an irregular extension in the appearance-support image. Rejecting the whole connected region before prompting SAM can then miss a clear target. The learned path can derive compact seeds from this support with a stronger, bounded opening. Each seed must pass the existing strict shape tests before its box and point are sent to SAM. The rough parent is never accepted directly as a pickable region. Final texture, shape, polygon and carbon checks retain their existing criteria.
+
+Previously eligible compact prompts keep their original order and take priority under the 24-prompt limit. Additional seeds fill only unused slots. This correction changes learned automatic prompting; manual drawing, explicit box/point prompting and the default capsid detector retain their existing behavior.
 
 ## Validation and practical limits
 

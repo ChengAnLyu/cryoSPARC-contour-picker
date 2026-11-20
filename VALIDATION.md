@@ -1,3 +1,56 @@
+# Version 2.7.0 validation scope
+
+Version 2.7.0 adds multi-deck training provenance, optional positive interiors
+from small marked groups, and optional positive sampling balanced across
+screenshots. The public source suite passes **409 tests**. The nine new training
+regressions cover incomplete-positive masks, valid-image restrictions, empty
+positive cases, sparse-case sampling, unchanged legacy pixel draws, and exact
+source-deck assignment and names. Three new prompt regressions cover compact
+seeds, preservation of existing compact proposals, and the 24-prompt bound.
+Runtime feature extraction, default capsid detection, carbon handling, manual
+sampling, screen overlays, picking speed and navigation retain their 2.6.1
+behavior. A separate learned-prompt correction handles supported regions that
+were previously discarded before SAM could outline a capsid. Application and
+installer version identifiers are updated.
+
+The private appearance-profile update uses examples 1–80. Development compares
+the shipped 40-example profile on the added examples with held-out 80-example
+training candidates, and checks the original examples against their previous
+held-out reference. Ten screenshot-group folds hold out eight examples each;
+each candidate fold trains on the other 72. The original examples retain their
+previous held-out memberships. Feature normalizers use only training samples.
+The delivered profile is subsequently fitted on all 80 examples. Neither SAM's
+weights nor the inference architecture are changed.
+
+The private reports bind model weights, both source decks, the frozen dataset,
+folds, trainer, feature schema, sampling indices and actual positive draws.
+Candidate checks use the production SAM prompt/decoding/refinement/filtering
+path. Verified image embeddings may be reused, but each candidate computes its
+own appearance scores and final proposals. This reuse is not a speed benchmark.
+The report distinguishes new-example comparisons, original-example regression
+checks, and the final profile's source-runtime integration check.
+
+The supplied markings remain incomplete confident positives. Unmarked cases and
+regions are unlabeled, and marker extents are not exact capsid segmentations.
+Large-target coverage and contour boundaries have priority in selection, as
+requested by the user. Selected area and visual review check overextended
+regions; small-target coverage is secondary. These measures do not establish
+precision, complete recall or boundary IoU. All candidate selection is internal
+development. Original micrograph and
+acquisition identifiers were unavailable, so overlap-aware screenshot grouping
+cannot establish independence across acquisitions. The private release guide
+records measured results, candidate selection and remaining failures.
+
+The Windows release retains the required native, frozen and installed checks
+for topmost panel layout, repeated semi-auto selection, micrograph navigation,
+shared picking behavior, carbon rejection, model and icon sidecar installation,
+and actual SAM inference. Public Windows checks use synthetic nonprivate
+fixtures. The delivered private profile is separately checked in the source
+runtime. The downloaded Windows reports determine the result of native gates;
+source tests alone do not certify the installer or live cryoSPARC behavior.
+
+---
+
 # Version 2.6.1 validation scope
 
 Version 2.6.1 adds a shared, conservative carbon-edge guard after refinement in

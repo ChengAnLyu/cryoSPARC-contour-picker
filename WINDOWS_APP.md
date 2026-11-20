@@ -1,12 +1,16 @@
-# SARU Picker 2.6.1 for Windows
+# SARU Picker 2.7.0 for Windows
 
-Install **SARU-Picker-Setup-2.6.1-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.7.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
 to the installed application, its EXE and its shortcuts. The setup EXE itself
 uses the public geometric icon. Setup also works without the optional sidecars,
 using that fallback for the installed app.
+
+## Version 2.7.0 update
+
+The private download includes an updated appearance profile trained with examples 1–80. Keep `capsid-profile.json` beside setup while installing, then select **Advanced → Detection profile → capsid-learned**. Large-capsid detection and contour boundaries take priority in model selection. The learned prompt step also derives compact regions when attached support would otherwise prevent a capsid from receiving a SAM query. Manual mode, panel layout, picking speed and micrograph navigation retain their existing behavior. See the private release guide for measured results and remaining recognition limitations.
 
 ## Version 2.6.1 update
 

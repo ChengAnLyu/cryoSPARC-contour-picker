@@ -1,6 +1,6 @@
 ; Inno Setup 6.3+ / 7. Build through packaging/build.ps1.
 #ifndef AppVersion
-  #define AppVersion "2.6.1"
+  #define AppVersion "2.7.0"
 #endif
 #ifndef AppSourceDir
   #define AppSourceDir "..\dist\SARU_Picker"

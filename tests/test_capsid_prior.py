@@ -139,6 +139,55 @@ class GuidedCapsidTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertEqual(prompts[0]['box'][0], 0)
 
+    def test_attached_dense_extension_can_prompt_but_cannot_bypass_final_shape(self):
+        support = np.zeros((240, 240), bool)
+        support[40:100, 40:100] = True
+        support[90:110, 70:200] = True
+        scores = np.where(support, .99, 0).astype(np.float32)
+        prompts = capsid_guided_prompts(scores)
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(prompts[0]['shape']['provisional'])
+        self.assertLess(prompts[0]['shape']['rough_support_solidity'], .72)
+        self.assertGreaterEqual(prompts[0]['shape']['filled_support_solidity'], .72)
+        self.assertGreaterEqual(prompts[0]['shape']['compact_seed_opening_radius'], 4)
+        self.assertLessEqual(prompts[0]['shape']['compact_seed_opening_radius'], 24)
+        self.assertLess(prompts[0]['box'][2], 160)
+        rng = np.random.default_rng(15)
+        gray = np.clip(128 + rng.normal(0, 3, support.shape)
+                       + rng.normal(0, 26, support.shape) * support, 0, 255).astype(np.uint8)
+        rgb = np.repeat(gray[:, :, None], 3, axis=2)
+        self.assertEqual(filter_capsid_with_profile(rgb, [{'segmentation': support}], scores), [])
+        separated = np.zeros_like(support)
+        separated[40:100, 40:100] = True
+        outputs = filter_capsid_with_profile(rgb, [{'segmentation': separated}], scores)
+        self.assertEqual(len(outputs), 1)
+        self.assertFalse(np.any(outputs[0]['segmentation'] & ~separated))
+
+    def test_provisional_box_cannot_displace_a_compact_target_at_prompt_limit(self):
+        yy, xx = np.mgrid[:240, :440]
+        compact = (xx - 330) ** 2 + (yy - 150) ** 2 < 20 ** 2
+        support = compact.copy()
+        support[40:100, 40:100] = True
+        support[90:110, 70:200] = True
+        scores = np.where(support, .99, 0).astype(np.float32)
+        all_prompts = capsid_guided_prompts(scores)
+        self.assertEqual(len(all_prompts), 2)
+        self.assertFalse(all_prompts[0]['shape']['provisional'])
+        self.assertTrue(all_prompts[1]['shape']['provisional'])
+        self.assertGreater(all_prompts[1]['rank'], all_prompts[0]['rank'])
+        limited = capsid_guided_prompts(scores, max_prompts=1)
+        self.assertEqual(limited, all_prompts[:1])
+        x, y = limited[0]['point']
+        self.assertTrue(compact[y, x])
+
+    def test_guided_budget_never_exceeds_twenty_four_boxes(self):
+        yy, xx = np.mgrid[:400, :400]
+        support = np.zeros_like(xx, dtype=bool)
+        for y in range(40, 400, 80):
+            for x in range(40, 400, 80):
+                support |= (xx - x) ** 2 + (yy - y) ** 2 < 15 ** 2
+        self.assertEqual(len(capsid_guided_prompts(support.astype(np.float32), max_prompts=100)), 24)
+
     def test_refinement_preserves_original_holes_and_coloured_exclusions(self):
         rgb, core, proposals = synthetic_core()
         proposals[0]['segmentation'][88:103, 75:90] = False
