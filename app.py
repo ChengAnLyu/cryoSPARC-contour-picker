@@ -1069,17 +1069,66 @@ def _smoke_manual_strokes(picker) -> dict[str, Any]:
         picker.set_mode(previous_mode)
 
 
-def _smoke_advanced_settings(picker, percent, screenshot_dir=None):
+def _smoke_windows_work_area() -> tuple[int, int, int, int]:
+    """Read the primary monitor's usable rectangle, excluding its taskbar."""
+    import ctypes
+    from ctypes import wintypes
+
+    query = ctypes.windll.user32.SystemParametersInfoW
+    query.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
+    query.restype = wintypes.BOOL
+    rectangle = wintypes.RECT()
+    if not query(0x0030, 0, ctypes.byref(rectangle), 0):  # SPI_GETWORKAREA
+        raise RuntimeError("Could not read the Windows work area for native UI checks.")
+    bounds = tuple(int(value) for value in
+                   (rectangle.left, rectangle.top, rectangle.right, rectangle.bottom))
+    if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+        raise RuntimeError(f"Windows returned an invalid work area: {bounds}.")
+    return bounds
+
+
+def _smoke_position_fixture(window, work_area) -> str:
+    """Choose one test position; retain the application's requested size.
+
+    Fresh Tk roots and settings windows otherwise use Windows' cascaded
+    placement. That moving origin can put a later, larger scale off-screen.
+    Position fixtures before their first native layout/capture check, never
+    in response to a failed check or between pixel-validation frames.
+    """
+    geometry = f"+{work_area[0] + 16}+{work_area[1] + 16}"
+    window.geometry(geometry)
+    return geometry
+
+
+def _smoke_assert_work_area(window, work_area) -> dict[str, Any]:
+    """Require the complete native frame to fit without moving or resizing it."""
+    left, top, width, height = control_panel_bounds(window)
+    frame = (left, top, left + width, top + height)
+    if (width <= 0 or height <= 0 or left < work_area[0] or top < work_area[1]
+            or frame[2] > work_area[2] or frame[3] > work_area[3]):
+        raise RuntimeError(f"Native UI fixture is outside the Windows work area: "
+                           f"frame={frame}, work_area={tuple(work_area)}. "
+                           "The smoke check will not resize or reposition it to pass.")
+    return {"native_outer_bbox": list(frame), "work_area_bbox": list(work_area),
+            "complete_frame_inside_work_area": True}
+
+
+def _smoke_advanced_settings(picker, percent, screenshot_dir=None, *, work_area=None):
     """Check the actual native size control and settings close callback."""
+    if work_area is None:
+        work_area = _smoke_windows_work_area()
     picker.open_advanced()
-    picker.root.update()
     window = picker.advanced
-    if window is None or not window.winfo_viewable():
+    if window is None:
         raise RuntimeError("Advanced settings did not open.")
+    fixture_position = _smoke_position_fixture(window, work_area)
+    picker.root.update()
+    if not window.winfo_viewable():
+        raise RuntimeError("Advanced settings did not open.")
+    screen_bounds = _smoke_assert_work_area(window, work_area)
     width, height = window.winfo_width(), window.winfo_height()
-    if (width < window.winfo_reqwidth() or height < window.winfo_reqheight()
-            or width > window.winfo_screenwidth() or height > window.winfo_screenheight() - 48):
-        raise RuntimeError(f"Advanced settings do not fit the screen at {percent}%: "
+    if width < window.winfo_reqwidth() or height < window.winfo_reqheight():
+        raise RuntimeError(f"Advanced settings controls do not fit their window at {percent}%: "
                            f"actual={width}x{height}, requested={window.winfo_reqwidth()}x{window.winfo_reqheight()}")
     widgets, pending = [], list(window.winfo_children())
     while pending:
@@ -1098,7 +1147,8 @@ def _smoke_advanced_settings(picker, percent, screenshot_dir=None):
     if len(controls) != 1 or len(done) != 1 or picker._model_config().min_capsid_area_px != 3500:
         raise RuntimeError("The default minimum capsid area is not exposed correctly.")
     record = {'status':'ok', 'scale_percent':percent, 'window_size':[width,height],
-              'default_minimum_area_px':3500, 'all_controls_mapped_and_inside_window':True}
+              'default_minimum_area_px':3500, 'all_controls_mapped_and_inside_window':True,
+              'fixture_position_geometry':fixture_position, 'screen_bounds':screen_bounds}
     if screenshot_dir is not None:
         record['screenshot'] = _smoke_panel_screenshot(
             window, Path(screenshot_dir)/f'settings-{percent}.png')
@@ -1119,6 +1169,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
     # does not reliably resize previously constructed controls.
     enable_dpi_awareness()
     configure_application_identity()
+    work_area = _smoke_windows_work_area()
     tkinter = importlib.import_module("tkinter")
     scale_checks = []
     panel_layouts = {}
@@ -1147,6 +1198,7 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                     or picker.hotkeys is not None or picker.mouse_observer is not None
                     or picker.overlay is not None):
                 raise RuntimeError("The compact screen application did not start in passive manual mode.")
+            fixture_position = _smoke_position_fixture(window, work_area)
             window.state("normal")
             layouts = {}
             for mode in ("manual", "semi-auto", "auto"):
@@ -1154,11 +1206,13 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                     picker.set_mode(mode)
                 initial_status = picker.status.get()
                 normal = _smoke_panel_layout(picker, mode, "default")
+                normal["screen_bounds"] = _smoke_assert_work_area(window, work_area)
                 if screenshot_dir is not None:
                     normal["screenshot"] = _smoke_panel_screenshot(
                         window, Path(screenshot_dir) / f"panel-{percent}-{mode}.png")
                 picker.status.set(long_status)
                 multiline = _smoke_panel_layout(picker, mode, "multiline_status")
+                multiline["screen_bounds"] = _smoke_assert_work_area(window, work_area)
                 picker._hide_overlays()
                 _smoke_settle_panel(picker)
                 if (window.state() != "normal" or not window.winfo_viewable()
@@ -1171,11 +1225,13 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
                     panel_layouts[mode] = normal["panel_size"]
                 picker.status.set(initial_status)
                 _smoke_settle_panel(picker)
-            settings_check = _smoke_advanced_settings(picker, percent, screenshot_dir)
+            settings_check = _smoke_advanced_settings(picker, percent, screenshot_dir,
+                                                       work_area=work_area)
             tk_version = str(window.tk.call("info", "patchlevel"))
             scale_checks.append({"scale_percent": percent, "requested_dpi": requested_dpi,
                                  "native_tk_scaling_before_test": original_scaling,
                                  "actual_tk_pixels_per_point": actual_scaling, "layouts": layouts,
+                                 "fixture_position_geometry": fixture_position,
                                  "advanced_settings":settings_check})
             if overlay_checks is None:
                 overlay_checks = verify_screen_overlay(window)
@@ -1208,6 +1264,8 @@ def _smoke_windows_runtime(log_path: Path, *, screenshot_dir: Path | None = None
     return {"tk_version": tk_version, "desktop_modules_imported": True,
             "full_application_constructed": True, "synthetic_mask_rendered": True,
             "compact_manual_default": True, "panel_layouts": panel_layouts,
+            "fixture_work_area_bbox": list(work_area),
+            "fixture_placement_method": "Position-only placement before native layout validation; complete native frames must fit the Windows work area. No resize or retry-to-pass.",
             "layout_scaling_method": "Native Windows Tk widgets; pixels-per-point set before construction to simulate 100/125/150/200% of 96 DPI. Windows monitor scaling is unchanged.",
             "layout_scale_checks": scale_checks,
             "screen_overlay": overlay_checks,

@@ -1277,9 +1277,9 @@ class ScreenPickerApp:
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Label(frame, text="capsid: existing dense-interior filter (default).\ncapsid-learned: learned capsids — experimental; review contours.\ngeneric: all SAM regions.", wraplength=settings_wrap).grid(
+            self.ttk.Label(frame, text="capsid-learned requires its installed appearance profile.", wraplength=settings_wrap).grid(
                 row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Label(frame, text="Both capsid profiles skip regions below the minimum area. 3,500 px² is the large-only default; 0 allows all sizes. Screen zoom changes apparent size. Manual and Box prompt selections are unchanged.",
+            self.ttk.Label(frame, text="Minimum area applies to both capsid modes; 0 allows all sizes.\nZoom changes apparent size. Manual and Box prompts are unchanged.",
                            wraplength=settings_wrap).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
             self.ttk.Label(frame, text="Click delay is in seconds. 0 removes the added wait; increase it if cryoSPARC misses picks.",
                            wraplength=settings_wrap).grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 0))

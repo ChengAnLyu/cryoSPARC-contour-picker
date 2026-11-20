@@ -417,6 +417,87 @@ class PanelCaptureValidationTests(unittest.TestCase):
             app._smoke_panel_screenshot(self.window, self.path)
 
 
+class WindowsFixturePlacementTests(unittest.TestCase):
+    def test_work_area_uses_native_usable_rectangle_and_rejects_failed_query(self):
+        import ctypes
+        query = Mock()
+
+        def fill_rectangle(action, parameter, pointer, flags):
+            self.assertEqual((action, parameter, flags), (0x0030, 0, 0))
+            pointer._obj.left, pointer._obj.top = 40, 24
+            pointer._obj.right, pointer._obj.bottom = 1920, 1040
+            return 1
+
+        query.side_effect = fill_rectangle
+        with patch.object(ctypes, "windll", SimpleNamespace(
+                user32=SimpleNamespace(SystemParametersInfoW=query)), create=True):
+            self.assertEqual(app._smoke_windows_work_area(), (40, 24, 1920, 1040))
+            query.side_effect = None
+            query.return_value = 0
+            with self.assertRaisesRegex(RuntimeError, "Could not read the Windows work area"):
+                app._smoke_windows_work_area()
+            # Success with a zero-sized rectangle is not a usable fallback.
+            query.return_value = 1
+            with self.assertRaisesRegex(RuntimeError, "invalid work area"):
+                app._smoke_windows_work_area()
+
+    def test_native_frame_must_fit_exact_work_area_without_geometry_repair(self):
+        window = Mock()
+        work_area = (40, 24, 1200, 900)
+        with patch.object(app, "control_panel_bounds", return_value=(40, 24, 1160, 876)) as bounds:
+            evidence = app._smoke_assert_work_area(window, work_area)
+            self.assertEqual(evidence["native_outer_bbox"], list(work_area))
+            self.assertTrue(evidence["complete_frame_inside_work_area"])
+            for outside in ((39, 24, 1160, 876), (40, 23, 1160, 876),
+                            (40, 24, 1161, 876), (40, 24, 1160, 877),
+                            (40, 24, 0, 876)):
+                with self.subTest(frame=outside):
+                    bounds.return_value = outside
+                    with self.assertRaisesRegex(RuntimeError, "outside the Windows work area"):
+                        app._smoke_assert_work_area(window, work_area)
+        window.geometry.assert_not_called()
+        window.withdraw.assert_not_called()
+        window.deiconify.assert_not_called()
+        window.lift.assert_not_called()
+
+    def test_advanced_fixture_position_precedes_first_event_pump_and_capture(self):
+        window = layout_widget(x=24, y=87, width=500, height=500)
+        root = Mock()
+        area = Mock()
+        area_value = ["3500"]
+        area.get.side_effect = lambda: area_value[0]
+        area.set.side_effect = lambda value: area_value.__setitem__(0, value)
+        control = layout_widget(window, x=40, y=110, width=100, height=30)
+        control.winfo_class.return_value = "TSpinbox"
+        control.cget.return_value = str(area)
+        done = layout_widget(window, x=40, y=500, width=100, height=30)
+        done.winfo_class.return_value = "TButton"
+        done.cget.return_value = "Done"
+        picker = SimpleNamespace(root=root, advanced=None, min_capsid_area=area,
+                                 _model_config=lambda: SimpleNamespace(
+                                     min_capsid_area_px=int(area_value[0])))
+        picker.open_advanced = Mock(side_effect=lambda: setattr(picker, "advanced", window))
+        done.invoke.side_effect = lambda: setattr(picker, "advanced", None)
+        events = []
+        window.geometry.side_effect = lambda value: events.append(("position", value))
+        root.update.side_effect = lambda: events.append(("pump", None))
+
+        def capture(actual_window, destination):
+            self.assertIs(actual_window, window)
+            self.assertEqual(events, [("position", "+16+56"), ("pump", None)])
+            return {"checked": True}
+
+        with patch.object(app, "control_panel_bounds", return_value=(16, 56, 516, 539)), \
+             patch.object(app, "_smoke_panel_screenshot", side_effect=capture):
+            result = app._smoke_advanced_settings(
+                picker, 200, Path("ui"), work_area=(0, 40, 1920, 1080))
+        self.assertEqual(events, [("position", "+16+56"), ("pump", None), ("pump", None)])
+        window.geometry.assert_called_once_with("+16+56")
+        self.assertTrue(result["screen_bounds"]["complete_frame_inside_work_area"])
+        self.assertTrue(result["edit_and_done_callback_verified"])
+        self.assertEqual(area_value[0], "3500")
+
+
 class WindowsScaleCoverageTests(unittest.TestCase):
 
     def test_native_smoke_constructs_each_scale_before_widgets_and_checks_every_mode(self):
@@ -435,6 +516,8 @@ class WindowsScaleCoverageTests(unittest.TestCase):
                 return "8.6.14"
             def state(value=None):
                 if value is not None:
+                    if value == "normal":
+                        window.geometry.assert_called_once_with("+16+56")
                     window._state = value
                 return window._state
             window.tk.call.side_effect = tk_call
@@ -443,6 +526,10 @@ class WindowsScaleCoverageTests(unittest.TestCase):
             window.withdraw.side_effect = lambda: state("withdrawn")
             window.winfo_viewable.side_effect = lambda: window._state == "normal"
             window.attributes.return_value = True
+            def position(value):
+                self.assertEqual(window._state, "withdrawn")
+                self.assertEqual(value, "+16+56")
+            window.geometry.side_effect = position
             windows.append(window)
             return window
 
@@ -464,6 +551,7 @@ class WindowsScaleCoverageTests(unittest.TestCase):
             return picker
 
         def measure(picker, mode, status_case):
+            picker.root.geometry.assert_called_once_with("+16+56")
             measured.append((picker.root._scale, mode, status_case, picker.status.get()))
             return {"panel_size": [round(420 * picker.root._scale), 500],
                     "terminate": {"full_requested_size": True}}
@@ -478,6 +566,8 @@ class WindowsScaleCoverageTests(unittest.TestCase):
             return {"checked": True}
         with patch.object(app.importlib, "import_module", side_effect=modules.__getitem__), \
              patch.object(app, "enable_dpi_awareness") as dpi, \
+             patch.object(app, "_smoke_windows_work_area", return_value=(0, 40, 1920, 1080)) as work_area, \
+             patch.object(app, "control_panel_bounds", return_value=(16, 56, 850, 700)) as bounds, \
              patch.object(app, "resolve_checkpoint", return_value=Path("model.pth")), \
              patch.object(app, "ScreenPickerApp", side_effect=make_picker), \
              patch.object(app, "_smoke_panel_layout", side_effect=measure), \
@@ -491,6 +581,11 @@ class WindowsScaleCoverageTests(unittest.TestCase):
         expected_scales = [96 * percent / 100 / 72 for percent in (100, 125, 150, 200)]
         self.assertEqual(constructions, expected_scales)
         self.assertEqual(settings.call_count, 4)
+        self.assertEqual(bounds.call_count, 4 * 3 * 2)
+        work_area.assert_called_once_with()
+        for call in settings.call_args_list:
+            self.assertEqual(call.kwargs, {"work_area": (0, 40, 1920, 1080)})
+        self.assertEqual(result["fixture_work_area_bbox"], [0, 40, 1920, 1080])
         self.assertEqual(len(measured), 4 * 3 * 2)
         for scale in expected_scales:
             self.assertEqual({(mode, case) for value, mode, case, _ in measured if value == scale},
@@ -504,6 +599,7 @@ class WindowsScaleCoverageTests(unittest.TestCase):
         for window, picker in zip(windows, pickers):
             self.assertEqual(window._scale, original_scaling)
             self.assertEqual(window.withdraw.call_count, 1)
+            window.geometry.assert_called_once_with("+16+56")
             self.assertEqual(picker._hide_overlays.call_count, 3)
             picker.close.assert_called_once()
         dpi.assert_called_once()
