@@ -5064,13 +5064,88 @@ def _smoke_panel_layout(picker, mode: str, status_case: str) -> dict[str, Any]:
 
 
 def _smoke_panel_screenshot(window, destination: Path) -> dict[str, Any]:
-    """Capture only an explicitly requested synthetic build-host panel."""
+    """Validate two painted client captures without repairing window state.
+
+    Tk mapping/layout completion does not establish that the compositor has
+    presented the client pixels yet. Pump normally for a short fixed interval
+    and use DwmFlush as a synchronization aid before each real screen capture.
+    DwmFlush does not flush the whole session, so both pixel checks must pass.
+    No visibility, focus, geometry or repaint repair is performed here.
+    """
+    import ctypes
+
     image_grab = importlib.import_module("PIL.ImageGrab")
-    left, top, width, height = control_panel_bounds(window)
-    bbox = (left, top, left + width, top + height)
+    flush = ctypes.windll.dwmapi.DwmFlush
+    flush.argtypes, flush.restype = [], ctypes.c_long
+    background = [int(round(value / 257))
+                  for value in window.winfo_rgb(window.cget("background"))]
+    inset, edge_band, tolerance, variation_delta = 3, 4, 12, 35
+    minimum_background, minimum_edge, minimum_varied = .65, .85, .003
+    frames, original_geometry = [], None
     destination.parent.mkdir(parents=True, exist_ok=True)
-    image_grab.grab(bbox=bbox, include_layered_windows=True, all_screens=True).save(destination)
-    return {"path": str(destination), "native_outer_bbox": list(bbox)}
+    for index in range(2):
+        # Give native events elapsed time without remapping, lifting or forcing
+        # a repaint. Both fixed captures must pass; there is no retry-to-pass.
+        for _ in range(5):
+            window.update()
+            time.sleep(.01)
+        window.update()
+        hresult = int(flush())
+        if hresult != 0:
+            raise RuntimeError(f"DwmFlush failed before panel capture: HRESULT {hresult:#x}.")
+        if window.state() != "normal" or not window.winfo_viewable():
+            raise RuntimeError("The panel lost its visible state before pixel validation.")
+        left, top, width, height = control_panel_bounds(window)
+        bbox = (left, top, left + width, top + height)
+        client_left, client_top = int(window.winfo_rootx()), int(window.winfo_rooty())
+        client_width, client_height = int(window.winfo_width()), int(window.winfo_height())
+        client_bbox = (client_left, client_top,
+                       client_left + client_width, client_top + client_height)
+        geometry = (bbox, client_bbox)
+        if original_geometry is not None and geometry != original_geometry:
+            raise RuntimeError("Panel geometry changed between the two pixel-validation captures.")
+        original_geometry = geometry
+        capture = image_grab.grab(bbox=bbox, include_layered_windows=True, all_screens=True).convert("RGB")
+        frame_path = (destination.with_name(f"{destination.stem}-frame-1{destination.suffix}")
+                      if index == 0 else destination)
+        # Retain the unmodified capture even if it fails, as build diagnostics.
+        capture.save(frame_path)
+        if capture.size != (width, height):
+            raise RuntimeError("Panel screenshot dimensions differ from its native frame bounds.")
+        x0, y0 = client_left - left, client_top - top
+        x1, y1 = x0 + client_width, y0 + client_height
+        if (min(client_width, client_height) < 32 or x0 < 0 or y0 < 0
+                or x1 > width or y1 > height):
+            raise RuntimeError("The actual panel client rectangle is outside its captured native frame.")
+        pixels = np.asarray(capture, dtype=np.int16)[y0+inset:y1-inset, x0+inset:x1-inset]
+        delta = np.max(np.abs(pixels - np.asarray(background, dtype=np.int16)), axis=2)
+        matches = delta <= tolerance
+        edges = {"top": float(matches[:edge_band, :].mean()),
+                 "bottom": float(matches[-edge_band:, :].mean()),
+                 "left": float(matches[:, :edge_band].mean()),
+                 "right": float(matches[:, -edge_band:].mean())}
+        evidence = {"path": str(frame_path), "image_dimensions": [width, height],
+                    "background_fraction": float(matches.mean()),
+                    "edge_background_fraction": edges,
+                    "varied_fraction": float((delta > variation_delta).mean())}
+        if (evidence["background_fraction"] < minimum_background
+                or min(edges.values()) < minimum_edge
+                or evidence["varied_fraction"] < minimum_varied):
+            raise RuntimeError(f"Panel capture {index+1} does not show a fully painted client "
+                               f"with visible controls: {json.dumps(evidence, sort_keys=True)}")
+        frames.append(evidence)
+    return {"path": str(destination), "native_outer_bbox": list(bbox),
+            "render_check": {"status": "ok", "frames_checked": 2,
+                             "event_pump_seconds_before_each": .05,
+                             "background_rgb": background, "color_tolerance": tolerance,
+                             "variation_delta": variation_delta, "client_inset_pixels": inset,
+                             "edge_band_pixels": edge_band, "client_bbox": list(client_bbox),
+                             "minimum_background_fraction": minimum_background,
+                             "minimum_edge_background_fraction": minimum_edge,
+                             "minimum_varied_fraction": minimum_varied, "frames": frames,
+                             "method": "Two actual client captures after normal event pumping and DwmFlush; "
+                                       "no visibility, focus, geometry or repaint repair. "
+                                       "Paint coverage and control variation, not text-pixel identity."}}
 
 
 def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:

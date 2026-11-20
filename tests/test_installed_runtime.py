@@ -306,20 +306,118 @@ class PanelLayoutValidationTests(unittest.TestCase):
             app._smoke_panel_layout(picker, "manual", "default")
 
 
+class PanelCaptureValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "ui" / "panel-125-manual.png"
+        self.window = layout_widget(x=-192, y=61, width=509, height=401)
+        self.window.state.return_value = "normal"
+        self.window.cget.return_value = "SystemButtonFace"
+        self.window.winfo_rgb.return_value = (240 * 257,) * 3
+        self.grab, self.flush = Mock(), Mock(return_value=0)
+        self.grab.grab.side_effect = [self.painted_frame(), self.painted_frame()]
+        import ctypes
+        patches = [patch.object(app.importlib, "import_module", return_value=self.grab),
+                   patch.object(app, "control_panel_bounds", return_value=(-200, 30, 525, 440)),
+                   patch.object(app.time, "sleep"),
+                   patch.object(ctypes, "windll", SimpleNamespace(
+                       dwmapi=SimpleNamespace(DwmFlush=self.flush)), create=True)]
+        self.imports, self.bounds, self.sleep, _ = [p.start() for p in patches]
+        for p in patches:
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def painted_frame(*, controls=True):
+        # Deliberately dark nonclient pixels must be excluded from validation.
+        frame = app.Image.new("RGB", (525, 440), (20, 20, 20))
+        draw = app.ImageDraw.Draw(frame)
+        draw.rectangle((8, 31, 516, 431), fill=(240, 240, 240))
+        if controls:
+            draw.rectangle((210, 50, 310, 66), fill=(20, 20, 20))
+            for x in (40, 190, 340):
+                draw.rectangle((x, 100, x+100, 140), fill=(255, 255, 255), outline=(20, 20, 20))
+                draw.rectangle((x+25, 114, x+75, 125), fill=(20, 20, 20))
+            draw.rectangle((190, 365, 330, 405), fill=(235, 235, 235), outline=(20, 20, 20))
+        return frame
+
+    def test_two_painted_captures_validate_actual_client_without_repair_or_pixel_identity(self):
+        second = self.painted_frame()
+        # Harmless text/raster variation between frames must not fail the check.
+        app.ImageDraw.Draw(second).rectangle((230, 50, 250, 66), fill=(240, 240, 240))
+        self.grab.grab.side_effect = [self.painted_frame(), second]
+        result = app._smoke_panel_screenshot(self.window, self.path)
+        self.imports.assert_called_once_with("PIL.ImageGrab")
+        self.assertEqual(self.flush.call_count, 2)
+        self.assertEqual(self.grab.grab.call_count, 2)
+        for call in self.grab.grab.call_args_list:
+            self.assertEqual(call.kwargs, {"bbox": (-200, 30, 325, 470),
+                                          "include_layered_windows": True, "all_screens": True})
+        self.assertEqual(result["native_outer_bbox"], [-200, 30, 325, 470])
+        rendered = result["render_check"]
+        self.assertEqual(rendered["client_bbox"], [-192, 61, 317, 462])
+        self.assertEqual(rendered["frames_checked"], 2)
+        self.assertEqual(rendered["status"], "ok")
+        self.assertEqual(rendered["background_rgb"], [240, 240, 240])
+        self.assertNotEqual(rendered["frames"][0]["varied_fraction"],
+                            rendered["frames"][1]["varied_fraction"])
+        for frame in rendered["frames"]:
+            self.assertTrue(Path(frame["path"]).is_file())
+            self.assertEqual(frame["image_dimensions"], [525, 440])
+        with app.Image.open(self.path) as saved:
+            self.assertEqual(saved.tobytes(), second.tobytes())
+        self.assertAlmostEqual(sum(call.args[0] for call in self.sleep.call_args_list), .1)
+        self.window.withdraw.assert_not_called()
+        self.window.deiconify.assert_not_called()
+        self.window.lift.assert_not_called()
+        self.window.geometry.assert_not_called()
+        self.window.attributes.assert_not_called()
+        self.assertTrue(all(not call.args for call in self.window.state.call_args_list))
+
+    def test_unpainted_first_client_is_retained_and_rejected_without_retry_to_good_frame(self):
+        unpainted = app.Image.new("RGB", (525, 440), (0, 0, 0))
+        self.grab.grab.side_effect = [unpainted, self.painted_frame()]
+        with self.assertRaisesRegex(RuntimeError, "capture 1 does not show a fully painted client"):
+            app._smoke_panel_screenshot(self.window, self.path)
+        self.assertEqual(self.grab.grab.call_count, 1)
+        self.assertFalse(self.path.exists())
+        failure = self.path.with_name(self.path.stem + "-frame-1.png")
+        with app.Image.open(failure) as saved:
+            self.assertEqual(saved.tobytes(), unpainted.tobytes())
+
+    def test_second_capture_with_unpainted_bottom_strip_fails_despite_high_total_background(self):
+        partial = self.painted_frame()
+        app.ImageDraw.Draw(partial).rectangle((8, 412, 516, 431), fill=(0, 0, 0))
+        self.grab.grab.side_effect = [self.painted_frame(), partial]
+        with self.assertRaisesRegex(RuntimeError, "capture 2 does not show a fully painted client") as error:
+            app._smoke_panel_screenshot(self.window, self.path)
+        evidence = json.loads(str(error.exception).split("controls: ", 1)[1])
+        self.assertGreater(evidence["background_fraction"], .65)
+        self.assertEqual(evidence["edge_background_fraction"]["bottom"], 0)
+        with app.Image.open(self.path) as saved:
+            self.assertEqual(saved.tobytes(), partial.tobytes())
+
+    def test_uniform_client_background_without_visible_controls_fails(self):
+        self.grab.grab.side_effect = [self.painted_frame(controls=False)]
+        with self.assertRaisesRegex(RuntimeError, "does not show a fully painted client") as error:
+            app._smoke_panel_screenshot(self.window, self.path)
+        evidence = json.loads(str(error.exception).split("controls: ", 1)[1])
+        self.assertEqual(evidence["background_fraction"], 1)
+        self.assertEqual(evidence["varied_fraction"], 0)
+
+    def test_compositor_failure_stops_before_capture_instead_of_claiming_synchronization(self):
+        self.flush.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, "DwmFlush failed"):
+            app._smoke_panel_screenshot(self.window, self.path)
+        self.grab.grab.assert_not_called()
+
+    def test_client_rectangle_outside_capture_is_rejected_not_padded_into_valid_image(self):
+        self.window.winfo_rootx.return_value = -205
+        with self.assertRaisesRegex(RuntimeError, "client rectangle is outside"):
+            app._smoke_panel_screenshot(self.window, self.path)
+
+
 class WindowsScaleCoverageTests(unittest.TestCase):
-    def test_explicit_screenshot_captures_complete_native_frame_bounds(self):
-        window, image_grab = Mock(), Mock()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "ui" / "panel-125-manual.png"
-            with patch.object(app.importlib, "import_module", return_value=image_grab) as imports, \
-                 patch.object(app, "control_panel_bounds", return_value=(-200, 30, 525, 440)):
-                result = app._smoke_panel_screenshot(window, path)
-            imports.assert_called_once_with("PIL.ImageGrab")
-            image_grab.grab.assert_called_once_with(
-                bbox=(-200, 30, 325, 470), include_layered_windows=True, all_screens=True)
-            image_grab.grab.return_value.save.assert_called_once_with(path)
-            self.assertTrue(path.parent.is_dir())
-            self.assertEqual(result["native_outer_bbox"], [-200, 30, 325, 470])
 
     def test_native_smoke_constructs_each_scale_before_widgets_and_checks_every_mode(self):
         windows, pickers, constructions, measured = [], [], [], []
