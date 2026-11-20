@@ -3,7 +3,7 @@
 This directory turns the source into an installed Windows x64 application. The
 installer includes the Python interpreter, Tcl/Tk, CPU PyTorch/torchvision,
 desktop automation libraries, and the original SAM ViT-B weights. End users
-install `SARU-Picker-Setup-2.6.0-win64.exe` and open **SARU Picker** from the Start
+install `SARU-Picker-Setup-2.6.1-win64.exe` and open **SARU Picker** from the Start
 menu or desktop shortcut. The installed application does not download models.
 
 The source archive is not itself an installer. A successful Windows workflow
@@ -94,6 +94,12 @@ check results must pass. Its purpose is deployment validation, not measurement
 of scientific recognition accuracy. The installed application is tested with
 the same command.
 
+The 2.6.1 source, frozen and installed image-processing checks also execute a
+deterministic carbon-edge fixture. It must detect a long support edge, reject
+the associated elongated film contour, and preserve a nearby compact target.
+This verifies that the guard and its native dependencies work in the packaged
+runtime. Recognition quality on real micrographs requires separate evaluation.
+
 Version 2.5.0 retains **Next micrograph** in semi-auto mode
 and **Limit (0=all)** / **Load (s)** in auto mode. The default auto limit is 0
 for continuous operation; positive limits include the current image and empty
@@ -166,7 +172,7 @@ acceptance test until those steps have actually been completed.
 Build outputs:
 
 - `dist/SARU_Picker/`: full portable application directory.
-- `artifacts/SARU-Picker-Setup-2.6.0-win64.exe`: Windows installer.
+- `artifacts/SARU-Picker-Setup-2.6.1-win64.exe`: Windows installer.
 - `artifacts/frozen-smoke-test.json`: frozen application validation.
 - `artifacts/installed-smoke-test.json`: installation validation when requested.
 - `artifacts/build-manifest.json`: versions, source commit, and model checksum.
@@ -179,3 +185,22 @@ live-click alignment on the intended workstation before a production release.
 ## Optional learned profile in version 2.6
 
 The public build includes the profile inference module but rejects a private `capsid-profile.json` embedded in its distribution. Setup optionally copies that external sidecar from its own folder into `_internal/models`. Installer verification generates a nonprivate constant-score fixture, requires actual installed profile inference, and checks its bytes, SHA-256, resolved path and numeric outputs independently. The temporary build fixture directory is removed after testing; verification reports remain in `artifacts`. `capsid-profile-install-verification.json` accompanies the verified installer. See [CAPSID_PROFILE.md](../CAPSID_PROFILE.md).
+
+## Carbon support boundaries in version 2.6.1
+
+The `capsid` and `capsid-learned` paths share a geometric check after contour
+refinement and before final candidate acceptance. It looks for long, coherent,
+nearly straight support edges in the clean screenshot, then rejects a contour
+only when substantial boundary contact and an elongated, aligned footprint
+support that decision. Compact nearby targets are assessed independently.
+The guard does not erase image pixels, change retained masks, or exclude an
+entire side of a detected edge. Short capsid facets, darkness and proximity
+alone are insufficient reasons to reject a contour. Curved support and
+ambiguous broad regions can remain undetected.
+
+The SAM checkpoint and optional appearance-profile format are unchanged. This
+update adds no model download or training step during installation. Manual
+picking, the compact panel, generic SAM detection and explicit prompted
+selection retain their existing behavior. New carbon-filter evaluation must
+bind the updated recognition and guard source; earlier recognition-quality
+reports describe their original version and do not validate this change.

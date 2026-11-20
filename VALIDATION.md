@@ -1,3 +1,82 @@
+# Version 2.6.1 validation scope
+
+Version 2.6.1 adds a shared, conservative carbon-edge guard after refinement in
+both **capsid** and **capsid-learned** automatic detection. It checks whether an
+elongated candidate follows a long, coherent edge supported by the surrounding
+screen area. An isolated membrane facet, proximity to a line, or membership in a
+broad SAM parent is insufficient. Retained masks, holes and proposal order are
+unchanged. The guard does not edit the screenshot or exclude an entire side of
+an edge. Generic SAM and explicit box/point prompts bypass it.
+
+The SAM checkpoint, learned appearance weights and training examples are
+unchanged from 2.6.0. The control layout, manual drawing and sampling, click
+pacing, semi-auto selection lifecycle and micrograph navigation behavior are
+also unchanged. This release adds geometric rejection, not a newly trained
+carbon classifier.
+
+## Paired replay of all 40 development examples
+
+The comparison reuses the exact saved 2.6.0 SAM proposals and held-out appearance
+score maps, replays the unchanged refiners and actual final candidate gate, then
+adds the new guard between those two stages. Reference replay was verified
+against the saved original masks. SAM inference and training were not repeated
+for this comparison.
+
+| Measure | Default capsid: before → after | Learned capsid: before → after |
+| --- | ---: | ---: |
+| Retained contours | 117 → 117 | 292 → 288 |
+| Selected valid-image union pixels | 805,278 → 805,278 | 1,305,036 → 1,297,777 |
+| Covered supplied positive-core pixels | 312,083 → 312,083 | 416,227 → 416,227 |
+| Covered supplied positive marker/ring pixels | 170,650 → 170,650 | 225,724 → 225,724 |
+| Positive-core coverage | 61.7973% → 61.7973% | 82.4194% → 82.4194% |
+| Positive marker/ring coverage | 53.0086% → 53.0086% | 70.1161% → 70.1161% |
+
+The denominators are 505,011 supplied positive-core pixels and 321,929 positive
+marker/ring pixels. Four learned contours were removed in examples 10, 16 and
+32, reducing the selected union by 7,259 valid pixels. Independent visual review
+within this development session judged them to be edge-following structural
+selections without an identifiable compact dense core. No supplied positive
+core or marker/ring pixels were lost in either path. The default detector's
+outputs did not change on these 40 examples; use of the same guard in both
+profiles must not be presented as a measured improvement in both.
+
+**These are incomplete confident positives, not exhaustive target masks or
+carbon-negative annotations.** Unmarked detections remain unjudged. The replay
+cannot establish precision, complete recall, exact boundary accuracy or
+external generalization. Broad detached film selections, compact patches inside
+film and curved support remain possible. In particular, a large region can
+contain a valid partial capsid: deleting its whole parent would lose known
+positive coverage. The guard deliberately retains ambiguous regions.
+
+The bounded context pass averaged 0.1258 seconds per image on this CPU, with a
+0.1762-second 95th percentile. Additional contour adjudication averaged 0.0110
+seconds for default capsid and 0.0342 seconds for learned capsid: approximately
+0.137 and 0.160 seconds total added work, respectively. These measurements omit
+SAM inference, screen capture, browser input and navigation and are not Windows
+throughput guarantees.
+
+## Source checks and required native Windows gates
+
+The 2.6.1 source suite passes **397 tests**, including 17 carbon-guard regressions
+and automatic-routing checks. Coverage includes nearby compact targets,
+rotation and resized coordinates, short polygon facets, isolated internal
+membrane faces, curved membranes, white margins, noise, retained holes and mask
+identity, cancellation, cache behavior, generic/prompt bypass, and a small noisy
+field inside otherwise white UI.
+
+The Windows release must additionally pass the native frozen and installed
+application gates. Its image-processing smoke check must detect a synthetic
+long support edge, reject the known false strip and preserve the neighboring
+compact target. Existing checks for the visible topmost panel, successive
+semi-auto selections, navigation, icon installation, profile installation,
+native libraries and actual SAM inference remain required. This section records
+those requirements; the release's downloaded build and installed-runtime
+reports determine whether they passed. Synthetic native checks send no real
+cryoSPARC input and do not certify browser pick delivery or loading behavior on
+the user's workstation.
+
+---
+
 # Version 2.6 validation scope
 
 The 2.6 update separates UI lifecycle validation, optional profile installation, and recognition evaluation. Historical results below apply to their named versions and experiments.

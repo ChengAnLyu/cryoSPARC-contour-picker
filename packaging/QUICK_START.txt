@@ -1,4 +1,4 @@
-SARU Picker 2.6.0 — Windows CPU edition
+SARU Picker 2.6.1 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -87,6 +87,17 @@ The learned score is not a calibrated capsid probability; SAM weights remain
 unchanged. Unmarked regions in sparse examples are not negative labels.
 Review the contours in semi-auto before running automatic picking.
 Advanced > Detection profile > generic restores unclassified SAM proposals.
+
+CARBON FILM EDGES
+Both capsid profiles check the clean screen image for very long, nearly straight
+support-film edges. The app rejects an elongated contour when a substantial
+part of its boundary follows such an edge. Nearby compact capsids are assessed
+individually; the app does not exclude an entire side of the film or use image
+darkness alone. Short polygon facets are not enough to reject a capsid.
+Curved support and ambiguous broad regions can still produce unwanted contours.
+This check uses the existing image and models; no additional download is needed.
+Manual picking, generic detection and explicit box/point prompts keep their
+existing behavior.
 
 Escape stops and disables picking. Space pauses/resumes active auto; F8 is an
 additional pause key. Disable Picking removes the input-catching overlay.

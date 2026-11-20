@@ -31,6 +31,7 @@ from application_icon import (apply_application_icon, application_icon_paths,
                               configure_application_identity, windows_application_icon_status)
 from capsid import filter_capsid_proposals, polygonal_capsid_mask
 from capsid_prior import load_profile, resolve_profile_path, score_image
+from carbon_support import detect_carbon_edges, guard_proposals
 
 from recognition import (
     Candidate, RecognitionConfig, RecognitionError, Cancelled, SamRecognizer,
@@ -46,7 +47,7 @@ from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fr
 from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -171,6 +172,25 @@ def _smoke_image_processing() -> dict[str, Any]:
     if (not evidence["components"][0]["applied"] or np.any(polygon & ~allowed)
             or not polygon[12, 44] or np.any(polygon[35:39, 25:29])):
         raise RuntimeError("Polygon fitting or its excluded-area constraint failed.")
+    # Exercise the packaged shared guard with a long support edge and a real
+    # compact target immediately beside it. No desktop events or model data.
+    yy, xx = np.mgrid[:320, :480]
+    distance = xx - .35 * yy - 150
+    rng = np.random.default_rng(261)
+    grey = 125 + rng.normal(0, 4, (320, 480))
+    grey[distance < 0] -= 35
+    grey[np.abs(distance) < 1.7] = 25
+    film_fragment = ((distance >= -20) & (distance <= -2) & (yy >= 95) & (yy <= 220))
+    compact = (np.abs(xx - 235) < 30) & (np.abs(yy - 160) < 30)
+    grey[compact] += rng.normal(0, 25, int(compact.sum()))
+    scene = np.repeat(np.uint8(np.clip(grey, 0, 255))[..., None], 3, axis=2)
+    records = [{"segmentation": film_fragment}, {"segmentation": compact}]
+    context = detect_carbon_edges(scene)
+    retained, guard = guard_proposals(context, records)
+    if (not context.segments or guard["rejected_indices"] != [0]
+            or len(retained) != 1 or retained[0] is not records[1]
+            or not np.array_equal(retained[0]["segmentation"], compact)):
+        raise RuntimeError("Carbon guard failed to reject the film fragment or preserve its neighboring target.")
     buffer = io.BytesIO()
     Image.fromarray(np.zeros((8, 12, 3), dtype=np.uint8)).save(buffer, format="PNG")
     buffer.seek(0)
@@ -183,7 +203,10 @@ def _smoke_image_processing() -> dict[str, Any]:
             "cross_contour_duplicate_guard": True,
             "capsid_uniform_scene_rejected": True,
             "capsid_polygon_fitting": True,
-            "polygon_exclusions_preserved": True}
+            "polygon_exclusions_preserved": True,
+            "carbon_guard": {"status": "ok", "detected_edges": len(context.segments),
+                             "rejected_film_contours": guard["rejected_count"],
+                             "nearby_capsid_preserved": True}}
 
 
 def _smoke_torchvision() -> dict[str, Any]:

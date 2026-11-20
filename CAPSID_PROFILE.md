@@ -10,6 +10,10 @@ For a source installation, place `capsid-profile.json` beside the configured SAM
 
 The experimental setting requires its profile file. A missing or invalid profile produces an actionable error; select **capsid** to use the earlier texture-based detector. Detection diagnostics record the loaded file's identity and SHA-256.
 
+## Shared carbon-boundary check in 2.6.1
+
+The `capsid` and `capsid-learned` detection modes share an additional support-boundary check based on full-image edge context and candidate geometry. It does not alter the screenshot, erase an entire side of a detected line, or retrain either SAM or the numeric appearance profile. A flat polygon side by itself is not sufficient evidence for rejection. Explicit user prompts and manual contours bypass this automatic check.
+
 ## What the profile learns
 
 The profile learns combinations of local density, texture at multiple scales, directional structure and surrounding contrast. Its small neural network runs through NumPy and SciPy on the CPU. Learned image features select a bounded set of box-and-point prompts for SAM, after which texture and shape checks refine polygonal interiors. The SAM image is encoded once. Dense granular material is stronger evidence than darkness alone. Polygon fitting remains a geometry step; neither a fixed number of sides nor a completely closed surrounding membrane is required.

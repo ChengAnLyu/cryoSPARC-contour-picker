@@ -13,10 +13,10 @@ from pathlib import Path
 def build(destination: Path | None = None) -> Path:
     directory = Path(__file__).resolve().parent
     destination = destination or directory / "main.py"
-    names = ("application_icon", "capsid_prior", "capsid", "recognition", "execution", "desktop", "manual_sampling", "micrograph_navigation", "screen_overlay", "screen_app", "app")
+    names = ("application_icon", "capsid_prior", "carbon_support", "capsid", "recognition", "execution", "desktop", "manual_sampling", "micrograph_navigation", "screen_overlay", "screen_app", "app")
     sections = [
         '#!/usr/bin/env python3\n',
-        '"""SARU Picker 2.6.0: direct screen contours and model-assisted desktop picking.\n',
+        '"""SARU Picker 2.6.1: direct screen contours and model-assisted desktop picking.\n',
         'Generated from the companion tested modules. Run python main.py --help.\n',
         '"""\nfrom __future__ import annotations\n\n',
     ]

@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw
 
 from capsid import filter_capsid_proposals, capsid_guided_prompts, filter_capsid_with_profile
 from capsid_prior import resolve_profile_path, load_profile, score_image
+from carbon_support import detect_carbon_edges, guard_proposals
 
 CancelCheck = Callable[[], bool] | None
 
@@ -491,6 +492,8 @@ class SamRecognizer:
             raw_count = len(raw)
             is_capsid = self.config.automatic_profile in {"capsid", "capsid-learned"}
             refinement_started = time.perf_counter()
+            carbon_seconds = 0.0
+            carbon_summary = {"enabled": False}
             if is_capsid:
                 if profile is not None:
                     raw = filter_capsid_with_profile(
@@ -502,6 +505,15 @@ class SamRecognizer:
                         rgb, raw, check_cancel=lambda: _check_cancel(cancel),
                         min_area_ratio=self.config.min_area_ratio,
                         max_area_ratio=min(self.config.max_area_ratio, .40))
+                # Adjudicate the extracted interiors, not their broad SAM
+                # parents: an edge-bound parent can contain a valid capsid.
+                # Retained masks and their order are never modified here.
+                carbon_started = time.perf_counter()
+                context = detect_carbon_edges(rgb, check_cancel=lambda: _check_cancel(cancel))
+                raw, carbon_summary = guard_proposals(
+                    context, raw, check_cancel=lambda: _check_cancel(cancel))
+                carbon_summary["enabled"] = True
+                carbon_seconds = time.perf_counter() - carbon_started
             candidates = []
             evidence = {}
             for item in raw:
@@ -529,8 +541,10 @@ class SamRecognizer:
                 "profile": self.config.automatic_profile,
                 "sam_proposals": raw_count, "selected_contours": len(result),
                 "appearance_model": appearance,
+                "carbon_guard": carbon_summary,
                 "timing_seconds": {"appearance": feature_seconds, "guided_proposals": proposal_seconds,
-                                   "sam": sam_seconds, "refinement": time.perf_counter() - refinement_started,
+                                   "sam": sam_seconds, "carbon_guard": carbon_seconds,
+                                   "refinement": time.perf_counter() - refinement_started,
                                    "total_including_initial_model_load": time.perf_counter() - started},
                 "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
                 "note": ("Positive-unlabeled appearance profile guides SAM boxes and bounded polygonal cores; "

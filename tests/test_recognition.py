@@ -473,6 +473,77 @@ class LearnedAutomaticProfileTests(unittest.TestCase):
             self.assertEqual(recognizer.last_detection['appearance_model']['status'], 'disabled')
             self.assertFalse(recognizer._appearance_profile_loaded)
 
+    def test_shared_carbon_guard_adjudicates_refined_contours_and_cache_in_both_modes(self):
+        from test_capsid import synthetic_core
+        for mode in ('capsid', 'capsid-learned'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                recognizer, rgb, _, _ = self._recognizer(directory)
+                recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode)
+                _, _, parents = synthetic_core()
+                recognizer._generator = types.SimpleNamespace(generate=lambda image: parents)
+                first = np.zeros(rgb.shape[:2], bool)
+                second = np.zeros_like(first)
+                first[25:65, 40:90] = True
+                second[70:110, 100:140] = True
+                refined = [{'segmentation': first}, {'segmentation': second}]
+                context = object()
+                observed = []
+                def adjudicate(actual_context, records, **kwargs):
+                    self.assertIs(actual_context, context)
+                    self.assertIs(records, refined)
+                    kwargs['check_cancel']()
+                    observed.append(records)
+                    return [records[1]], {'input_count': 2, 'retained_count': 1,
+                                          'rejected_count': 1, 'rejected_indices': [0]}
+                refiner = ('recognition.filter_capsid_proposals' if mode == 'capsid'
+                           else 'recognition.filter_capsid_with_profile')
+                with patch(refiner, return_value=refined), \
+                     patch('recognition.detect_carbon_edges', return_value=context) as detect, \
+                     patch('recognition.guard_proposals', side_effect=adjudicate):
+                    result = recognizer.automatic(rgb)
+                    cached = recognizer.automatic(rgb.copy())
+                self.assertEqual(detect.call_count, 1)
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(len(result), 1)
+                np.testing.assert_array_equal(result[0].mask, second)
+                self.assertFalse(result[0].mask.flags.writeable)
+                self.assertEqual(result[0].id, cached[0].id)
+                self.assertTrue(recognizer.last_detection['carbon_guard']['enabled'])
+                self.assertEqual(recognizer.last_detection['carbon_guard']['rejected_count'], 1)
+
+    def test_carbon_cancellation_never_commits_partial_detection(self):
+        from test_capsid import synthetic_core
+        for mode in ('capsid', 'capsid-learned'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                recognizer, rgb, _, _ = self._recognizer(directory)
+                recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode)
+                _, _, parents = synthetic_core()
+                recognizer._generator = types.SimpleNamespace(generate=lambda image: parents)
+                with patch('recognition.guard_proposals', side_effect=Cancelled('stop carbon pass')):
+                    with self.assertRaisesRegex(Cancelled, 'stop carbon pass'):
+                        recognizer.automatic(rgb)
+                self.assertIsNone(recognizer._automatic_result)
+                self.assertIsNone(recognizer._automatic_image_key)
+                self.assertIsNone(recognizer.last_detection)
+                self.assertIsNone(recognizer._active_cancel)
+
+    def test_generic_and_explicit_prompts_bypass_automatic_carbon_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer, rgb, _, _ = self._recognizer(directory)
+            recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile='generic')
+            mask = np.zeros(rgb.shape[:2], bool)
+            mask[15:60, 30:90] = True
+            recognizer._generator = types.SimpleNamespace(generate=lambda image: [{'segmentation': mask}])
+            with patch('recognition.detect_carbon_edges', side_effect=AssertionError('automatic guard invoked')):
+                self.assertEqual(len(recognizer.automatic(rgb)), 1)
+            self.assertFalse(recognizer.last_detection['carbon_guard']['enabled'])
+        for mode in ('generic', 'capsid', 'capsid-learned'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                recognizer, rgb, _, _ = self._recognizer(directory)
+                recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile=mode)
+                with patch('recognition.detect_carbon_edges', side_effect=AssertionError('automatic guard invoked')):
+                    self.assertTrue(recognizer.prompt(rgb, box=(30, 20, 99, 77)))
+
 
 if __name__ == "__main__":
     unittest.main()

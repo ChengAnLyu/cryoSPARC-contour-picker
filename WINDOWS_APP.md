@@ -1,12 +1,16 @@
-# SARU Picker 2.6 for Windows
+# SARU Picker 2.6.1 for Windows
 
-Install **SARU-Picker-Setup-2.6.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.6.1-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
 to the installed application, its EXE and its shortcuts. The setup EXE itself
 uses the public geometric icon. Setup also works without the optional sidecars,
 using that fallback for the installed app.
+
+## Version 2.6.1 update
+
+Both capsid detection modes add a shared carbon-boundary check. It uses a candidate’s relationship to a much longer image boundary instead of rejecting all straight sides or all material on one side of a line. The existing learned profile, manual interaction, compact panel and picking controls are retained.
 
 ## Version 2.6 update
 
