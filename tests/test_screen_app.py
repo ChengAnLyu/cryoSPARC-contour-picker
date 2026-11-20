@@ -365,6 +365,19 @@ class ScreenGeometryTests(unittest.TestCase):
         batches = screen_model_batches([make_candidate(mask)], region, 13, picked=[(20, 20)])
         np.testing.assert_array_equal(batches[0].local, [[26, 31]])
 
+    def test_contour_plan_reports_raw_sites_and_actual_history_exclusions(self):
+        geometry = CaptureGeometry(0, 0, 160, 120)
+        original, shifted = np.zeros((120, 160), bool), np.zeros((120, 160), bool)
+        original[10:110, 20:120] = True
+        shifted[12:112, 22:122] = True
+        original_points = mask_contour_points(original, 20)
+        plan = screen_model_batches([make_candidate(shifted)], geometry, 20,
+                                    picked=map(tuple, original_points))[0]
+        self.assertEqual(plan.raw_count, 30)
+        self.assertEqual(plan.blocked_count, 30)
+        self.assertEqual(len(plan.local), 0)
+        self.assertEqual(len(plan.screen), 0)
+
     def test_click_limit_applies_after_filtering_already_picked_positions(self):
         region = CaptureGeometry(0, 0, 80, 70)
         mask = np.zeros((70, 80), bool)
@@ -737,6 +750,142 @@ class ScreenControllerTests(unittest.TestCase):
                 self.assertFalse(app.root.destroyed)
             self.assertIsNone(app.input_surface)
         self.assertEqual(app.desktop.keys, [])
+
+    def test_eight_semi_selections_retire_exhausted_overlaps_and_continue_after_zero_plan(self):
+        app = app_state("semi-auto")
+        app.spacing.set(20)
+        app.click_delay.set(0)
+        app.geometry = CaptureGeometry(726, 421, 696, 499)
+        app.desktop.rgb = np.full((1080, 1920, 3), 100, np.uint8)
+        app.reference = app.rgb = np.full((499, 696, 3), 100, np.uint8)
+        candidates = []
+        for y in (60, 300):
+            for x in (25, 190, 355, 520):
+                mask = np.zeros((499, 696), bool)
+                mask[y:y+100, x:x+100] = True
+                candidates.append(make_candidate(mask))
+        duplicates = []
+        for source in (candidates[0], candidates[6]):
+            x, y = source.bbox[:2]
+            mask = np.zeros((499, 696), bool)
+            mask[y+2:y+102, x+2:x+102] = True
+            duplicates.append(make_candidate(mask))
+        app.candidates = list(candidates) + duplicates
+        expected_clicks = []
+        yy, xx = np.indices((499, 696))
+
+        def select(candidate):
+            self.assertIsNotNone(app.input_surface)
+            self.assertTrue(app.input_surface.visible)
+            x, y = candidate.bbox[:2]
+            app._input_press(726+x+1, 421+y+1)
+            app._input_release(726+x+1, 421+y+1)
+            for _ in range(10):
+                if app.runner.busy:
+                    break
+                app.root.run_next()
+            self.assertTrue(app.runner.busy)
+            result = app.runner.finish()
+            app.runner.results.append(TaskResult(app.active_token, value=result))
+            app.poll()
+            self.assertFalse(app.disabled.get())
+            self.assertFalse(app.root.hidden)
+            self.assertFalse(app.root.destroyed)
+            return result
+
+        with patch("screen_app.InputSurface", Surface):
+            app._present_masks()
+            for number, candidate in enumerate(candidates):
+                if number:
+                    # The browser can paint older markers after the previous
+                    # completion capture, including after the fifth contour.
+                    for x, y in app.picked_points:
+                        marker = (xx-x)**2 + (yy-y)**2 <= 14**2
+                        app.desktop.rgb[421:920, 726:1422][marker] = (0, 255, 0)
+                if number == 5:
+                    # A fresh Detect can propose an already picked region.
+                    # The empty-plan detour must explain itself and restore
+                    # selection for all three untouched regions afterwards.
+                    app._result("recognition", {"rgb": app.reference.copy(), "auto": False,
+                                "prompt": False, "candidates": [duplicates[0], *app.candidates]})
+                    before = set(app.picked_points)
+                    empty = select(duplicates[0])
+                    self.assertEqual(empty["count"], 0)
+                    self.assertEqual(empty["planning"], {"spacing": 20, "raw_grid_points": 30,
+                                     "blocked_grid_points": 30, "eligible_grid_points": 0, "sent_points": 0})
+                    self.assertEqual(app.picked_points, before)
+                    self.assertIn("already covered", app.status.get())
+                    self.assertIsNotNone(app.input_surface)
+                result = select(candidate)
+                expected_clicks.extend(tuple(point) for point in
+                                       mask_contour_points(candidate.mask, 20) + [726, 421])
+                self.assertEqual(result["count"], 30)
+                self.assertEqual(result["planning"]["raw_grid_points"], 30)
+                self.assertEqual(result["planning"]["blocked_grid_points"], 0)
+                self.assertEqual(result["planning"]["sent_points"], 30)
+                self.assertEqual(app.desktop.clicks, expected_clicks)
+                self.assertEqual(len(app.picked_points), 30 * (number+1))
+                remaining_ids = {item.id for item in app.candidates}
+                self.assertNotIn(duplicates[0].id, remaining_ids)
+                if number < 6:
+                    # Both overlapping, unpicked choices must stay available.
+                    # Planning one must not reserve points against the other.
+                    records = {item["candidate_id"]: item for item in result["remaining_plans"]}
+                    for unpicked in (candidates[6], duplicates[1]):
+                        self.assertIn(unpicked.id, remaining_ids)
+                        self.assertEqual(records[unpicked.id]["eligible_grid_points"], 30)
+                else:
+                    self.assertNotIn(duplicates[1].id, remaining_ids)
+            self.assertEqual(len(app.desktop.clicks), 240)
+            self.assertEqual(app.candidates, [])
+            self.assertIsNone(app.input_surface)
+            self.assertFalse(app.overlay.visible)
+            self.assertIn("No selectable contours remain", app.status.get())
+            self.assertIn("Next micrograph", app.status.get())
+            self.assertNotIn("Click another green", app.status.get())
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_spacing_changed_during_playback_does_not_apply_stale_exhaustion_plan(self):
+        app = app_state("semi-auto")
+        first, shifted = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[15:45, 10:40] = True
+        shifted[16:46, 11:41] = True
+        selected, remaining = make_candidate(first), make_candidate(shifted)
+        app.candidates = [selected, remaining]
+        app._start_model_picks([selected])
+        app.root.run_next()
+        result = app.runner.finish()
+        self.assertEqual(result["exhausted_ids"], {remaining.id})
+        app.spacing.set(5)
+        app.runner.results.append(TaskResult(app.active_token, value=result))
+        with patch("screen_app.InputSurface", Surface):
+            app.poll()
+        self.assertEqual([item.id for item in app.candidates], [remaining.id])
+        self.assertEqual(app.picked_points, set(result["picked"]))
+        self.assertTrue(app.input_surface.visible)
+        self.assertIn("1 contour ready", app.status.get())
+
+    def test_empty_grid_is_explained_separately_from_an_already_picked_contour(self):
+        app = app_state("semi-auto")
+        app.spacing.set(20)
+        mask = np.zeros((70, 80), bool)
+        yy, xx = np.indices((10, 10))
+        mask[10:20, 10:20] = xx + yy >= 9
+        candidate = make_candidate(mask)
+        app.candidates = [candidate]
+        app._start_model_picks([candidate])
+        app.root.run_next()
+        result = app.runner.finish()
+        self.assertEqual(result["planning"], {"spacing": 20, "raw_grid_points": 0,
+                         "blocked_grid_points": 0, "eligible_grid_points": 0, "sent_points": 0})
+        app.runner.results.append(TaskResult(app.active_token, value=result))
+        with patch("screen_app.InputSurface", Surface):
+            app.poll()
+        self.assertEqual(app.desktop.clicks, [])
+        self.assertEqual(app.picked_points, set())
+        self.assertIn("No grid sites at spacing 20", app.status.get())
+        self.assertIn("No selectable contours remain", app.status.get())
+        self.assertNotIn("already covered", app.status.get())
 
     def test_second_contour_still_rejects_global_image_change_before_clicking(self):
         app = app_state("semi-auto")

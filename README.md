@@ -1,10 +1,12 @@
-# SARU Picker 2.7.1
+# SARU Picker 2.7.2
 
 SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the image viewer, with its existing layout and controls. A compact, always-on-top **SARU PICKER** panel selects manual, semi-auto, or auto mode.
 
 ## Windows application
 
-The CPU installer is named **SARU-Picker-Setup-2.7.1-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+The CPU installer is named **SARU-Picker-Setup-2.7.2-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+
+Version 2.7.2 corrects semi-auto handling of overlapping proposals that have no new pick positions. After a contour finishes, remaining proposals are checked independently against actual completed picks. Fully covered proposals are removed before the selectable overlay returns. A zero-pick selection explains whether the contour is already covered or has no grid sites at the current spacing, and the final status says when no selectable contours remain. Pick history, duplicate-spacing protection, manual controls and model weights are retained. The Windows regression fixture now exercises eight fresh contours plus a covered, zero-pick selection after the fifth contour.
 
 Version 2.7.1 excludes small automatically detected capsid regions by default. Both **capsid** and **capsid-learned** require each final connected region to contain at least **3,500 native screen pixels**. Change **Advanced → Minimum capsid area (screen px²)** to adjust this for your zoom; **0** restores all sizes. The cutoff counts actual foreground pixels, excludes holes, and never combines disconnected small fragments to pass the limit. It is applied after contour refinement, so surviving contours keep their original boundaries. Empty detection results stay empty. Manual contours, explicit Box prompts, and generic SAM proposals retain their existing behavior. Changing recognition settings retires old displayed contours and requires Detect again while retaining actual pick history. This release keeps the 2.7.0 learned weights; no retraining is claimed.
 

@@ -58,6 +58,11 @@ class ScreenContourBatch:
     candidate_id: str
     local: np.ndarray
     screen: np.ndarray
+    raw_count: int
+
+    @property
+    def blocked_count(self):
+        return self.raw_count - len(self.local)
 
 
 def _screen_picked_points(picked, geometry):
@@ -128,7 +133,7 @@ def screen_model_batches(candidates, geometry, spacing, picked=(), cancel=None,
         already.update(tuple(map(int, point)) for point in local)
         screen = np.asarray([geometry.local_to_screen(int(x), int(y)) for x, y in local],
                             dtype=np.int32).reshape(-1, 2)
-        batches.append(ScreenContourBatch(candidate.id, local, screen))
+        batches.append(ScreenContourBatch(candidate.id, local, screen, len(positions)))
     return batches
 
 
@@ -835,6 +840,9 @@ class ScreenPickerApp:
         if geometry is None or target is None or reference is None:
             raise ValueError("Detect the selected screen area before picking.")
         candidates, picked = tuple(candidates), set(self.picked_points)
+        selected_ids = {candidate.id for candidate in candidates}
+        remaining_candidates = tuple(candidate for candidate in self.candidates
+                                     if candidate.id not in selected_ids)
         spacing, frame_id = int(self.spacing.get()), self.frame_id
         SCREEN_LOG.info("Starting model picks: frame=%s contours=%s previous_picks=%s auto=%s ids=%s",
                         frame_id, len(candidates), len(picked), auto, [candidate.id for candidate in candidates])
@@ -849,6 +857,10 @@ class ScreenPickerApp:
                 if not batches:
                     raise ValueError("There are no detected contours to pick.")
                 planned = sum(len(batch.screen) for batch in batches)
+                raw_count = sum(batch.raw_count for batch in batches)
+                blocked_count = sum(batch.blocked_count for batch in batches)
+                SCREEN_LOG.info("Model pick plan: frame=%s spacing=%s raw=%s blocked=%s eligible=%s",
+                                frame_id, spacing, raw_count, blocked_count, planned)
                 self.desktop.focus_target(target)
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
@@ -898,6 +910,26 @@ class ScreenPickerApp:
                                          max_clicks=10000, progress=progress)
                     SCREEN_LOG.info("Completed model contour: frame=%s contour=%s/%s id=%s picks=%s",
                                     frame_id, index, len(batches), batch.candidate_id, len(batch.screen))
+                # Retire stale overlapping proposals before restoring the
+                # selectable overlay. Check every remaining region separately
+                # against actual clicks only: an unselected proposal must not
+                # suppress another unselected proposal's available sites.
+                # This bitmap/grid work stays on the worker thread.
+                actual_picks = picked | set(completed_local)
+                remaining_plans, exhausted_ids = [], set()
+                for candidate in remaining_candidates:
+                    available = screen_model_batches([candidate], geometry, spacing, actual_picks,
+                                                     cancel=lambda: token.cancelled,
+                                                     max_points=int(candidate.mask.size))[0]
+                    record = {"candidate_id": candidate.id, "raw_grid_points": available.raw_count,
+                              "blocked_grid_points": available.blocked_count,
+                              "eligible_grid_points": len(available.local)}
+                    remaining_plans.append(record)
+                    if not len(available.local):
+                        exhausted_ids.add(candidate.id)
+                    SCREEN_LOG.info("Remaining contour plan: frame=%s id=%s raw=%s blocked=%s eligible=%s",
+                                    frame_id, candidate.id, available.raw_count,
+                                    available.blocked_count, len(available.local))
                 token.sleep(.12)
                 self.desktop.ensure_target(target)
                 after = self._capture_region(geometry)
@@ -905,7 +937,11 @@ class ScreenPickerApp:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
                 return {"count": count, "ids": {batch.candidate_id for batch in batches}, "reference": after,
                         "auto": auto, "contours": len(batches), "scene_verified": background is not None,
-                        "frame_id": frame_id, "picked": tuple(completed_local)}
+                        "frame_id": frame_id, "picked": tuple(completed_local),
+                        "planning": {"spacing": spacing, "raw_grid_points": raw_count,
+                                     "blocked_grid_points": blocked_count,
+                                     "eligible_grid_points": planned, "sent_points": count},
+                        "remaining_plans": tuple(remaining_plans), "exhausted_ids": exhausted_ids}
             self._submit("model picks", work)
         self._schedule(90, begin)
 
@@ -1063,13 +1099,35 @@ class ScreenPickerApp:
                 self.reference = self.rgb = None
                 return
             self.reference = value["reference"]
-            self.candidates = [c for c in self.candidates if c.id not in value["ids"]]
+            planning = value.get("planning", {})
+            # The slider remains usable during playback. A plan made with the
+            # old spacing cannot retire a region which may have sites at the
+            # user's new spacing. Frame identity was checked above.
+            exhausted_ids = (value.get("exhausted_ids", set())
+                             if planning.get("spacing") == int(self.spacing.get()) else set())
+            retired = sum(c.id in exhausted_ids and c.id not in value["ids"] for c in self.candidates)
+            self.candidates = [c for c in self.candidates
+                               if c.id not in value["ids"] and c.id not in exhausted_ids]
             self.alternatives = []
             if value["auto"]:
                 self._finish_auto_frame()
             else:
                 self._present_masks()
-                self.status.set(f"{value['count']} picks placed. Click another green region or detect again.")
+                if value["count"]:
+                    message = f"{value['count']} picks placed."
+                elif planning.get("raw_grid_points") == 0:
+                    message = f"No grid sites at spacing {planning['spacing']}. Lower spacing and Detect again."
+                elif planning.get("blocked_grid_points") == planning.get("raw_grid_points") and planning:
+                    message = "No new picks: this contour is already covered by earlier picks."
+                else:
+                    message = "No new pick positions in this contour."
+                if retired:
+                    message += f" {retired} region{'s' if retired != 1 else ''} without new positions hidden."
+                if self.candidates:
+                    message += f" {len(self.candidates)} contour{'s' if len(self.candidates) != 1 else ''} ready."
+                else:
+                    message += " No selectable contours remain. Use Next micrograph or Detect."
+                self.status.set(message)
         elif kind == "next frame":
             if not value["advanced"]:
                 self.reference = self.rgb = value["rgb"]

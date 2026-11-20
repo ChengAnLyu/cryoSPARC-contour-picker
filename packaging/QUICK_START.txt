@@ -1,4 +1,4 @@
-SARU Picker 2.7.1 — Windows CPU edition
+SARU Picker 2.7.2 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -29,6 +29,15 @@ default click delay as semi-auto and auto. The previous outline is cleared
 before a new stroke appears; the control panel stays visible.
 Manual mode has no screenshot, screen-area selection, model or separate review
 step. A stroke starts immediately and release directly starts picking.
+
+REPEATED SELECTIONS (2.7.2)
+After a contour finishes, overlapping proposals with no new pick positions are
+hidden. Each remaining proposal is checked against actual completed picks.
+A covered selection now says it is already covered, and a contour with no grid
+sites reports the current spacing. Later valid contours remain selectable.
+When none remain, the status points to Next micrograph or Detect. The log records
+raw, blocked, eligible and sent counts. Manual behavior and model weights stay
+the same; the 3,500-screen-pixel automatic capsid cutoff is retained.
 
 SEMI-AUTO
 Move the panel outside the intended micrograph area. Select screen area,

@@ -48,7 +48,7 @@ from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fr
 from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.7.2"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -491,11 +491,11 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
     _smoke_settle_panel(picker)
     width, height = root.winfo_screenwidth(), root.winfo_screenheight()
     occupied = control_panel_bounds(root)
-    geometry = next((CaptureGeometry(x, y, 240, 160)
-                     for x, y in ((width-260, 30), (width-260, height-190),
-                                  (20, height-190), (20, 30))
+    geometry = next((CaptureGeometry(x, y, 480, 360)
+                     for x, y in ((width-500, 30), (width-500, height-390),
+                                  (20, height-390), (20, 30))
                      if x >= 0 and y >= 0
-                     and not screen_region_overlaps_panel(CaptureGeometry(x, y, 240, 160), occupied)), None)
+                     and not screen_region_overlaps_panel(CaptureGeometry(x, y, 480, 360), occupied)), None)
     if geometry is None:
         raise RuntimeError("No free screen area for the repeated-contour UI check.")
 
@@ -540,20 +540,41 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
             draw = ImageDraw.Draw(image)
             for x, y in self.clicks:
                 x, y = x-geometry.left, y-geometry.top
-                draw.ellipse((x-10, y-10, x+10, y+10), outline=(40, 240, 60), width=4)
+                draw.ellipse((x-15, y-15, x+15, y+15), outline=(40, 240, 60), width=5)
             self.rgb = np.array(image)
 
     desktop = MemoryDesktop()
     candidates = []
-    for left in (12, 89, 166):
-        mask = polygon_mask([(left+9, 30), (left+43, 30), (left+54, 48),
-                             (left+49, 94), (left+10, 101), (left, 73)],
-                            (geometry.height, geometry.width))
-        candidates.append(make_candidate(mask, source="synthetic lifecycle check"))
+    for top in (30, 205):
+        for left in (20, 134, 248, 362):
+            mask = np.zeros((geometry.height, geometry.width), dtype=bool)
+            mask[top:top+80, left:left+80] = True
+            candidates.append(make_candidate(mask, source="synthetic lifecycle check"))
+    overlap = np.zeros_like(candidates[0].mask)
+    overlap[30:110, 22:102] = True
+    exhausted = make_candidate(overlap, source="synthetic exhausted overlap check")
     completed = []
     annotation_presentations, retired_windows = [], []
     panel_handle = int(root.winfo_id())
     delayed_fraction = 0.0
+    attempts = []
+    previous_result_override = picker.__dict__.get("_result")
+    original_result = picker._result
+
+    def record_result(kind, value):
+        original_result(kind, value)
+        if kind == "model picks":
+            planning = value["planning"]
+            attempts.append({"candidate_id": next(iter(value["ids"])),
+                             "frame_id": value["frame_id"],
+                             "raw_grid_points": planning["raw_grid_points"],
+                             "blocked_grid_points": planning["blocked_grid_points"],
+                             "eligible_grid_points": planning["eligible_grid_points"],
+                             "sent_points": planning["sent_points"],
+                             "exhausted_ids": sorted(value["exhausted_ids"]),
+                             "remaining_plans": list(value["remaining_plans"]),
+                             "remaining_contour_ids": [c.id for c in picker.candidates],
+                             "status": picker.status.get()})
 
     def inspect_annotation(expected_candidates):
         # Inspect the actual Tk PhotoImage attached to the sole Canvas item,
@@ -585,13 +606,68 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
             "one_current_canvas_image": True,
         })
 
+    def select_and_check(candidate, expected_remaining, expected_picks):
+        inspect_annotation(picker.candidates)
+        previous_annotation = picker.overlay.window
+        previous_canvas = picker.overlay.canvas
+        surface = picker.input_surface
+        if surface is None or not surface.visible:
+            raise RuntimeError("A remaining contour has no clickable overlay.")
+        before = len(desktop.clicks)
+        previous_attempts = len(attempts)
+        ys, xs = np.nonzero(candidate.mask)
+        mid = len(xs)//2
+        local_x, local_y = int(xs[mid]), int(ys[mid])
+        x, y = geometry.local_to_screen(local_x, local_y)
+        surface.canvas.event_generate("<ButtonPress-1>", x=local_x, y=local_y,
+                                      rootx=x, rooty=y)
+        surface.canvas.event_generate("<ButtonRelease-1>", x=local_x, y=local_y,
+                                      rootx=x, rooty=y)
+        if not (picker.transition or picker.runner.busy):
+            raise RuntimeError(f"Contour selection did not start: {picker.status.get()}")
+        deadline = time.monotonic() + 15
+        while picker.transition or picker.runner.busy:
+            root.update()
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Contour selection did not finish: {picker.status.get()}")
+            time.sleep(.005)
+        root.update()
+        if picker.disabled.get() or len(attempts) != previous_attempts+1:
+            raise RuntimeError(f"Contour result failed: {picker.status.get()}")
+        if len(desktop.clicks)-before != expected_picks:
+            raise RuntimeError("A fresh or exhausted contour sent an unexpected number of picks.")
+        if [c.id for c in picker.candidates] != [c.id for c in expected_remaining]:
+            raise RuntimeError("Remaining contours include an exhausted proposal or omit a fresh one.")
+        plan = attempts[-1]
+        if (plan["candidate_id"] != candidate.id or plan["raw_grid_points"] != 20
+                or plan["eligible_grid_points"] != expected_picks
+                or plan["blocked_grid_points"] != 20-expected_picks
+                or plan["sent_points"] != expected_picks):
+            raise RuntimeError("Actual pick planning diagnostics do not match the synthetic grid.")
+        if (picker.root is not root or int(root.winfo_id()) != panel_handle
+                or root.state() != "normal" or not root.winfo_viewable()
+                or not root.tk.getboolean(root.attributes("-topmost"))):
+            raise RuntimeError("The control panel disappeared during repeated selections.")
+        if expected_remaining:
+            if picker.input_surface is None or not picker.input_surface.visible:
+                raise RuntimeError("The next fresh contour is not selectable.")
+            if (picker.overlay.window is previous_annotation
+                    or picker.overlay.canvas is previous_canvas
+                    or previous_annotation.winfo_exists() or previous_canvas.winfo_exists()):
+                raise RuntimeError("Semi-auto remapped the previous contour's painted window.")
+            retired_windows.append(previous_annotation)
+        elif (picker.overlay.visible or picker.overlay.canvas.find_all()
+                or picker.overlay._mask_photo is not None or picker.input_surface is not None):
+            raise RuntimeError("The final contour left a visible or uncleared annotation surface.")
+
     try:
+        picker._result = record_result
         picker.desktop, picker.hotkeys, picker.mouse_observer = desktop, Hooks(), Hooks()
         picker.geometry, picker.target = geometry, 12345
         picker.rgb = desktop.rgb.copy()
         picker.reference = desktop.rgb.copy()
         picker.frame_id += 1
-        picker.candidates = candidates.copy()
+        picker.candidates = candidates + [exhausted]
         picker.picked_points.clear()
         picker.spacing.set(20)
         picker.click_delay.set(.02)
@@ -599,57 +675,45 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
         picker._present_masks()
         root.update()
         for index, candidate in enumerate(candidates):
-            inspect_annotation(candidates[index:])
-            previous_annotation = picker.overlay.window
-            previous_canvas = picker.overlay.canvas
-            surface = picker.input_surface
-            if surface is None or not surface.visible:
-                raise RuntimeError(f"Clickable overlay missing before contour {index+1}.")
-            ys, xs = np.nonzero(candidate.mask)
-            mid = len(xs)//2
-            local_x, local_y = int(xs[mid]), int(ys[mid])
-            x, y = geometry.local_to_screen(local_x, local_y)
-            surface.canvas.event_generate("<ButtonPress-1>", x=local_x, y=local_y,
-                                          rootx=x, rooty=y)
-            surface.canvas.event_generate("<ButtonRelease-1>", x=local_x, y=local_y,
-                                          rootx=x, rooty=y)
-            if not (picker.transition or picker.runner.busy):
-                raise RuntimeError(f"Contour {index+1} did not start: {picker.status.get()}")
-            deadline = time.monotonic() + 15
-            while picker.transition or picker.runner.busy:
-                root.update()
-                if time.monotonic() > deadline:
-                    raise RuntimeError(f"Contour {index+1} did not finish: {picker.status.get()}")
-                time.sleep(.005)
-            root.update()
-            if picker.disabled.get() or any(c.id == candidate.id for c in picker.candidates):
-                raise RuntimeError(f"Contour {index+1} failed: {picker.status.get()}")
-            if (picker.root is not root or int(root.winfo_id()) != panel_handle
-                    or root.state() != "normal" or not root.winfo_viewable()
-                    or not root.tk.getboolean(root.attributes("-topmost"))):
-                raise RuntimeError(f"Control panel disappeared after contour {index+1}.")
-            if index < len(candidates)-1 and (picker.input_surface is None or not picker.input_surface.visible):
-                raise RuntimeError(f"Next contour was not selectable after contour {index+1}.")
-            if index < len(candidates)-1:
-                if (picker.overlay.window is previous_annotation
-                        or picker.overlay.canvas is previous_canvas
-                        or previous_annotation.winfo_exists() or previous_canvas.winfo_exists()):
-                    raise RuntimeError("Semi-auto remapped the previous contour's painted window.")
-                retired_windows.append(previous_annotation)
-            elif (picker.overlay.visible or picker.overlay.canvas.find_all()
-                    or picker.overlay._mask_photo is not None or picker.input_surface is not None):
-                raise RuntimeError("The final contour left a visible or uncleared annotation surface.")
+            select_and_check(candidate, candidates[index+1:], 20)
             completed.append(len(desktop.clicks))
             if index == 0:
+                if exhausted.id not in attempts[-1]["exhausted_ids"]:
+                    raise RuntimeError("The covered overlapping proposal was not retired after the first pick.")
                 desktop.paint_delayed_markers()
                 delayed_fraction = screen_changed_fraction(picker.reference, desktop.rgb)
                 if delayed_fraction <= .03:
                     raise RuntimeError("Delayed-marker fixture did not cross the former drift threshold.")
+            if index == 4:
+                # A synthetic recognition result deliberately reintroduces a
+                # covered proposal after five jobs. This exercises the empty
+                # plan path as well as proactive retirement of initial overlaps.
+                remembered = set(picker.picked_points)
+                previous_annotation = picker.overlay.window
+                picker._result("recognition", {"rgb": desktop.rgb.copy(),
+                               "candidates": [exhausted] + candidates[index+1:],
+                               "auto": False, "prompt": False})
+                root.update()
+                if picker.picked_points != remembered or previous_annotation.winfo_exists():
+                    raise RuntimeError("Re-detection lost actual picks or reused its previous annotation surface.")
+                retired_windows.append(previous_annotation)
+                select_and_check(exhausted, candidates[index+1:], 0)
+                if picker.picked_points != remembered or "already" not in picker.status.get().lower():
+                    raise RuntimeError("The zero-plan selection did not explain coverage or preserve actual picks.")
         if len(desktop.clicks) != len(set(desktop.clicks)) or not desktop.clicks:
             raise RuntimeError("Repeated contours produced duplicate or empty test picks.")
         if desktop.thread_ids == {threading.get_ident()} or len(desktop.thread_ids) != 1:
             raise RuntimeError("Picking did not use the serialized background worker.")
+        if len(attempts) != 9 or completed != list(range(20, 161, 20)):
+            raise RuntimeError("Eight fresh contours did not complete across the zero-plan detour.")
+        if "next micrograph" not in picker.status.get().lower() or "click another green" in picker.status.get().lower():
+            raise RuntimeError("The completed scene still offers a nonexistent green contour.")
         return {"contours_completed": len(completed), "cumulative_pick_counts": completed,
+                "selection_attempts": len(attempts), "zero_plan_attempts": 1,
+                "exhausted_proposals_retired": True,
+                "zero_plan_did_not_block_next_selection": True,
+                "final_completion_status_clear": True,
+                "attempts": attempts, "final_status": picker.status.get(),
                 "delayed_marker_changed_fraction": delayed_fraction,
                 "separate_worker_jobs": True, "real_tk_input_events": True,
                 "remaining_contours_selectable": True, "panel_visible_throughout": True,
@@ -662,6 +726,10 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
                 "unique_test_picks": len(desktop.clicks), "desktop_events_sent": 0,
                 "note": "Real controller/worker/Windows overlays; in-memory target and click sink, not cryoSPARC. Checks window retirement and actual Tk bitmap contents, not every compositor frame."}
     finally:
+        if previous_result_override is None:
+            picker.__dict__.pop("_result", None)
+        else:
+            picker._result = previous_result_override
         picker.stop()
         if not picker.runner.shutdown(wait=True, timeout=5):
             raise RuntimeError("Repeated-contour test worker did not terminate.")

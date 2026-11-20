@@ -634,7 +634,7 @@ class WindowsScaleCoverageTests(unittest.TestCase):
              patch.object(app, "_smoke_panel_layout", side_effect=measure), \
              patch.object(app, "_smoke_advanced_settings", return_value={"status":"ok"}) as settings, \
              patch.object(app, "windows_application_icon_status", return_value={"small_icon": True, "large_icon": True}), \
-             patch.object(app, "_smoke_repeated_screen_picks", return_value={"contours_completed": 3}) as repeated, \
+             patch.object(app, "_smoke_repeated_screen_picks", return_value={"contours_completed": 8, "selection_attempts": 9}) as repeated, \
              patch.object(app, "_smoke_micrograph_cycle", return_value={"continuous_auto": {"down_keys": 3}}) as cycle, \
              patch.object(app, "_smoke_manual_strokes", return_value={"strokes_completed": 2}) as manual, \
              patch.object(app, "verify_screen_overlay", side_effect=verify_overlay) as overlay:
@@ -669,7 +669,8 @@ class WindowsScaleCoverageTests(unittest.TestCase):
         repeated.assert_called_once_with(pickers[0])
         cycle.assert_called_once_with(pickers[0])
         manual.assert_called_once_with(pickers[0])
-        self.assertEqual(result["repeated_semi_auto_contours"]["contours_completed"], 3)
+        self.assertEqual(result["repeated_semi_auto_contours"]["contours_completed"], 8)
+        self.assertEqual(result["repeated_semi_auto_contours"]["selection_attempts"], 9)
         self.assertEqual(result["micrograph_navigation_cycle"]["continuous_auto"]["down_keys"], 3)
         self.assertEqual(result["consecutive_manual_strokes"]["strokes_completed"], 2)
         modules["pyautogui"].click.assert_not_called()

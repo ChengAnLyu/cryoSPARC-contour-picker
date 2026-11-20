@@ -1,12 +1,18 @@
-# SARU Picker 2.7.1 for Windows
+# SARU Picker 2.7.2 for Windows
 
-Install **SARU-Picker-Setup-2.7.1-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.7.2-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
 to the installed application, its EXE and its shortcuts. The setup EXE itself
 uses the public geometric icon. Setup also works without the optional sidecars,
 using that fallback for the installed app.
+
+## Version 2.7.2: repeated semi-auto selections
+
+After each completed contour, the application hides other proposals whose grid positions are already covered by actual picks. Remaining proposals are checked independently, so two unpicked regions cannot suppress one another. If a selected contour has no new sites, the status explains why; the next valid contour remains selectable. When all selectable contours are finished, use **Next micrograph** or **Detect** as the status indicates. This update preserves the original manual interaction, pick spacing and speed, large-only automatic size filter and model weights.
+
+The log now records raw grid sites, sites blocked by earlier picks, eligible sites and sent picks. These counts help distinguish a covered contour from a picking failure. The release checks include eight fresh selections and an intentionally covered selection after the fifth, using real Windows Tk surfaces and an in-memory target. The supplied panel screenshot alone does not establish the cause on the user's original micrograph.
 
 ## Version 2.7.1: skip small automatic capsids
 
