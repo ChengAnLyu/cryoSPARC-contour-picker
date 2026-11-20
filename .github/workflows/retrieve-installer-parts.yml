@@ -29,66 +29,89 @@ jobs:
           import hashlib, json, os, urllib.request, urllib.error
           from pathlib import Path
 
-          repository = os.environ['GITHUB_REPOSITORY']
-          assert repository == 'ChengAnLyu/cryoSPARC-contour-picker'
-          artifact_id = 14648795887
-          expected_sha = '94dc41834d880e1fb7109a634100fe538db3397d67527c98b31645db95be258a'
-          expected_bytes = 480744464
-          api = f'https://api.github.com/repos/{repository}/actions/artifacts/{artifact_id}'
+          expected = {'repository': 'ChengAnLyu/cryoSPARC-contour-picker', 'branch': 'packaging/windows-installer-20261119', 'artifact_id': 14657240458, 'artifact_name': 'SARU-Picker-Windows-CPU-19', 'sha256': '163aa80cc57d3bf49882442fc656b50865e2ca7a88d9e51364864923bf10abc5', 'bytes': 480728920, 'source_run_id': 44790690709, 'source_job_id': 136477235764, 'source_commit': 'b2295b9334bb9d12e1c6a12915ace5b0e573a5fe'}
+
+          def need(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+
+          need(os.environ['GITHUB_REPOSITORY'] == expected['repository'], 'Repository identity mismatch')
+          need(7 * 64 * 1024 * 1024 < expected['bytes'] <= 8 * 64 * 1024 * 1024,
+               'Archive does not fit the reviewed eight-part plan')
+          api = (f"https://api.github.com/repos/{expected['repository']}/actions/artifacts/"
+                 f"{expected['artifact_id']}")
           headers = {'Authorization': 'Bearer ' + os.environ['SARU_TRANSFER_TOKEN'],
                      'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
           with urllib.request.urlopen(urllib.request.Request(api, headers=headers), timeout=60) as response:
               metadata = json.load(response)
-          assert metadata['workflow_run']['id'] == 44772457913
-          assert metadata['workflow_run']['head_sha'] == '7da0c56a8dc871ddd824f2ab45f7c2a184ec8dda'
-          assert metadata['digest'] == 'sha256:' + expected_sha and metadata['size_in_bytes'] == expected_bytes
-          assert not metadata['expired']
+          need(metadata['id'] == expected['artifact_id'] and metadata['name'] == expected['artifact_name'],
+               'Source artifact identity mismatch')
+          need(metadata['workflow_run']['id'] == expected['source_run_id'], 'Source run mismatch')
+          need(metadata['workflow_run']['head_sha'] == expected['source_commit'], 'Source commit mismatch')
+          need(metadata['workflow_run']['head_branch'] == expected['branch'], 'Source branch mismatch')
+          need(metadata['digest'] == 'sha256:' + expected['sha256']
+               and metadata['size_in_bytes'] == expected['bytes'], 'Source digest or size mismatch')
+          need(metadata['expired'] is False, 'Source artifact has expired')
 
           class NoRedirect(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, response_headers, newurl):
                   return None
 
           try:
-              urllib.request.build_opener(NoRedirect).open(urllib.request.Request(api + '/zip', headers=headers), timeout=60)
+              urllib.request.build_opener(NoRedirect).open(
+                  urllib.request.Request(api + '/zip', headers=headers), timeout=60)
               raise RuntimeError('Expected the authenticated artifact redirect')
           except urllib.error.HTTPError as error:
               if error.code != 302:
                   raise RuntimeError(f'Artifact API status {error.code}') from None
               download_url = error.headers['Location']
-          # Do not forward the GitHub token to the signed storage destination.
+          # A fresh request prevents forwarding the GitHub token to the storage host.
+          # Exception messages are sanitized so signed URLs cannot reach build logs.
           source = Path('verified-source.zip')
           checksum, count = hashlib.sha256(), 0
-          with urllib.request.urlopen(download_url, timeout=90) as response, source.open('wb') as destination:
-              while block := response.read(1024 * 1024):
-                  destination.write(block)
-                  checksum.update(block)
-                  count += len(block)
-          assert count == expected_bytes and checksum.hexdigest() == expected_sha
+          try:
+              with urllib.request.urlopen(download_url, timeout=90) as response, source.open('wb') as destination:
+                  while block := response.read(1024 * 1024):
+                      count += len(block)
+                      need(count <= expected['bytes'], 'Source download exceeded its authenticated size')
+                      destination.write(block)
+                      checksum.update(block)
+          except Exception as error:
+              raise RuntimeError(f'Source archive transfer failed: {type(error).__name__}') from None
+          need(count == expected['bytes'] and checksum.hexdigest() == expected['sha256'],
+               'Downloaded source bytes failed authentication')
           parts = []
           with source.open('rb') as stream:
               for index in range(1, 9):
                   data = stream.read(64 * 1024 * 1024)
-                  assert data
+                  need(bool(data), 'Transfer plan contains an empty part')
                   directory = Path('parts') / f'part-{index:02d}'
                   directory.mkdir(parents=True)
                   name = f'archive.part-{index:02d}'
                   (directory / name).write_bytes(data)
-                  parts.append({'index': index, 'name': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
-              assert not stream.read(1)
-          manifest = {'source_artifact_id': artifact_id, 'source_run_id': 44772457913,
-                      'source_commit': metadata['workflow_run']['head_sha'], 'original_archive_sha256': expected_sha,
-                      'original_archive_bytes': expected_bytes, 'parts': parts,
-                      'transfer_run_id': int(os.environ['GITHUB_RUN_ID'])}
+                  parts.append({'index': index, 'name': name, 'bytes': len(data),
+                                'sha256': hashlib.sha256(data).hexdigest()})
+              need(not stream.read(1), 'Transfer plan did not consume the complete source')
+          manifest = {'source_artifact_id': expected['artifact_id'], 'source_run_id': expected['source_run_id'],
+                      'source_job_id': expected['source_job_id'], 'source_commit': expected['source_commit'],
+                      'original_archive_sha256': expected['sha256'], 'original_archive_bytes': expected['bytes'],
+                      'parts': parts, 'part_bytes_limit': 64 * 1024 * 1024,
+                      'transfer_run_id': int(os.environ['GITHUB_RUN_ID']),
+                      'transfer_commit': os.environ['GITHUB_SHA'], 'transfer_job': os.environ['GITHUB_JOB']}
+          # Persist only allowlisted artifact metadata; download URLs and tokens are excluded.
+          source_metadata = {key: metadata[key] for key in
+                             ('id', 'name', 'size_in_bytes', 'digest', 'expired', 'workflow_run')}
           for part in parts:
               directory = Path('parts') / f"part-{part['index']:02d}"
               (directory / 'transfer-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-              (directory / 'source-artifact.json').write_text(json.dumps(metadata, indent=2) + '\n')
-          print(json.dumps({'verified_original_bytes': count, 'verified_original_sha256': expected_sha, 'parts': len(parts)}))
+              (directory / 'source-artifact.json').write_text(json.dumps(source_metadata, indent=2) + '\n')
+          print(json.dumps({'verified_original_bytes': count, 'verified_original_sha256': expected['sha256'],
+                            'parts': len(parts), 'source_commit': expected['source_commit']}))
           PYCODE
       - name: Upload verified part 01
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-01
+          name: SARU-Picker-2.7.1-transfer-part-01
           path: parts/part-01/*
           if-no-files-found: error
           compression-level: 0
@@ -96,7 +119,7 @@ jobs:
       - name: Upload verified part 02
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-02
+          name: SARU-Picker-2.7.1-transfer-part-02
           path: parts/part-02/*
           if-no-files-found: error
           compression-level: 0
@@ -104,7 +127,7 @@ jobs:
       - name: Upload verified part 03
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-03
+          name: SARU-Picker-2.7.1-transfer-part-03
           path: parts/part-03/*
           if-no-files-found: error
           compression-level: 0
@@ -112,7 +135,7 @@ jobs:
       - name: Upload verified part 04
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-04
+          name: SARU-Picker-2.7.1-transfer-part-04
           path: parts/part-04/*
           if-no-files-found: error
           compression-level: 0
@@ -120,7 +143,7 @@ jobs:
       - name: Upload verified part 05
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-05
+          name: SARU-Picker-2.7.1-transfer-part-05
           path: parts/part-05/*
           if-no-files-found: error
           compression-level: 0
@@ -128,7 +151,7 @@ jobs:
       - name: Upload verified part 06
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-06
+          name: SARU-Picker-2.7.1-transfer-part-06
           path: parts/part-06/*
           if-no-files-found: error
           compression-level: 0
@@ -136,7 +159,7 @@ jobs:
       - name: Upload verified part 07
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-07
+          name: SARU-Picker-2.7.1-transfer-part-07
           path: parts/part-07/*
           if-no-files-found: error
           compression-level: 0
@@ -144,7 +167,7 @@ jobs:
       - name: Upload verified part 08
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: SARU-Picker-2.7.0-transfer-part-08
+          name: SARU-Picker-2.7.1-transfer-part-08
           path: parts/part-08/*
           if-no-files-found: error
           compression-level: 0
