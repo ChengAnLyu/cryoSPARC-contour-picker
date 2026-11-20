@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 import math
+import heapq
 from typing import Any
 
 import numpy as np
@@ -584,3 +585,223 @@ def filter_capsid_proposals(
         record["capsid_evidence"]["polygon"] = polygon_evidence
     return selected
 
+
+
+def _profile_shape(mask: np.ndarray, check_cancel=None) -> tuple[bool, dict[str, float]]:
+    """Broad compactness support, rejecting long strips and thin membrane rims.
+
+    This is an extent prior, not an exact side-count/roundness template. Holes
+    are retained in masks. Filled-extent thickness and supported occupancy are
+    separate, so an internal contaminant does not make a valid core a thin rim.
+    """
+    _capsid_check(check_cancel)
+    yy, xx = np.nonzero(mask)
+    if len(xx) < 3:
+        return False, {}
+    covariance = np.cov(np.stack((xx, yy)))
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    elongation = math.sqrt(float(eigenvalues[-1]) / max(float(eigenvalues[0]), 1e-6))
+    if elongation > 4.0:
+        return False, {"moment_elongation": elongation}
+    filled = ndi.binary_fill_holes(mask)
+    occupancy = len(xx) / int(filled.sum())
+    if occupancy < .50:
+        return False, {'supported_occupancy': occupancy, 'moment_elongation': elongation}
+    distance = ndi.distance_transform_edt(np.pad(filled, 1))[1:-1, 1:-1]
+    thickness = float(distance.max()) / math.sqrt(int(filled.sum()))
+    if thickness < .24:
+        return False, {"moment_elongation": elongation, "normalized_thickness": thickness}
+    rings = _capsid_boundary_rings(filled, check_cancel)
+    if not rings:
+        return False, {}
+    hull = _capsid_convex_hull(np.vstack(rings))
+    following = np.roll(hull, -1, axis=0)
+    hull_area = abs(float(np.sum(hull[:, 0] * following[:, 1] - hull[:, 1] * following[:, 0]))) * .5
+    solidity = int(filled.sum()) / max(hull_area, 1)
+    evidence = {"moment_elongation": elongation, "normalized_thickness": thickness,
+                "filled_support_solidity": solidity, "supported_occupancy": occupancy}
+    return solidity >= .72, evidence
+
+
+def _profile_components(support: np.ndarray, min_area: int, max_area: float,
+                        check_cancel=None):
+    """Remove bounded thin extensions, then assess each remaining component."""
+    labels, count = ndi.label(support)
+    # Object IDs, rather than any positive pixel inside a bounding box, keep
+    # nested/disconnected components separate when their boxes overlap.
+    for label, bounds in enumerate(ndi.find_objects(labels), 1):
+        _capsid_check(check_cancel)
+        if bounds is None:
+            continue
+        local = labels[bounds] == label
+        area = int(local.sum())
+        if not min_area <= area <= max_area:
+            continue
+        radius = max(2, min(8, round(math.sqrt(area) * .07)))
+        # Pad as foreground only at actual image edges. Partial capsids keep
+        # their open screen boundary; internal narrow tails are trimmed.
+        padded = np.pad(ndi.binary_fill_holes(local), radius)
+        if bounds[0].start == 0:
+            padded[:radius, radius:-radius] = True
+        if bounds[0].stop == support.shape[0]:
+            padded[-radius:, radius:-radius] = True
+        if bounds[1].start == 0:
+            padded[radius:-radius, :radius] = True
+        if bounds[1].stop == support.shape[1]:
+            padded[radius:-radius, -radius:] = True
+        opened = ndi.binary_opening(padded, iterations=radius)[radius:-radius, radius:-radius]
+        cleaned = opened & local  # Never grow beyond support or fill an exclusion.
+        pieces, number = ndi.label(cleaned)
+        for piece in range(1, number + 1):
+            _capsid_check(check_cancel)
+            part = pieces == piece
+            if int(part.sum()) < min_area:
+                continue
+            accepted, evidence = _profile_shape(part, check_cancel)
+            if not accepted:
+                continue
+            mask = np.zeros_like(support)
+            mask[bounds] = part
+            yield mask, evidence
+
+
+def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
+                          max_area_ratio=.40, max_prompts=24, check_cancel=None):
+    """Bounded automatic SAM boxes from learned positive appearance support."""
+    scores = np.asarray(scores)
+    if scores.ndim != 2 or not scores.size or not np.isfinite(scores).all():
+        raise ValueError('Capsid appearance scores must be a finite two-dimensional image.')
+    if not 0 <= min_area_ratio < max_area_ratio <= 1:
+        raise ValueError('Capsid area ratios must satisfy 0 <= min < max <= 1.')
+    if max_prompts <= 0:
+        return []
+    max_prompts = min(24, max_prompts)
+    min_area = max(64, math.ceil(min_area_ratio * scores.size))
+    max_area = max_area_ratio * scores.size
+    support = ndi.binary_closing(scores >= .5, iterations=4, border_value=1)
+    support &= scores > 0
+    support = ndi.binary_opening(support, iterations=3, border_value=0)
+    proposals = []
+    for mask, shape in _profile_components(support, min_area, max_area, check_cancel):
+        _capsid_check(check_cancel)
+        x, y, width, height = _capsid_bbox(mask)
+        margin = max(6, min(24, round(max(width, height) * .12)))
+        box = [max(0, x - margin), max(0, y - margin),
+               min(scores.shape[1], x + width + margin),
+               min(scores.shape[0], y + height + margin)]
+        distances = ndi.distance_transform_edt(mask)
+        cy, cx = np.unravel_index(np.argmax(distances * scores), scores.shape)
+        rank = float(np.mean(scores[mask]) * math.sqrt(mask.sum()))
+        proposals.append({'box': box, 'point': [int(cx), int(cy)], 'rank': rank,
+                          'support_area': int(mask.sum()), 'shape': shape})
+    return sorted(proposals, key=lambda item: item['rank'], reverse=True)[:max_prompts]
+
+
+def _profile_pool_offer(pool, record, serial):
+    """Retain at most64 full-image candidate records, stable by rank then arrival."""
+    entry = (float(record['capsid_score']), -serial, record)
+    if len(pool) < 64:
+        heapq.heappush(pool, entry)
+    else:
+        heapq.heappushpop(pool, entry)
+
+
+def _profile_masks_overlap(first, second):
+    ax, ay, aw, ah = first['bbox']
+    bx, by, bw, bh = second['bbox']
+    if ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay:
+        return False
+    return (np.count_nonzero(first['segmentation'] & second['segmentation'])
+            / min(first['area'], second['area']) >= .80)
+
+
+def filter_capsid_with_profile(rgb: np.ndarray, raw_proposals, scores: np.ndarray, *,
+                               check_cancel=None, min_area_ratio=.002,
+                               max_area_ratio=.40, max_candidates=24):
+    """Refine guided SAM masks with the same learned support used for prompting.
+
+    The resulting bitmap is used for overlay, hit testing and picking. This
+    path keeps the geometric exclusions and never inherits SAM IoU estimates
+    as scores for the modified region. Appearance scores are uncalibrated.
+    """
+    rgb = np.asarray(rgb)
+    scores = np.asarray(scores)
+    if (rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3
+            or scores.shape != rgb.shape[:2] or not np.isfinite(scores).all()):
+        raise ValueError('Capsid profile scores and screenshot must have matching image dimensions.')
+    if not 0 <= min_area_ratio < max_area_ratio <= 1:
+        raise ValueError('Capsid area ratios must satisfy 0 <= min < max <= 1.')
+    if max_candidates <= 0:
+        return []
+    max_candidates = min(24, max_candidates)
+    min_area = max(64, math.ceil(min_area_ratio * scores.size))
+    max_area = max_area_ratio * scores.size
+    texture, valid = _capsid_texture(rgb, check_cancel)
+    if np.count_nonzero(valid) < min_area:
+        return []
+    global_median = float(np.median(texture[valid]))
+    if global_median < 1e-7:
+        return []
+    bounds = _capsid_field_bounds(valid)
+    refined = []
+    serial = 0
+    for index, proposal in enumerate(raw_proposals):
+        _capsid_check(check_cancel)
+        if index >= 128:
+            break
+        parent = np.asarray(proposal['segmentation'], dtype=bool)
+        if parent.shape != scores.shape:
+            raise ValueError('A guided SAM proposal has a different size from the screenshot.')
+        area = int(parent.sum())
+        if not min_area <= area <= max_area or _capsid_screen_sides(parent & valid, bounds) >= 3:
+            continue
+        inset = max(2, min(6, round(math.sqrt(area / math.pi) * .045)))
+        allowed = ndi.binary_erosion(parent, iterations=inset, border_value=1) & valid
+        support = ndi.binary_closing(allowed & (scores >= .5), iterations=4, border_value=1) & allowed
+        for component, shape in _profile_components(support, min_area, max_area, check_cancel):
+            component_area = int(component.sum())
+            annulus = (ndi.binary_dilation(component, iterations=20)
+                       & ~ndi.binary_dilation(component, iterations=3) & valid)
+            inside = float(np.median(texture[component]))
+            outside = float(np.median(texture[annulus])) if np.any(annulus) else global_median
+            local_ratio = inside / max(outside, 1e-7)
+            global_ratio = inside / global_median
+            # Require either a local grain increase or strong field-relative
+            # grain. This removes flat rims while allowing crowded neighbours.
+            if local_ratio < 1.04 and global_ratio < 1.15:
+                continue
+            mean_score = float(np.mean(scores[component]))
+            rank = mean_score * math.sqrt(component_area) / max(1, shape['moment_elongation'])
+            evidence = {'appearance_score_mean': mean_score,
+                        'appearance_score_median': float(np.median(scores[component])),
+                        'appearance_threshold': .5, 'shape': shape,
+                        'local_texture_ratio': local_ratio, 'global_texture_ratio': global_ratio,
+                        'proposal_predicted_iou': proposal.get('predicted_iou'),
+                        'proposal_stability_score': proposal.get('stability_score'),
+                        'is_calibrated_probability': False}
+            record = {'segmentation': component, 'area': component_area,
+                            'bbox': _capsid_bbox(component), 'predicted_iou': None,
+                            'stability_score': None, 'capsid_score': rank,
+                            'capsid_evidence': evidence, '_allowed': allowed,
+                            'source': 'learned capsid core (review)'}
+            _profile_pool_offer(refined, record, serial)
+            serial += 1
+    ranked = [entry[2] for entry in sorted(refined, key=lambda entry: (entry[0], entry[1]), reverse=True)]
+    refined.clear()
+    selected = []
+    for record in ranked:
+        _capsid_check(check_cancel)
+        if any(_profile_masks_overlap(record, previous) for previous in selected):
+            continue
+        selected.append(record)
+        if len(selected) >= max_candidates:
+            break
+    ranked.clear()
+    for record in selected:
+        fitted, evidence = polygonal_capsid_mask(record['segmentation'],
+                                                allowed_mask=record.pop('_allowed'),
+                                                check_cancel=check_cancel)
+        record.update(segmentation=fitted, area=int(fitted.sum()), bbox=_capsid_bbox(fitted),
+                      source='learned capsid polygon (review)')
+        record['capsid_evidence']['polygon'] = evidence
+    return selected

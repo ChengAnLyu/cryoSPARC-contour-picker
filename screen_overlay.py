@@ -360,6 +360,31 @@ class ScreenOverlay(_ScreenSurface):
             self.canvas.delete("all")
         self._mask_photo = None
 
+    def _retire_surface(self):
+        """Release a previous painted buffer without closing the overlay owner.
+
+        Clearing Canvas items on a withdrawn layered HWND does not clear the
+        compositor's last frame. New strokes, selections, and mask sets must
+        not remap that HWND. The control panel is a separate persistent window.
+        """
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen overlay is closed.")
+        if self.window is not None:
+            self.hide()
+            self.clear()
+            self.window.destroy()
+            self.window = self.canvas = None
+
+    def begin_selection(self):
+        """Prepare a fresh hidden, blank surface for a region or box gesture.
+
+        A selection can follow displayed contours or an earlier selection.
+        Retire that painted window before showing any new selection geometry.
+        """
+        self._retire_surface()
+        self._ensure()
+
     def begin_trace(self, screen_xy):
         """Start a manual stroke on a fresh native annotation surface.
 
@@ -374,11 +399,7 @@ class ScreenOverlay(_ScreenSurface):
             raise OverlayError("The screen overlay is closed.")
         # Validate before retiring the old surface so bad input has no effect.
         points = [_screen_xy(*point) for point in screen_xy]
-        if self.window is not None:
-            self.hide()
-            self.clear()
-            self.window.destroy()
-            self.window = self.canvas = None
+        self._retire_surface()
         self.draw_trace(points)
 
     def draw_trace(self, screen_xy):
@@ -398,8 +419,19 @@ class ScreenOverlay(_ScreenSurface):
                                      outline="#63dbe9", width=2, tags="region")
 
     def draw_masks(self, candidates, geometry: CaptureGeometry, selected_ids=(), preview=None):
-        self._ensure()
+        """Prepare a complete current mask set on a fresh hidden surface.
+
+        In semi-auto mode the previous surface was hidden during picking and
+        can still contain the completed contour in its native painted buffer.
+        Validate the new bitmap before retiring it, then populate the new
+        canvas before the controller calls show(). No old contour is remapped.
+        """
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen overlay is closed.")
         bitmap = _mask_image(candidates, geometry, selected_ids, preview)
+        self._retire_surface()
+        self._ensure()
         if self._photo_factory is None:
             from PIL import ImageTk
             self._photo_factory = ImageTk.PhotoImage

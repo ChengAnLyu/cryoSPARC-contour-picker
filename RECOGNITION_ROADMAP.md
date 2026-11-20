@@ -6,6 +6,10 @@ The target is the **dense viral capsid material in perforated virus-like particl
 
 The demonstration annotations are particle-pick circles. Multiple circles sample a single capsid. These are useful positive locations, but they are neither exact capsid boundaries nor independent capsid instances. Unmarked pixels are not automatically negative labels. Reconstructing a filled hull around the circles would create a weak pseudo-label, not expert segmentation ground truth.
 
+## Version 2.6: optional learned appearance
+
+The application now supports a separate, locally trained appearance profile beside the SAM checkpoint. Its input uses clean screen images and positive-unlabeled supervision. The public build contains the runtime and synthetic test fixtures; private learned parameters are supplied separately. SAM itself remains unchanged. See [installation, learning assumptions and evaluation limits](CAPSID_PROFILE.md). The texture-based detector described below remains the default. The learned detector is explicitly selected as **capsid-learned**, is labeled experimental, and requires its profile file.
+
 ## What version 2.2 supplies
 
 The screen application now uses a conservative capsid profile by default. It retains more SAM proposals before checking granular interior texture against the nearby scene, refines supported interiors, and resolves nested candidates after the content check. It preserves the previous generic SAM route as a comparison profile. Prompted segmentation remains available for missed targets. Neither SAM's weights nor a capsid-specific network were trained by these code changes.

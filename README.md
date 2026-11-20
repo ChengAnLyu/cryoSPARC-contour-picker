@@ -1,14 +1,16 @@
-# SARU Picker 2.5
+# SARU Picker 2.6
 
 SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the image viewer, with its existing layout and controls. A compact, always-on-top **SARU PICKER** panel selects manual, semi-auto, or auto mode.
 
 ## Windows application
 
-The CPU installer is named **SARU-Picker-Setup-2.5.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+The CPU installer is named **SARU-Picker-Setup-2.6.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
 
-Version 2.5.0 gives manual, semi-auto and auto picking the same adjustable click pacing, with a **0.01-second default** and a **0.00-second option with no added inter-click delay**. It also clears the previous manual outline before a new stroke appears. The compact panel, original manual gesture and spacing, polygonal capsid regions, **Next micrograph**, continuous auto cycle, repeated-contour repairs and private custom icons are retained. Auto completes one contour before the next. The optional snapshot editor remains available with `--review`.
+Version 2.6.0 replaces the temporary annotation window between semi-auto contour selections so a completed contour is not remapped from an old painted buffer. It also supports an optional [learned capsid appearance profile](CAPSID_PROFILE.md). The compact panel, original manual gesture and spacing, polygonal regions, **Next micrograph**, continuous auto cycle and private custom icons are retained. All three picking modes retain the shared **0.01-second default** and **0.00-second option with no added inter-click delay**. Auto completes one contour before the next. The optional snapshot editor remains available with `--review`.
 
 For a custom-icon download, **extract the complete ZIP before running setup**. Keep `app-icon.png` and `app-icon.ico` beside the setup EXE during installation. Setup copies this artwork into the installed application and updates its EXE and shortcut icons. Personal artwork is distributed with the private download rather than committed to the public source tree. Running setup without these optional files uses the repository's geometric fallback icon.
+
+If the download includes **capsid-profile.json**, keep it beside setup as well. Installation places this learned appearance profile next to the bundled SAM model; **Advanced → Detection profile → capsid-learned** selects the experimental learned detector. The default **capsid** detector is unchanged even when the sidecar is installed. The public installer without that optional profile retains the earlier texture-based detector. See [profile installation and validation limits](CAPSID_PROFILE.md).
 
 ## Manual mode — original interaction
 
@@ -46,7 +48,7 @@ Choose **auto**, select the screen area, uncheck **Disable Picking**, and choose
 - **Load (s)** defaults to **10 seconds** and is the maximum loading timeout, not a fixed delay after each Down key. Detection starts once the changed image is stable. Increase this value for a slower-loading cryoSPARC session.
 - An image with **no detected contours** is counted as processed and skipped. Auto continues to the next image while its limit allows.
 
-Auto mode picks every displayed contour. The default capsid profile is an image-based filter on SAM proposals, **not a newly trained or validated capsid classifier**. It can miss faint cores and fragments and can still include unwanted material. Check representative images in semi-auto mode before an automatic run. Re-detecting the same scene retains the recorded pick positions; a verified new frame clears them.
+Auto mode picks every displayed contour. The default capsid setting uses the earlier texture heuristic; **capsid-learned** explicitly selects the optional experimental appearance model. Neither path guarantees biological classification: faint cores and fragments can be missed, and unwanted material can survive. Check representative images in semi-auto mode before an automatic run. Re-detecting the same scene retains the recorded pick positions; a verified new frame clears them.
 
 The app stops if navigation leaves the same image visible, returns to a recently seen image, or fails to reach a stable new image before the timeout. It also stops on lost target focus, unexpected movement during detection/picking, other errors, or insufficient stable background to verify remaining masks. It sends no repeated Down-key retries. At the end of a list, an unchanged view stops the run. Image-change checks are heuristics, not image registration. Keep the image zoom and position fixed during recognition and picking.
 
@@ -71,7 +73,7 @@ Zero delay still yields execution between clicks and retains per-click cancellat
 
 Settings also expose checkpoint selection, model type, CPU/CUDA device selection, detection profile and automatic proposal grid density. The installer supplies the checkpoint automatically and contains CPU PyTorch. A source installation can use a compatible CUDA PyTorch build.
 
-The default **capsid** profile starts with permissive SAM proposals, then compares granular interior texture with the nearby background and the rest of the selected image. It refines supported interiors, fits polygonal boundaries, and resolves duplicate regions after those content checks. The polygon fit simplifies noisy edges while bounding shape changes, retaining separate objects, substantial holes, and partially visible image-edge regions. The fitted mask is used for the displayed outline, click selection, and pick placement. Broad background, membranes without dense interiors, and small unsupported fragments are therefore less likely to survive solely because they received a high SAM quality score. These are explicit image heuristics, not learned biological labels. **generic** and box-prompt alternatives retain their original SAM masks.
+The default **capsid** setting starts with permissive SAM proposals, then compares granular interior texture with the nearby background and the rest of the selected image. It refines supported interiors, fits polygonal boundaries, and resolves duplicate regions after those content checks. The polygon fit simplifies noisy edges while bounding shape changes, retaining separate objects, substantial holes, and partially visible image-edge regions. The fitted mask is used for the displayed outline, click selection, and pick placement. Broad background, membranes without dense interiors, and small unsupported fragments are therefore less likely to survive solely because they received a high SAM quality score. The fallback consists of explicit image heuristics. The opt-in **capsid-learned** setting uses the experimental trained appearance model described in [CAPSID_PROFILE.md](CAPSID_PROFILE.md), guides SAM with image-supported box-and-point prompts, and refines polygonal cores. It requires its sidecar and limits input to 4,194,304 pixels. Development results are mixed, so it does not replace the default detector or make the output a validated biological label. **generic** and box-prompt alternatives retain their original SAM masks.
 
 Modified core masks do not inherit the original proposal's predicted IoU or stability: those numbers do not describe the new boundary. Headless exports retain the original proposal evidence separately. The profile uses the existing checkpoint and does not require another model download or a second image encoding. Model, prompt embeddings, and identical-image automatic results are reused where possible. See the [recognition roadmap](RECOGNITION_ROADMAP.md) for the supervised-model plan and evaluation requirements.
 
@@ -99,7 +101,7 @@ Headless segmentation remains available, with no desktop input:
 python main.py --segment-image my_micrograph.png --checkpoint sam_vit_b_01ec64.pth --device cpu --box 195 120 370 265 --output result
 ```
 
-Without a box or point, headless segmentation uses the capsid profile. Add `--automatic-profile generic` for the earlier proposal pipeline. CLI and optional offline review exports retain their explicit spacing/inset controls; the live screen modes use the per-contour manual convention described above.
+Without a box or point, headless segmentation uses the capsid profile. Add `--automatic-profile generic` for the earlier proposal pipeline, or `--automatic-profile capsid-learned` for the experimental trained profile. CLI and optional offline review exports retain their explicit spacing/inset controls; the live screen modes use the per-contour manual convention described above.
 
 Exports are bitmap masks and capture/screen pixel coordinates, not calibrated micrograph coordinates or direct cryoSPARC .cs imports.
 

@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw
 from application_icon import (apply_application_icon, application_icon_paths,
                               configure_application_identity, windows_application_icon_status)
 from capsid import filter_capsid_proposals, polygonal_capsid_mask
+from capsid_prior import load_profile, resolve_profile_path, score_image
 
 from recognition import (
     Candidate, RecognitionConfig, RecognitionError, Cancelled, SamRecognizer,
@@ -42,10 +43,10 @@ from execution import (
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
 from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fraction,
                         screen_region_overlaps_panel)
-from screen_overlay import control_panel_bounds, verify_screen_overlay
+from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -508,7 +509,40 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
                             (geometry.height, geometry.width))
         candidates.append(make_candidate(mask, source="synthetic lifecycle check"))
     completed = []
+    annotation_presentations, retired_windows = [], []
+    panel_handle = int(root.winfo_id())
     delayed_fraction = 0.0
+
+    def inspect_annotation(expected_candidates):
+        # Inspect the actual Tk PhotoImage attached to the sole Canvas item,
+        # not a second rendering through the production outline function.
+        from PIL import ImageTk
+        overlay = picker.overlay
+        if overlay is None or not overlay.visible or overlay._mask_photo is None:
+            raise RuntimeError("Remaining contours have no visible annotation bitmap.")
+        items = overlay.canvas.find_all()
+        if (len(items) != 1 or len(overlay.canvas.find_withtag("masks")) != 1
+                or overlay.canvas.itemcget(items[0], "image") != str(overlay._mask_photo)):
+            raise RuntimeError("A previous annotation remained alongside the current mask bitmap.")
+        pixels = np.asarray(ImageTk.getimage(overlay._mask_photo).convert("RGB"))
+        painted = np.any(pixels != TRANSPARENT_RGB, axis=2)
+        remaining = np.zeros((geometry.height, geometry.width), dtype=bool)
+        for candidate in expected_candidates:
+            remaining |= candidate.mask
+            if not np.any(painted & candidate.mask):
+                raise RuntimeError("A remaining contour disappeared from its annotation bitmap.")
+        if np.any(painted & ~remaining):
+            raise RuntimeError("Completed contours or stale geometry remained in the annotation bitmap.")
+        if any(window.winfo_exists() for window in retired_windows):
+            raise RuntimeError("A retired contour window was reused or remained alive.")
+        annotation_presentations.append({
+            "tk_window": str(overlay.window),
+            "native_window": int(overlay.window.winfo_id()),
+            "remaining_contour_ids": [candidate.id for candidate in expected_candidates],
+            "only_remaining_contours_in_bitmap": True,
+            "one_current_canvas_image": True,
+        })
+
     try:
         picker.desktop, picker.hotkeys, picker.mouse_observer = desktop, Hooks(), Hooks()
         picker.geometry, picker.target = geometry, 12345
@@ -523,6 +557,9 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
         picker._present_masks()
         root.update()
         for index, candidate in enumerate(candidates):
+            inspect_annotation(candidates[index:])
+            previous_annotation = picker.overlay.window
+            previous_canvas = picker.overlay.canvas
             surface = picker.input_surface
             if surface is None or not surface.visible:
                 raise RuntimeError(f"Clickable overlay missing before contour {index+1}.")
@@ -545,10 +582,21 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
             root.update()
             if picker.disabled.get() or any(c.id == candidate.id for c in picker.candidates):
                 raise RuntimeError(f"Contour {index+1} failed: {picker.status.get()}")
-            if root.state() != "normal" or not root.winfo_viewable():
+            if (picker.root is not root or int(root.winfo_id()) != panel_handle
+                    or root.state() != "normal" or not root.winfo_viewable()
+                    or not root.tk.getboolean(root.attributes("-topmost"))):
                 raise RuntimeError(f"Control panel disappeared after contour {index+1}.")
             if index < len(candidates)-1 and (picker.input_surface is None or not picker.input_surface.visible):
                 raise RuntimeError(f"Next contour was not selectable after contour {index+1}.")
+            if index < len(candidates)-1:
+                if (picker.overlay.window is previous_annotation
+                        or picker.overlay.canvas is previous_canvas
+                        or previous_annotation.winfo_exists() or previous_canvas.winfo_exists()):
+                    raise RuntimeError("Semi-auto remapped the previous contour's painted window.")
+                retired_windows.append(previous_annotation)
+            elif (picker.overlay.visible or picker.overlay.canvas.find_all()
+                    or picker.overlay._mask_photo is not None or picker.input_surface is not None):
+                raise RuntimeError("The final contour left a visible or uncleared annotation surface.")
             completed.append(len(desktop.clicks))
             if index == 0:
                 desktop.paint_delayed_markers()
@@ -563,8 +611,14 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
                 "delayed_marker_changed_fraction": delayed_fraction,
                 "separate_worker_jobs": True, "real_tk_input_events": True,
                 "remaining_contours_selectable": True, "panel_visible_throughout": True,
+                "panel_identity_preserved": True,
+                "fresh_annotation_surface_after_selection": True,
+                "retired_annotation_windows_destroyed": len(retired_windows),
+                "completed_contours_absent_from_bitmaps": True,
+                "final_annotation_cleared": True,
+                "annotation_presentations": annotation_presentations,
                 "unique_test_picks": len(desktop.clicks), "desktop_events_sent": 0,
-                "note": "Real controller/worker/Windows overlays; in-memory target and click sink, not cryoSPARC."}
+                "note": "Real controller/worker/Windows overlays; in-memory target and click sink, not cryoSPARC. Checks window retirement and actual Tk bitmap contents, not every compositor frame."}
     finally:
         picker.stop()
         if not picker.runner.shutdown(wait=True, timeout=5):
@@ -1097,6 +1151,38 @@ def _smoke_sam(checkpoint: Path) -> dict[str, Any]:
         recognizer.close()
 
 
+def _smoke_capsid_profile(checkpoint: Path) -> dict[str, Any]:
+    """Resolve the production sidecar and execute its actual numeric model.
+
+    Public builds normally have no learned profile and retain the existing
+    detector. The installer integration check supplies a nonprivate constant
+    model whose expected output can be verified independently after install.
+    """
+    path = resolve_profile_path(checkpoint)
+    if path is None:
+        return {"profile_status": "missing", "fallback_used": True,
+                "profile_inference_executed": False,
+                "note": "No optional capsid profile; the existing capsid heuristic remains available."}
+    profile = load_profile(path)
+    yy, xx = np.mgrid[:96, :128]
+    grey = (70 + (xx * 3 + yy * 5) % 80).astype(np.uint8)
+    rgb = np.repeat(grey[..., None], 3, axis=2)
+    scores = score_image(rgb, profile)
+    if (scores.shape != rgb.shape[:2] or not np.isfinite(scores).all()
+            or np.any(scores < 0) or np.any(scores > 1)):
+        raise RuntimeError("The capsid profile returned an invalid inference map.")
+    return {"profile_status": "loaded", "fallback_used": False,
+            "profile_inference_executed": True,
+            "profile_path": profile.path, "profile_sha256": profile.sha256,
+            "format": profile.format,
+            "inference": {"input_shape": list(rgb.shape), "score_shape": list(scores.shape),
+                          "scored_pixels": int(scores.size), "minimum": float(scores.min()),
+                          "maximum": float(scores.max()), "mean": float(scores.mean(dtype=np.float64)),
+                          "score_sha256": hashlib.sha256(scores.astype("<f4").tobytes()).hexdigest()},
+            "score_is_calibrated_probability": False,
+            "note": "Actual profile inference on a synthetic image; not recognition accuracy."}
+
+
 def run_smoke_test(checkpoint: Path, log_path: Path) -> dict[str, Any]:
     """Noninteractive build validation; deliberately never sends desktop input."""
     report = diagnostic_report(log_path, checkpoint)
@@ -1110,6 +1196,7 @@ def run_smoke_test(checkpoint: Path, log_path: Path) -> dict[str, Any]:
         report["checks"].append({"name": "windows_runtime", "status": "skipped",
                                   "reason": "Requires the Windows build host."})
     checks.append(("sam_cpu_inference", lambda: _smoke_sam(checkpoint)))
+    checks.append(("capsid_profile", lambda: _smoke_capsid_profile(checkpoint)))
     for name, function in checks:
         started = time.perf_counter()
         try:
@@ -2117,8 +2204,8 @@ def build_parser():
     parser.add_argument("--box", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--point", nargs=3, action="append", type=float, metavar=("X", "Y", "LABEL"), help="Repeatable foreground(1)/background(0) prompt.")
     parser.add_argument("--points-per-side", type=int, default=8)
-    parser.add_argument("--automatic-profile", choices=("capsid", "generic"), default="capsid",
-                        help="Automatic recognition profile; generic retains unclassified SAM proposals.")
+    parser.add_argument("--automatic-profile", choices=("capsid", "capsid-learned", "generic"), default="capsid",
+                        help="capsid keeps the existing filter; capsid-learned selects the optional experimental profile; generic returns unclassified SAM proposals.")
     parser.add_argument("--spacing", type=int, default=13)
     parser.add_argument("--inset", type=float, default=2)
     parser.add_argument("--output", type=Path, help="Headless segmentation output directory; defaults to writable user data when installed.")

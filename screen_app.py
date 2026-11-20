@@ -628,7 +628,7 @@ class ScreenPickerApp:
             self._hide_overlays()
             bounds = CaptureGeometry(0, 0, width, height)
             self.input_kind = "region"
-            self.ensure_overlay().clear()
+            self.ensure_overlay().begin_selection()
             self.overlay.show()
             self.input_surface = InputSurface(self.root, bounds, self._input_press,
                                               self._input_move, self._input_release,
@@ -748,6 +748,9 @@ class ScreenPickerApp:
         self._show_panel()
         self._close_input()
         if self.mode == "manual" or self.geometry is None or not self.candidates:
+            if self.overlay is not None:
+                self.overlay.hide()
+                self.overlay.clear()
             return
         overlay = self.ensure_overlay()
         overlay.draw_masks(self.candidates, self.geometry, selected_ids=[c.id for c in self.candidates])
@@ -779,7 +782,7 @@ class ScreenPickerApp:
             self._hide_overlays()
             self._check_panel_clear(self.geometry)
             self.input_kind = "box"
-            self.ensure_overlay().clear()
+            self.ensure_overlay().begin_selection()
             self.overlay.draw_region(self.geometry)
             self.overlay.show()
             self.input_surface = InputSurface(self.root, self.geometry, self._input_press,
@@ -1230,9 +1233,9 @@ class ScreenPickerApp:
             self.ttk.Button(frame, text="Browse…", command=browse).grid(row=1, column=2, padx=4)
             for index, (label, variable, values) in enumerate((("Device", self.device, ("auto", "cpu", "cuda")),
                                                                ("Model type", self.model_type, ("vit_b", "vit_l", "vit_h")),
-                                                               ("Detection profile", self.automatic_profile, ("capsid", "generic"))), 2):
+                                                               ("Detection profile", self.automatic_profile, ("capsid", "capsid-learned", "generic"))), 2):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
-                self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=10).grid(row=index, column=1)
+                self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=18 if label == "Detection profile" else 10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
                                                                         ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
@@ -1244,7 +1247,7 @@ class ScreenPickerApp:
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Label(frame, text="capsid: dense interiors; generic: all SAM regions", wraplength=410).grid(
+            self.ttk.Label(frame, text="capsid: existing dense-interior filter (default).\ncapsid-learned: learned capsids — experimental; review contours.\ngeneric: all SAM regions.", wraplength=410).grid(
                 row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
             self.ttk.Label(frame, text="Click delay is in seconds. 0 removes the added wait; increase it if cryoSPARC misses picks.",
                            wraplength=410).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))

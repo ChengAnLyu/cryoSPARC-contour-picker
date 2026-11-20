@@ -369,5 +369,110 @@ class ModelLoadingTests(unittest.TestCase):
         self.assertTrue(validate_rgb(original).flags.c_contiguous)
 
 
+
+
+class LearnedAutomaticProfileTests(unittest.TestCase):
+    def _recognizer(self, directory):
+        import json
+        from test_capsid_prior import fixture
+        from test_capsid import synthetic_core
+        profile = fixture()
+        profile['layers'][0]['weight'][0][4] = 2.
+        profile['layers'][0]['bias'][0] = -.5
+        profile['layers'][1]['weight'][0][0] = 2.
+        profile['layers'][2]['weight'][0][0] = 3.
+        profile['layers'][2]['bias'][0] = 0.
+        path = Path(directory) / 'capsid-profile.json'
+        path.write_text(json.dumps(profile))
+        rgb, core, proposals = synthetic_core()
+        recognizer = SamRecognizer(RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile="capsid-learned"))
+        recognizer._torch = types.SimpleNamespace(inference_mode=contextlib.nullcontext)
+        class Predictor(FakePredictor):
+            def predict(self, **kwargs):
+                self.last_kwargs = kwargs
+                self.predict_calls += 1
+                return np.stack([proposals[0]['segmentation']]), np.array([.9]), None
+        recognizer._predictor = Predictor()
+        recognizer._generator = types.SimpleNamespace(generate=lambda rgb: self.fail('Learned path used the uniform grid'))
+        return recognizer, rgb, core, path
+
+    def test_actual_profile_scoring_guides_sam_and_uses_same_bitmap_for_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer, rgb, core, path = self._recognizer(directory)
+            result = recognizer.automatic(rgb)
+            self.assertEqual(len(result), 1)
+            self.assertGreater(np.count_nonzero(result[0].mask & core), .7 * core.sum())
+            self.assertEqual(recognizer._predictor.set_calls, 1)
+            self.assertGreater(recognizer._predictor.predict_calls, 0)
+            info = recognizer.last_detection['appearance_model']
+            self.assertEqual(info['status'], 'loaded')
+            self.assertTrue(info['inference_executed'])
+            self.assertFalse(info['fallback_used'])
+            self.assertEqual(info['scored_pixels'], rgb.shape[0] * rgb.shape[1])
+            self.assertEqual(Path(info['path']), path.resolve())
+            self.assertTrue(result[0].source.startswith('learned'))
+            first_calls = recognizer._predictor.predict_calls
+            again = recognizer.automatic(rgb.copy())
+            self.assertEqual(again[0].id, result[0].id)
+            self.assertEqual(recognizer._predictor.predict_calls, first_calls)
+
+    def test_cancelled_guided_predictor_cannot_publish_masks_or_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer, rgb, _, _ = self._recognizer(directory)
+            original = recognizer._predictor.predict
+            stopped = False
+            def predict(**kwargs):
+                nonlocal stopped
+                value = original(**kwargs)
+                stopped = True
+                return value
+            recognizer._predictor.predict = predict
+            with self.assertRaises(Cancelled):
+                recognizer.automatic(rgb, cancel=lambda: stopped)
+            self.assertIsNone(recognizer._automatic_result)
+            self.assertIsNone(recognizer.last_detection)
+            self.assertIsNone(recognizer._active_cancel)
+
+    def test_corrupt_profile_fails_before_loading_sam(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer, rgb, _, path = self._recognizer(directory)
+            path.write_text('{not json')
+            with patch.object(recognizer, '_ensure_model') as ensure:
+                with self.assertRaisesRegex(RecognitionError, 'capsid appearance profile'):
+                    recognizer.automatic(rgb)
+                ensure.assert_not_called()
+
+    def test_default_capsid_mode_keeps_existing_filter_despite_installed_profile(self):
+        from test_capsid import synthetic_core
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer, rgb, _, _ = self._recognizer(directory)
+            recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'))
+            _, _, proposals = synthetic_core()
+            recognizer._generator = types.SimpleNamespace(generate=lambda rgb: proposals)
+            with patch('recognition.score_image', side_effect=AssertionError('Default mode invoked learned profile')):
+                self.assertEqual(len(recognizer.automatic(rgb)), 1)
+            self.assertEqual(recognizer.last_detection['appearance_model']['status'], 'disabled')
+
+    def test_explicit_learned_mode_missing_sidecar_has_actionable_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer = SamRecognizer(RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile='capsid-learned'))
+            with patch.object(recognizer, '_ensure_model') as ensure:
+                with self.assertRaisesRegex(RecognitionError, 'Select capsid for the earlier texture detector'):
+                    recognizer.automatic(np.zeros((30, 30, 3), np.uint8))
+                ensure.assert_not_called()
+
+    def test_generic_mode_does_not_load_or_apply_an_installed_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recognizer, rgb, _, _ = self._recognizer(directory)
+            recognizer.config = RecognitionConfig(str(Path(directory) / 'sam.pth'), automatic_profile='generic')
+            mask = np.zeros(rgb.shape[:2], bool)
+            mask[15:60, 30:90] = True
+            recognizer._generator = types.SimpleNamespace(generate=lambda rgb: [{'segmentation': mask}])
+            with patch('recognition.score_image', side_effect=AssertionError('Generic mode invoked learned profile')):
+                self.assertEqual(len(recognizer.automatic(rgb)), 1)
+            self.assertEqual(recognizer.last_detection['appearance_model']['status'], 'disabled')
+            self.assertFalse(recognizer._appearance_profile_loaded)
+
+
 if __name__ == "__main__":
     unittest.main()

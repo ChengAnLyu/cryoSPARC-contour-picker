@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gc
+import logging
+import time
 import hashlib
 import math
 import os
@@ -18,7 +20,8 @@ from typing import Callable, Iterable, Sequence
 import numpy as np
 from PIL import Image, ImageDraw
 
-from capsid import filter_capsid_proposals
+from capsid import filter_capsid_proposals, capsid_guided_prompts, filter_capsid_with_profile
+from capsid_prior import resolve_profile_path, load_profile, score_image
 
 CancelCheck = Callable[[], bool] | None
 
@@ -53,14 +56,17 @@ class RecognitionConfig:
     overlap_threshold: float = 0.80
     prefer_smaller: bool = True
     automatic_profile: str = "capsid"
+    capsid_prior_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.model_type not in {"vit_b", "vit_l", "vit_h"}:
             raise ValueError("model_type must be vit_b, vit_l, or vit_h.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda.")
-        if self.automatic_profile not in {"capsid", "generic"}:
-            raise ValueError("automatic_profile must be capsid or generic.")
+        if self.automatic_profile not in {"capsid", "capsid-learned", "generic"}:
+            raise ValueError("automatic_profile must be capsid, capsid-learned, or generic.")
+        if self.capsid_prior_path is not None and (not isinstance(self.capsid_prior_path, str) or not self.capsid_prior_path.strip()):
+            raise ValueError("capsid_prior_path must be a nonempty path string or None.")
         for name in ("cpu_threads", "points_per_side"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -235,6 +241,8 @@ class SamRecognizer:
         self._automatic_image_key: str | None = None
         self._automatic_result: list[Candidate] | None = None
         self.last_detection: dict | None = None
+        self._appearance_profile = None
+        self._appearance_profile_loaded = False
         self._active_cancel: CancelCheck = None
         self.device: str | None = None
 
@@ -295,9 +303,9 @@ class SamRecognizer:
                 # The capsid pass needs inner candidates that generic SAM's
                 # stability gate can omit. Domain filtering follows inference;
                 # these permissive proposal thresholds are not acceptance scores.
-                pred_iou_thresh=(0.50 if self.config.automatic_profile == "capsid"
+                pred_iou_thresh=(0.50 if self.config.automatic_profile in {"capsid", "capsid-learned"}
                                  else self.config.pred_iou_thresh),
-                stability_score_thresh=(0.75 if self.config.automatic_profile == "capsid"
+                stability_score_thresh=(0.75 if self.config.automatic_profile in {"capsid", "capsid-learned"}
                                        else self.config.stability_score_thresh),
                 box_nms_thresh=0.7,
                 crop_n_layers=0,
@@ -390,24 +398,90 @@ class SamRecognizer:
         except Exception as exc:
             raise RecognitionError(f"SAM prompted segmentation failed: {exc}") from exc
 
+    def _get_appearance_profile(self):
+        """Load a stable optional numeric profile once per recognizer instance."""
+        if self.config.automatic_profile != "capsid-learned":
+            return None
+        if not self._appearance_profile_loaded:
+            try:
+                path = resolve_profile_path(self.config.checkpoint, self.config.capsid_prior_path)
+                if path is None:
+                    raise ValueError("The experimental capsid profile is not installed. Keep capsid-profile.json beside Setup and reinstall, Select capsid for the earlier texture detector.")
+                self._appearance_profile = load_profile(path)
+            except (OSError, ValueError) as exc:
+                raise RecognitionError(
+                    f"Could not load the capsid appearance profile: {exc}. "
+                    "Reinstall the accompanying capsid-profile.json. Select capsid for the earlier texture detector.") from exc
+            self._appearance_profile_loaded = True
+            if self._appearance_profile is not None:
+                logging.getLogger("saru.recognition").info(
+                    "Using capsid appearance profile %s from %s", self._appearance_profile.sha256,
+                    self._appearance_profile.path)
+            else:
+                logging.getLogger("saru.recognition").info(
+                    "No capsid appearance sidecar found; using the existing SAM texture filter.")
+        return self._appearance_profile
+
     def automatic(self, rgb: np.ndarray | Image.Image,
                   cancel: CancelCheck = None) -> list[Candidate]:
-        """Generate reviewable regions using the configured automatic profile.
+        """Generate reviewable regions with a private learned profile when present.
 
-        The capsid profile refines permissive SAM proposals with local texture
-        evidence. It is a conservative image heuristic, not a trained capsid
-        classifier. Generic mode retains the previous proposal pipeline.
+        The opt-in capsid-learned path proposes at most 24 boxes from positive
+        appearance support and encodes the screenshot once. Default capsid mode
+        retains its earlier sparse-grid texture path. A missing selected learned
+        profile raises an actionable error; generic and user prompts are unchanged.
         """
         rgb = validate_rgb(rgb)
         _check_cancel(cancel)
         key = _image_key(rgb)
         if key == self._automatic_image_key and self._automatic_result is not None:
             return list(self._automatic_result)
+        profile = self._get_appearance_profile()
+        started = time.perf_counter()
+        # Validate and score before loading SAM: oversized/corrupt inputs fail
+        # before expensive model allocation, and cancellation stays responsive.
+        appearance_scores = None
+        guided = []
+        feature_seconds = proposal_seconds = 0.0
+        if profile is not None:
+            feature_started = time.perf_counter()
+            try:
+                appearance_scores = score_image(rgb, profile, lambda: _check_cancel(cancel))
+                feature_seconds = time.perf_counter() - feature_started
+                proposal_started = time.perf_counter()
+                guided = capsid_guided_prompts(
+                    appearance_scores, check_cancel=lambda: _check_cancel(cancel),
+                    min_area_ratio=self.config.min_area_ratio,
+                    max_area_ratio=min(self.config.max_area_ratio, .40))
+                proposal_seconds = time.perf_counter() - proposal_started
+            except Cancelled:
+                raise
+            except (ValueError, MemoryError) as exc:
+                raise RecognitionError(f"Capsid appearance scoring failed: {exc}") from exc
         self._ensure_model(cancel)
         self._active_cancel = cancel
         try:
+            sam_started = time.perf_counter()
             with self._torch.inference_mode():
-                raw = self._generator.generate(rgb)
+                if profile is None:
+                    raw = self._generator.generate(rgb)
+                else:
+                    raw = []
+                    if guided:
+                        self._set_image(rgb, key, cancel)
+                    for prompt in guided:
+                        _check_cancel(cancel)
+                        masks, scores, _ = self._predictor.predict(
+                            point_coords=np.asarray([prompt['point']], dtype=np.float32),
+                            point_labels=np.asarray([1], dtype=np.int32),
+                            box=np.asarray(prompt['box'], dtype=np.float32),
+                            multimask_output=True)
+                        _check_cancel(cancel)
+                        for mask, score in zip(masks, scores):
+                            if float(score) >= .50:
+                                raw.append({'segmentation': mask, 'predicted_iou': float(score),
+                                            'source': 'learned capsid box prompt'})
+            sam_seconds = time.perf_counter() - sam_started
             _check_cancel(cancel)
             for item in raw:
                 _check_cancel(cancel)
@@ -415,12 +489,19 @@ class SamRecognizer:
                 if mask.shape != rgb.shape[:2]:
                     raise RecognitionError("SAM returned a mask with the wrong image dimensions.")
             raw_count = len(raw)
-            is_capsid = self.config.automatic_profile == "capsid"
+            is_capsid = self.config.automatic_profile in {"capsid", "capsid-learned"}
+            refinement_started = time.perf_counter()
             if is_capsid:
-                raw = filter_capsid_proposals(
-                    rgb, raw, check_cancel=lambda: _check_cancel(cancel),
-                    min_area_ratio=self.config.min_area_ratio,
-                    max_area_ratio=min(self.config.max_area_ratio, .40))
+                if profile is not None:
+                    raw = filter_capsid_with_profile(
+                        rgb, raw, appearance_scores, check_cancel=lambda: _check_cancel(cancel),
+                        min_area_ratio=self.config.min_area_ratio,
+                        max_area_ratio=min(self.config.max_area_ratio, .40))
+                else:
+                    raw = filter_capsid_proposals(
+                        rgb, raw, check_cancel=lambda: _check_cancel(cancel),
+                        min_area_ratio=self.config.min_area_ratio,
+                        max_area_ratio=min(self.config.max_area_ratio, .40))
             candidates = []
             evidence = {}
             for item in raw:
@@ -439,13 +520,23 @@ class SamRecognizer:
             result = filter_candidates(candidates, self.config, cancel,
                                        suppress_duplicates=not is_capsid)
             _check_cancel(cancel)
+            appearance = (profile.describe() if profile is not None else
+                          {'status': 'disabled', 'fallback_used': False})
+            if profile is not None:
+                appearance.update(inference_executed=True, scored_pixels=int(rgb.shape[0] * rgb.shape[1]),
+                                  guided_boxes=len(guided), fallback_used=False)
             self.last_detection = {
                 "profile": self.config.automatic_profile,
-                "sam_proposals": raw_count,
-                "selected_contours": len(result),
+                "sam_proposals": raw_count, "selected_contours": len(result),
+                "appearance_model": appearance,
+                "timing_seconds": {"appearance": feature_seconds, "guided_proposals": proposal_seconds,
+                                   "sam": sam_seconds, "refinement": time.perf_counter() - refinement_started,
+                                   "total_including_initial_model_load": time.perf_counter() - started},
                 "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
-                "note": ("Dense-core filter with bounded polygonal boundaries; "
-                         "not a trained or calibrated capsid classifier."
+                "note": ("Positive-unlabeled appearance profile guides SAM boxes and bounded polygonal cores; "
+                         "scores are not calibrated capsid probabilities."
+                         if profile is not None else
+                         "Dense-core texture filter with bounded polygonal boundaries; no trained appearance profile."
                          if is_capsid else "Unclassified generic SAM proposals."),
             }
             self._automatic_image_key, self._automatic_result = key, result
@@ -455,11 +546,9 @@ class SamRecognizer:
         except Exception as exc:
             raise RecognitionError(
                 f"SAM automatic proposals failed: {exc}. For memory errors, reduce "
-                "points_per_batch or select CPU; for missing targets, use a box/point prompt.") from exc
+                "the selected screen area or points_per_batch; for missing targets, use a box/point prompt.") from exc
         finally:
             self._active_cancel = None
-            # Automatic generator resets its own predictor. It does not replace
-            # the independent prompted predictor's cached image embedding.
 
     def close(self) -> None:
         """Release model/cache resources when no inference is running."""

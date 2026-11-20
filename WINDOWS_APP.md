@@ -1,6 +1,6 @@
-# SARU Picker 2.5 for Windows
+# SARU Picker 2.6 for Windows
 
-Install **SARU-Picker-Setup-2.5.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.6.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
@@ -8,9 +8,13 @@ to the installed application, its EXE and its shortcuts. The setup EXE itself
 uses the public geometric icon. Setup also works without the optional sidecars,
 using that fallback for the installed app.
 
+## Version 2.6 update
+
+Semi-auto contour presentations now use a fresh temporary annotation window after each completed selection. The persistent panel and original manual behavior remain. An optional `capsid-profile.json` supplied beside Setup is installed next to the SAM checkpoint and makes the experimental learned capsid appearance profile available through **Advanced → Detection profile → capsid-learned**. Extract the entire ZIP and retain that file and both custom-icon files beside Setup during installation. See [the capsid profile guide](CAPSID_PROFILE.md).
+
 ## Work directly over cryoSPARC
 
-The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer. The panel stays visible during drawing, detection and picking, and sizes itself to fit its controls and Windows text scaling. The terminate button has a reserved footer. Version 2.5 preserves the original manual gesture and spacing while sharing faster click pacing across all modes. A new manual stroke clears the previous outline before its new trace appears, with the panel retained.
+The normal application is the original compact floating control panel. cryoSPARC keeps its own layout and remains the live image viewer. The panel stays visible during drawing, detection and picking, and sizes itself to fit its controls and Windows text scaling. The terminate button has a reserved footer. Version 2.6 preserves the original manual gesture and spacing while retaining shared faster click pacing across all modes. A new manual stroke clears the previous outline before its new trace appears, with the panel retained.
 
 | Mode | Screen interaction |
 | --- | --- |
@@ -48,7 +52,7 @@ Native UI checks create their own synthetic target window. They verify that anno
 
 The installer uses a normal application folder so its model does not need to be unpacked each launch. It is built on Windows because [PyInstaller distributions are platform-specific](https://pyinstaller.org/en/stable/operating-mode.html).
 
-The default capsid profile adds a conservative texture-based interior filter and polygon fitting to original SAM. It is not a trained capsid classifier; faint targets, fragments, and ambiguous material still need review. The fitted polygon mask drives both outline display and picking. Advanced settings retain a generic SAM profile for comparison. Both screen model modes use the manual spacing convention per contour and avoid crowding earlier picks. Live capture, hotkeys and click alignment must also be checked on the user's workstation.
+The default **capsid** setting retains the earlier texture-based interior filter. The optional **capsid-learned** setting requires its installed sidecar and enables the experimental appearance model. Its development results include both recovered targets and missed or unwanted regions, so inspect it in semi-auto mode first. Both paths use polygon fitting after selecting image-supported regions. Faint targets, fragments and ambiguous material still need review, and the learned scores are not calibrated capsid probabilities. The fitted polygon mask drives both outline display and picking. Advanced settings retain a generic SAM profile for comparison. Both screen model modes use the manual spacing convention per contour and avoid crowding earlier picks. Live capture, hotkeys and click alignment must also be checked on the user's workstation.
 
 The repairs introduced in version 2.3 remain: completed picks are recorded before restoring the next selectable contour, and their marker neighborhoods are excluded from scene-change checks. Completed worker callbacks are released on the GUI thread, polling remains alive after recoverable errors, and timers are cancelled during shutdown. Terminate requests cancellation immediately; if a native model calculation is still running, the panel shows a stopping message until it can close safely. Custom artwork is used for the installed application, shortcuts and uninstall entry.
 

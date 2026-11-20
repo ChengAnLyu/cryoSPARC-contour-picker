@@ -30,7 +30,7 @@ $BuildDirectory = Join-Path $ProjectRoot "build"
 $ArtifactDirectory = Join-Path $ProjectRoot "artifacts"
 $VenvDirectory = Join-Path $ProjectRoot ".build-venv"
 $VenvPython = Join-Path $VenvDirectory "Scripts\python.exe"
-$AppVersion = "2.5.0"
+$AppVersion = "2.6.0"
 $Manifest = Get-Content (Join-Path $PSScriptRoot "model-manifest.json") -Raw | ConvertFrom-Json
 
 function Invoke-Checked {
@@ -56,7 +56,8 @@ function Assert-Checkpoint {
 }
 
 function Invoke-SmokeTest {
-    param([string]$Executable, [string]$Report)
+    param([string]$Executable, [string]$Report,
+          [ValidateSet("missing", "loaded")][string]$ExpectedCapsidProfile = "missing")
     if (Test-Path -LiteralPath $Report) { Remove-Item -LiteralPath $Report }
     # Start-Process joins ArgumentList elements without adding quotes. Supply
     # one deliberately quoted argument string for paths containing spaces.
@@ -76,11 +77,15 @@ function Invoke-SmokeTest {
     if ($Result.status -ne "ok" -or $Result.mode -ne "smoke-test") {
         throw "Smoke-test report does not indicate success: $Report"
     }
-    foreach ($Required in @("image_processing", "torchvision_native", "windows_runtime", "sam_cpu_inference")) {
+    foreach ($Required in @("image_processing", "torchvision_native", "windows_runtime", "sam_cpu_inference", "capsid_profile")) {
         $Passed = @($Result.checks | Where-Object { $_.name -eq $Required -and $_.status -eq "ok" })
         if ($Passed.Count -ne 1) {
             throw "Smoke test did not pass required check ${Required}: $Report"
         }
+    }
+    $ProfileCheck = @($Result.checks | Where-Object { $_.name -eq "capsid_profile" })[0]
+    if ($ProfileCheck.details.profile_status -ne $ExpectedCapsidProfile) {
+        throw "Capsid profile runtime state is not ${ExpectedCapsidProfile}: $Report"
     }
     Write-Host "Passed executable smoke test: $Report"
 }
@@ -128,6 +133,7 @@ function Invoke-IconHelper {
 Push-Location $ProjectRoot
 $PreviousModel = $env:SARU_MODEL_FILE
 $IconSidecarTested = $false
+$CapsidProfileSidecarTested = $false
 try {
     New-Item -ItemType Directory -Path $BuildDirectory, $ArtifactDirectory -Force | Out-Null
     Invoke-Checked $PythonExe @("-c", "import struct,sys; assert sys.platform == 'win32' and sys.version_info[:2] == (3,12) and struct.calcsize('P') == 8, 'Python 3.12 x64 is required'")
@@ -171,6 +177,9 @@ try {
 
     $Distribution = Join-Path $ProjectRoot "dist\SARU_Picker"
     $Executable = Join-Path $Distribution "SARU Picker.exe"
+    if (Test-Path -LiteralPath (Join-Path $Distribution "_internal\models\capsid-profile.json")) {
+        throw "The public distribution unexpectedly contains a private capsid profile. Deliver it only as an external installer sidecar."
+    }
     # Keep the tiny stdlib helper independent of the application's large
     # onedir bundle. Its own onefile runtime cannot replace base_library.zip
     # or any DLL in the main application's _internal directory.
@@ -219,19 +228,22 @@ try {
             New-Item -ItemType Directory -Path $IconFixtureDirectory -Force | Out-Null
             $FixtureInstaller = Join-Path $IconFixtureDirectory (Split-Path -Leaf $Installer)
             Copy-Item -LiteralPath $Installer -Destination $FixtureInstaller
-            Invoke-Checked $VenvPython @("packaging\verify_icon_installation.py", "make-fixture", "--directory", $IconFixtureDirectory, "--baseline-directory", (Join-Path $ProjectRoot "assets"), "--report", (Join-Path $ArtifactDirectory "icon-fixture.json"))
             $InstallIconReport = Join-Path $env:LOCALAPPDATA "SARU_Picker\icon-install.json"
             if (Test-Path -LiteralPath $InstallIconReport) { Remove-Item -LiteralPath $InstallIconReport }
             $Installed = $false
             try {
+                Invoke-Checked $VenvPython @("packaging\verify_icon_installation.py", "make-fixture", "--directory", $IconFixtureDirectory, "--baseline-directory", (Join-Path $ProjectRoot "assets"), "--report", (Join-Path $ArtifactDirectory "icon-fixture.json"))
+                Invoke-Checked $VenvPython @("packaging\verify_capsid_profile_installation.py", "make-fixture", "--directory", $IconFixtureDirectory, "--report", (Join-Path $ArtifactDirectory "capsid-profile-fixture.json"))
                 $InstallArguments = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$InstallDirectory`" /LOG=`"$InstallLog`""
                 $InstallProcess = Start-Process -FilePath $FixtureInstaller -ArgumentList $InstallArguments -Wait -PassThru
                 if ($InstallProcess.ExitCode -ne 0) { throw "Installer failed (exit $($InstallProcess.ExitCode))." }
                 $Installed = $true
                 Assert-BundledLibraries $InstallDirectory
-                Invoke-SmokeTest (Join-Path $InstallDirectory "SARU Picker.exe") (Join-Path $ArtifactDirectory "installed-smoke-test.json")
+                Invoke-SmokeTest (Join-Path $InstallDirectory "SARU Picker.exe") (Join-Path $ArtifactDirectory "installed-smoke-test.json") "loaded"
                 Invoke-Checked $VenvPython @("packaging\verify_icon_installation.py", "verify", "--install-directory", $InstallDirectory, "--fixture-directory", $IconFixtureDirectory, "--helper-report", $InstallIconReport, "--runtime-report", (Join-Path $ArtifactDirectory "installed-smoke-test.json"), "--report", (Join-Path $ArtifactDirectory "icon-install-verification.json"))
                 $IconSidecarTested = $true
+                Invoke-Checked $VenvPython @("packaging\verify_capsid_profile_installation.py", "verify", "--install-directory", $InstallDirectory, "--fixture-directory", $IconFixtureDirectory, "--runtime-report", (Join-Path $ArtifactDirectory "installed-smoke-test.json"), "--report", (Join-Path $ArtifactDirectory "capsid-profile-install-verification.json"))
+                $CapsidProfileSidecarTested = $true
             } finally {
                 if (Test-Path -LiteralPath $InstallIconReport -PathType Leaf) {
                     Copy-Item -LiteralPath $InstallIconReport -Destination (Join-Path $ArtifactDirectory "icon-helper-install.json") -Force
@@ -261,6 +273,8 @@ try {
         dependencies = @($DependencyList | ConvertFrom-Json)
         installer_tested = [bool]$TestInstaller
         icon_sidecar_installation_tested = $IconSidecarTested
+        capsid_profile_sidecar_installation_tested = $CapsidProfileSidecarTested
+        capsid_profile_embedded_in_public_build = $false
         icon_helper_bytes = (Get-Item -LiteralPath $IconHelper).Length
     }
     $BuildMetadata | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $ArtifactDirectory "build-manifest.json") -Encoding UTF8

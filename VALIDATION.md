@@ -1,4 +1,14 @@
-# SAM validation on the supplied example
+# Version 2.6 validation scope
+
+The 2.6 update separates UI lifecycle validation, optional profile installation, and recognition evaluation. Historical results below apply to their named versions and experiments.
+
+The semi-auto regression requires a fresh native annotation window for each remaining contour set. The old 2.5.0 implementation fails this regression. The native Windows three-selection check also inspects actual Tk image pixels, verifies completed contours are absent, checks two old annotation windows were destroyed, and requires the final annotation to be cleared. The same visible, topmost control panel must survive every selection. These checks establish window lifecycle and current bitmap contents; they are not a recording of every Windows compositor frame or a live cryoSPARC session.
+
+The optional profile has separate strict JSON, feature and inference tests. The frozen public build reports whether the optional profile is available; the default detector retains its texture heuristic. The explicitly selected experimental learned detector requires a valid profile. The installer test supplies a nonprivate constant-weight fixture and verifies that the installed runtime loads its exact bytes and computes the expected numerical scores. No private training images or learned parameters are required in public CI.
+
+Recognition evaluation uses clean images, positive-only markers and unlabeled regions. Learned parameters and normalization must exclude each evaluation group. Marked-location coverage is accompanied by selected area, candidate counts, case-level results and visual inspection. Incomplete annotations cannot establish precision, complete recall or exact boundary overlap. Iterative development comparisons are not an independent external test; the private model's evidence and limitations accompany its delivery.
+
+# Historical SAM validation on the supplied example
 
 ## What this test establishes
 

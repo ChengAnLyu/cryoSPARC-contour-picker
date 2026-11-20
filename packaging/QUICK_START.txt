@@ -1,4 +1,4 @@
-SARU Picker 2.5.0 — Windows CPU edition
+SARU Picker 2.6.0 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -8,6 +8,12 @@ and app-icon.ico in the same folder as the setup EXE. Setup copies them into the
 application and updates the app/shortcut icons. Setup itself has a geometric
 icon; launching the installed application shows your supplied portrait. Setup
 without these optional files uses the geometric fallback throughout.
+
+LEARNED CAPSIDS: If capsid-profile.json is included, keep it beside the setup
+EXE as well. Setup places it beside the SAM model. Select Advanced > Detection
+profile > capsid-learned to try the experimental trained detector. No separate
+model download is needed. The default capsid detector keeps the earlier texture
+heuristic even when the learned profile is installed.
 
 cryoSPARC remains your live image viewer. Keep it on the primary monitor.
 The control panel stays visible and above the drawing/selection overlays.
@@ -30,7 +36,8 @@ drag around the micrograph, then Detect. The panel remains visible throughout. G
 appear directly over cryoSPARC. Enable picking and click inside a target
 contour. The program waits for your mouse release, hides its annotation layer,
 then fills only that contour. The panel stays visible and the remaining outlines
-return. Box prompt provides guided selection.
+return on a fresh drawing window so completed contours are not remapped.
+Box prompt provides guided selection.
 Next micrograph replaces Next alternative. It sends Down once to cryoSPARC,
 waits for a different stable image, and detects fresh contours in the same
 screen area. It does not pick them until you click a contour. This also works
@@ -68,10 +75,16 @@ browser still need time to process picks; detection and image loading are
 separate. Use the lowest setting that registers reliably on your workstation.
 
 DETECTION
-The default capsid profile filters SAM proposals for dense granular interiors
-and fits polygonal boundaries used for both display and picking. It reduces
-broad background/membrane selections. It is an image-based
-heuristic, not a newly trained capsid model, and can miss faint cores/fragments.
+The default capsid profile retains the earlier texture heuristic. The
+capsid-learned option uses the experimental appearance model to locate dense
+granular interiors and guide SAM; it requires capsid-profile.json. Polygonal
+boundaries are used for both display and picking. Development results include
+recovered targets, missed known targets and unwanted background regions, so
+this option has not replaced the default detector. Its screen selection must
+contain no more than 4,194,304 pixels; select a smaller region if asked.
+Neither path guarantees every target or excludes every membrane fragment.
+The learned score is not a calibrated capsid probability; SAM weights remain
+unchanged. Unmarked regions in sparse examples are not negative labels.
 Review the contours in semi-auto before running automatic picking.
 Advanced > Detection profile > generic restores unclassified SAM proposals.
 

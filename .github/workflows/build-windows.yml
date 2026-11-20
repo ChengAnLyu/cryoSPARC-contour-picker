@@ -63,6 +63,7 @@ jobs:
             artifacts/frozen-smoke-test.json
             artifacts/installed-smoke-test.json
             artifacts/icon-install-verification.json
+            artifacts/capsid-profile-install-verification.json
             artifacts/installer-smoke.log
           if-no-files-found: error
           compression-level: 0

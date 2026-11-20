@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.5.0: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 2.6.0: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
@@ -132,10 +132,216 @@ def windows_application_icon_status(root) -> dict[str, bool]:
     }
 
 
+# ---------------- capsid_prior.py ----------------
+
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+from scipy import ndimage as ndi
+
+PROFILE_FORMAT = "saru-capsid-appearance-v1"
+PROFILE_FILENAME = "capsid-profile.json"
+PROFILE_MAX_BYTES = 262144
+FEATURE_NAMES = (
+    'mean_1', 'mean_4', 'mean_12', 'mean_32',
+    'fine_rms_5', 'fine_rms_12', 'fine_rms_24',
+    'mid_rms_5', 'mid_rms_12', 'mid_rms_24',
+    'coarse_rms_8', 'coarse_rms_16', 'coarse_rms_32',
+    'minor_3', 'coherence_3', 'minor_6', 'coherence_6', 'minor_12', 'coherence_12',
+    'grain_local_context_6', 'grain_local_context_12', 'black_6', 'black_16',
+)
+
+
+def _prior_check(check_cancel: Callable[[], None] | None) -> None:
+    if check_cancel is not None:
+        check_cancel()
+
+
+@dataclass(frozen=True)
+class CapsidProfile:
+    path: str
+    sha256: str
+    format: str
+    mean: np.ndarray
+    scale: np.ndarray
+    layers: tuple[tuple[np.ndarray, np.ndarray], ...]
+
+    def describe(self) -> dict:
+        return {'status': 'loaded', 'path': self.path, 'sha256': self.sha256,
+                'format': self.format, 'feature_count': len(FEATURE_NAMES),
+                'score_is_calibrated_probability': False}
+
+
+def resolve_profile_path(checkpoint: str | Path,
+                         explicit_path: str | Path | None = None) -> Path | None:
+    """Resolve only a caller-selected file or the sidecar next to SAM weights."""
+    if explicit_path is not None:
+        path = Path(explicit_path).expanduser()
+        if not path.is_file():
+            raise ValueError(f'Capsid profile not found: {path}')
+        return path
+    path = Path(checkpoint).expanduser().parent / PROFILE_FILENAME
+    return path if path.is_file() else None
+
+
+def load_profile(path: str | Path) -> CapsidProfile:
+    """Load bounded numeric JSON, rejecting schema drift and invalid numbers."""
+    path = Path(path).expanduser()
+    with path.open('rb') as handle:
+        blob = handle.read(PROFILE_MAX_BYTES + 1)
+    if len(blob) > PROFILE_MAX_BYTES:
+        raise ValueError('Capsid profile exceeds the 256 KiB size limit.')
+    try:
+        data = json.loads(blob.decode('utf-8'))
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ValueError('Capsid profile must be valid UTF-8 JSON.') from exc
+    if not isinstance(data, dict) or data.get('format') != PROFILE_FORMAT:
+        raise ValueError('Unsupported capsid profile format.')
+    if data.get('feature_names') != list(FEATURE_NAMES):
+        raise ValueError('Capsid profile feature schema does not match this application.')
+
+    def numbers(value, shape, label, *, positive=False):
+        try:
+            raw = np.asarray(value)
+            if raw.dtype.kind not in 'fiu':
+                raise ValueError('Profile parameters must be JSON numbers.')
+            array = raw.astype(np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f'Invalid capsid profile {label}.') from exc
+        if (array.shape != shape or not np.isfinite(array).all()
+                or np.any(np.abs(array) > 10000)
+                or (positive and np.any(array < 1e-5))):
+            raise ValueError(f'Invalid capsid profile {label} dimensions or values.')
+        array = np.ascontiguousarray(array)
+        array.flags.writeable = False
+        return array
+
+    mean = numbers(data.get('mean'), (23,), 'mean')
+    scale = numbers(data.get('scale'), (23,), 'scale', positive=True)
+    raw_layers = data.get('layers')
+    if not isinstance(raw_layers, list) or len(raw_layers) != 3:
+        raise ValueError('Capsid profile must contain exactly three neural layers.')
+    layers = []
+    for index, (raw, dimensions) in enumerate(zip(raw_layers, ((32, 23), (16, 32), (1, 16)))):
+        if not isinstance(raw, dict):
+            raise ValueError('Capsid profile layers must be numeric objects.')
+        layers.append((numbers(raw.get('weight'), dimensions, f'layer {index} weight'),
+                       numbers(raw.get('bias'), (dimensions[0],), f'layer {index} bias')))
+    return CapsidProfile(str(path.resolve()), hashlib.sha256(blob).hexdigest(),
+                         PROFILE_FORMAT, mean, scale, tuple(layers))
+
+
+def appearance_features(rgb: np.ndarray,
+                        check_cancel: Callable[[], None] | None = None):
+    """Fixed, contrast-normalized image features, with bounded temporary storage.
+
+    Feature scales are screen pixels, matching the screenshot training domain.
+    Feature normalization uses only the current clean screenshot, never marks.
+    The 23-channel output is preallocated; neural activations are chunked later.
+    """
+    _prior_check(check_cancel)
+    rgb = np.asarray(rgb)
+    if (rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3
+            or min(rgb.shape[:2]) < 4):
+        raise ValueError('Capsid appearance requires an H x W x 3 uint8 RGB image, at least 4 pixels per side.')
+    if rgb.shape[0] * rgb.shape[1] > 4_194_304:
+        raise ValueError('Selected screen area is too large for the capsid profile; select a smaller micrograph area.')
+    gray = rgb.mean(2, dtype=np.float32) / 255
+    chroma = rgb.max(2).astype(np.int16) - rgb.min(2)
+    valid = (chroma < 8) & (ndi.uniform_filter(gray, 7) < .97)
+    valid = ndi.binary_erosion(valid, iterations=3, border_value=1)
+    features = np.zeros((*gray.shape, len(FEATURE_NAMES)), np.float32)
+    if not valid.any():
+        return features, valid
+    q10, median, q90 = np.quantile(gray[valid], [.1, .5, .9])
+    contrast = max(float(q90 - q10), 1 / 255)
+    z = np.clip((gray - median) / contrast, -4, 4).astype(np.float32)
+    smooth = {}
+    for sigma in (1, 3, 4, 8, 12, 32):
+        _prior_check(check_cancel)
+        smooth[sigma] = ndi.gaussian_filter(z, sigma)
+    cursor = 0
+    def append(value):
+        nonlocal cursor
+        features[..., cursor] = np.clip(value, -6, 6)
+        cursor += 1
+        _prior_check(check_cancel)
+    for sigma in (1, 4, 12, 32):
+        append(smooth[sigma])
+    epsilon = np.float32(1e-5)
+    for band, scales in ((z - smooth[1], (5, 12, 24)),
+                         (smooth[1] - smooth[3], (5, 12, 24)),
+                         (smooth[3] - smooth[8], (8, 16, 32))):
+        squared = band * band
+        for sigma in scales:
+            _prior_check(check_cancel)
+            rms = np.sqrt(np.maximum(ndi.gaussian_filter(squared, sigma), 0))
+            append(np.log((rms + epsilon) / (np.median(rms[valid]) + epsilon)))
+    gy, gx = np.gradient(smooth[1])
+    xx, xy, yy = gx * gx, gx * gy, gy * gy
+    for sigma in (3, 6, 12):
+        _prior_check(check_cancel)
+        a = ndi.gaussian_filter(xx, sigma)
+        b = ndi.gaussian_filter(xy, sigma)
+        c = ndi.gaussian_filter(yy, sigma)
+        discriminant = np.sqrt(np.maximum((a - c) ** 2 + 4 * b * b, 0))
+        trace = a + c
+        minor = np.sqrt(np.maximum((trace - discriminant) * .5, 0))
+        append(np.log((minor + epsilon) / (np.median(minor[valid]) + epsilon)))
+        append(discriminant / (trace + epsilon))
+    fine = ndi.gaussian_filter((z - smooth[1]) ** 2, 3)
+    context = ndi.gaussian_filter(fine, 32)
+    for sigma in (6, 12):
+        local = ndi.gaussian_filter(fine, sigma)
+        append(np.log((local + epsilon) / (context + epsilon)))
+    dark = (z < -.8).astype(np.float32)
+    for sigma in (6, 16):
+        append(ndi.gaussian_filter(dark, sigma))
+    if cursor != len(FEATURE_NAMES) or not np.isfinite(features).all():
+        raise ValueError('Capsid appearance feature computation failed.')
+    return features, valid
+
+
+def score_features(features: np.ndarray, profile: CapsidProfile,
+                   check_cancel: Callable[[], None] | None = None) -> np.ndarray:
+    """Apply the profile in fixed-size chunks without a full-image hidden tensor."""
+    _prior_check(check_cancel)
+    if features.ndim != 3 or features.shape[-1] != len(FEATURE_NAMES):
+        raise ValueError('Capsid feature dimensions do not match the profile.')
+    flat = features.reshape(-1, features.shape[-1])
+    result = np.empty(len(flat), np.float32)
+    for start in range(0, len(flat), 32768):
+        _prior_check(check_cancel)
+        hidden = np.clip((flat[start:start + 32768] - profile.mean) / profile.scale, -8, 8)
+        for index, (weight, bias) in enumerate(profile.layers):
+            hidden = hidden @ weight.T + bias
+            if index < len(profile.layers) - 1:
+                hidden = np.tanh(hidden)
+        result[start:start + len(hidden)] = 1 / (1 + np.exp(-np.clip(hidden[:, 0], -30, 30)))
+    if not np.isfinite(result).all():
+        raise ValueError('Capsid appearance profile produced nonfinite scores.')
+    _prior_check(check_cancel)
+    return result.reshape(features.shape[:2])
+
+
+def score_image(rgb: np.ndarray, profile: CapsidProfile,
+                check_cancel: Callable[[], None] | None = None) -> np.ndarray:
+    """Return one uncalibrated score per input pixel; UI-coloured pixels are zero."""
+    features, valid = appearance_features(rgb, check_cancel)
+    result = score_features(features, profile, check_cancel)
+    result[~valid] = 0
+    return result
+
+
 # ---------------- capsid.py ----------------
 
 from collections.abc import Callable, Iterable, Mapping
 import math
+import heapq
 from typing import Any
 
 import numpy as np
@@ -706,10 +912,232 @@ def filter_capsid_proposals(
 
 
 
+def _profile_shape(mask: np.ndarray, check_cancel=None) -> tuple[bool, dict[str, float]]:
+    """Broad compactness support, rejecting long strips and thin membrane rims.
+
+    This is an extent prior, not an exact side-count/roundness template. Holes
+    are retained in masks. Filled-extent thickness and supported occupancy are
+    separate, so an internal contaminant does not make a valid core a thin rim.
+    """
+    _capsid_check(check_cancel)
+    yy, xx = np.nonzero(mask)
+    if len(xx) < 3:
+        return False, {}
+    covariance = np.cov(np.stack((xx, yy)))
+    eigenvalues = np.linalg.eigvalsh(covariance)
+    elongation = math.sqrt(float(eigenvalues[-1]) / max(float(eigenvalues[0]), 1e-6))
+    if elongation > 4.0:
+        return False, {"moment_elongation": elongation}
+    filled = ndi.binary_fill_holes(mask)
+    occupancy = len(xx) / int(filled.sum())
+    if occupancy < .50:
+        return False, {'supported_occupancy': occupancy, 'moment_elongation': elongation}
+    distance = ndi.distance_transform_edt(np.pad(filled, 1))[1:-1, 1:-1]
+    thickness = float(distance.max()) / math.sqrt(int(filled.sum()))
+    if thickness < .24:
+        return False, {"moment_elongation": elongation, "normalized_thickness": thickness}
+    rings = _capsid_boundary_rings(filled, check_cancel)
+    if not rings:
+        return False, {}
+    hull = _capsid_convex_hull(np.vstack(rings))
+    following = np.roll(hull, -1, axis=0)
+    hull_area = abs(float(np.sum(hull[:, 0] * following[:, 1] - hull[:, 1] * following[:, 0]))) * .5
+    solidity = int(filled.sum()) / max(hull_area, 1)
+    evidence = {"moment_elongation": elongation, "normalized_thickness": thickness,
+                "filled_support_solidity": solidity, "supported_occupancy": occupancy}
+    return solidity >= .72, evidence
+
+
+def _profile_components(support: np.ndarray, min_area: int, max_area: float,
+                        check_cancel=None):
+    """Remove bounded thin extensions, then assess each remaining component."""
+    labels, count = ndi.label(support)
+    # Object IDs, rather than any positive pixel inside a bounding box, keep
+    # nested/disconnected components separate when their boxes overlap.
+    for label, bounds in enumerate(ndi.find_objects(labels), 1):
+        _capsid_check(check_cancel)
+        if bounds is None:
+            continue
+        local = labels[bounds] == label
+        area = int(local.sum())
+        if not min_area <= area <= max_area:
+            continue
+        radius = max(2, min(8, round(math.sqrt(area) * .07)))
+        # Pad as foreground only at actual image edges. Partial capsids keep
+        # their open screen boundary; internal narrow tails are trimmed.
+        padded = np.pad(ndi.binary_fill_holes(local), radius)
+        if bounds[0].start == 0:
+            padded[:radius, radius:-radius] = True
+        if bounds[0].stop == support.shape[0]:
+            padded[-radius:, radius:-radius] = True
+        if bounds[1].start == 0:
+            padded[radius:-radius, :radius] = True
+        if bounds[1].stop == support.shape[1]:
+            padded[radius:-radius, -radius:] = True
+        opened = ndi.binary_opening(padded, iterations=radius)[radius:-radius, radius:-radius]
+        cleaned = opened & local  # Never grow beyond support or fill an exclusion.
+        pieces, number = ndi.label(cleaned)
+        for piece in range(1, number + 1):
+            _capsid_check(check_cancel)
+            part = pieces == piece
+            if int(part.sum()) < min_area:
+                continue
+            accepted, evidence = _profile_shape(part, check_cancel)
+            if not accepted:
+                continue
+            mask = np.zeros_like(support)
+            mask[bounds] = part
+            yield mask, evidence
+
+
+def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
+                          max_area_ratio=.40, max_prompts=24, check_cancel=None):
+    """Bounded automatic SAM boxes from learned positive appearance support."""
+    scores = np.asarray(scores)
+    if scores.ndim != 2 or not scores.size or not np.isfinite(scores).all():
+        raise ValueError('Capsid appearance scores must be a finite two-dimensional image.')
+    if not 0 <= min_area_ratio < max_area_ratio <= 1:
+        raise ValueError('Capsid area ratios must satisfy 0 <= min < max <= 1.')
+    if max_prompts <= 0:
+        return []
+    max_prompts = min(24, max_prompts)
+    min_area = max(64, math.ceil(min_area_ratio * scores.size))
+    max_area = max_area_ratio * scores.size
+    support = ndi.binary_closing(scores >= .5, iterations=4, border_value=1)
+    support &= scores > 0
+    support = ndi.binary_opening(support, iterations=3, border_value=0)
+    proposals = []
+    for mask, shape in _profile_components(support, min_area, max_area, check_cancel):
+        _capsid_check(check_cancel)
+        x, y, width, height = _capsid_bbox(mask)
+        margin = max(6, min(24, round(max(width, height) * .12)))
+        box = [max(0, x - margin), max(0, y - margin),
+               min(scores.shape[1], x + width + margin),
+               min(scores.shape[0], y + height + margin)]
+        distances = ndi.distance_transform_edt(mask)
+        cy, cx = np.unravel_index(np.argmax(distances * scores), scores.shape)
+        rank = float(np.mean(scores[mask]) * math.sqrt(mask.sum()))
+        proposals.append({'box': box, 'point': [int(cx), int(cy)], 'rank': rank,
+                          'support_area': int(mask.sum()), 'shape': shape})
+    return sorted(proposals, key=lambda item: item['rank'], reverse=True)[:max_prompts]
+
+
+def _profile_pool_offer(pool, record, serial):
+    """Retain at most64 full-image candidate records, stable by rank then arrival."""
+    entry = (float(record['capsid_score']), -serial, record)
+    if len(pool) < 64:
+        heapq.heappush(pool, entry)
+    else:
+        heapq.heappushpop(pool, entry)
+
+
+def _profile_masks_overlap(first, second):
+    ax, ay, aw, ah = first['bbox']
+    bx, by, bw, bh = second['bbox']
+    if ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay:
+        return False
+    return (np.count_nonzero(first['segmentation'] & second['segmentation'])
+            / min(first['area'], second['area']) >= .80)
+
+
+def filter_capsid_with_profile(rgb: np.ndarray, raw_proposals, scores: np.ndarray, *,
+                               check_cancel=None, min_area_ratio=.002,
+                               max_area_ratio=.40, max_candidates=24):
+    """Refine guided SAM masks with the same learned support used for prompting.
+
+    The resulting bitmap is used for overlay, hit testing and picking. This
+    path keeps the geometric exclusions and never inherits SAM IoU estimates
+    as scores for the modified region. Appearance scores are uncalibrated.
+    """
+    rgb = np.asarray(rgb)
+    scores = np.asarray(scores)
+    if (rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3
+            or scores.shape != rgb.shape[:2] or not np.isfinite(scores).all()):
+        raise ValueError('Capsid profile scores and screenshot must have matching image dimensions.')
+    if not 0 <= min_area_ratio < max_area_ratio <= 1:
+        raise ValueError('Capsid area ratios must satisfy 0 <= min < max <= 1.')
+    if max_candidates <= 0:
+        return []
+    max_candidates = min(24, max_candidates)
+    min_area = max(64, math.ceil(min_area_ratio * scores.size))
+    max_area = max_area_ratio * scores.size
+    texture, valid = _capsid_texture(rgb, check_cancel)
+    if np.count_nonzero(valid) < min_area:
+        return []
+    global_median = float(np.median(texture[valid]))
+    if global_median < 1e-7:
+        return []
+    bounds = _capsid_field_bounds(valid)
+    refined = []
+    serial = 0
+    for index, proposal in enumerate(raw_proposals):
+        _capsid_check(check_cancel)
+        if index >= 128:
+            break
+        parent = np.asarray(proposal['segmentation'], dtype=bool)
+        if parent.shape != scores.shape:
+            raise ValueError('A guided SAM proposal has a different size from the screenshot.')
+        area = int(parent.sum())
+        if not min_area <= area <= max_area or _capsid_screen_sides(parent & valid, bounds) >= 3:
+            continue
+        inset = max(2, min(6, round(math.sqrt(area / math.pi) * .045)))
+        allowed = ndi.binary_erosion(parent, iterations=inset, border_value=1) & valid
+        support = ndi.binary_closing(allowed & (scores >= .5), iterations=4, border_value=1) & allowed
+        for component, shape in _profile_components(support, min_area, max_area, check_cancel):
+            component_area = int(component.sum())
+            annulus = (ndi.binary_dilation(component, iterations=20)
+                       & ~ndi.binary_dilation(component, iterations=3) & valid)
+            inside = float(np.median(texture[component]))
+            outside = float(np.median(texture[annulus])) if np.any(annulus) else global_median
+            local_ratio = inside / max(outside, 1e-7)
+            global_ratio = inside / global_median
+            # Require either a local grain increase or strong field-relative
+            # grain. This removes flat rims while allowing crowded neighbours.
+            if local_ratio < 1.04 and global_ratio < 1.15:
+                continue
+            mean_score = float(np.mean(scores[component]))
+            rank = mean_score * math.sqrt(component_area) / max(1, shape['moment_elongation'])
+            evidence = {'appearance_score_mean': mean_score,
+                        'appearance_score_median': float(np.median(scores[component])),
+                        'appearance_threshold': .5, 'shape': shape,
+                        'local_texture_ratio': local_ratio, 'global_texture_ratio': global_ratio,
+                        'proposal_predicted_iou': proposal.get('predicted_iou'),
+                        'proposal_stability_score': proposal.get('stability_score'),
+                        'is_calibrated_probability': False}
+            record = {'segmentation': component, 'area': component_area,
+                            'bbox': _capsid_bbox(component), 'predicted_iou': None,
+                            'stability_score': None, 'capsid_score': rank,
+                            'capsid_evidence': evidence, '_allowed': allowed,
+                            'source': 'learned capsid core (review)'}
+            _profile_pool_offer(refined, record, serial)
+            serial += 1
+    ranked = [entry[2] for entry in sorted(refined, key=lambda entry: (entry[0], entry[1]), reverse=True)]
+    refined.clear()
+    selected = []
+    for record in ranked:
+        _capsid_check(check_cancel)
+        if any(_profile_masks_overlap(record, previous) for previous in selected):
+            continue
+        selected.append(record)
+        if len(selected) >= max_candidates:
+            break
+    ranked.clear()
+    for record in selected:
+        fitted, evidence = polygonal_capsid_mask(record['segmentation'],
+                                                allowed_mask=record.pop('_allowed'),
+                                                check_cancel=check_cancel)
+        record.update(segmentation=fitted, area=int(fitted.sum()), bbox=_capsid_bbox(fitted),
+                      source='learned capsid polygon (review)')
+        record['capsid_evidence']['polygon'] = evidence
+    return selected
+
+
 # ---------------- recognition.py ----------------
 
 from dataclasses import dataclass
 import gc
+import logging
+import time
 import hashlib
 import math
 import os
@@ -754,14 +1182,17 @@ class RecognitionConfig:
     overlap_threshold: float = 0.80
     prefer_smaller: bool = True
     automatic_profile: str = "capsid"
+    capsid_prior_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.model_type not in {"vit_b", "vit_l", "vit_h"}:
             raise ValueError("model_type must be vit_b, vit_l, or vit_h.")
         if self.device not in {"auto", "cpu", "cuda"}:
             raise ValueError("device must be auto, cpu, or cuda.")
-        if self.automatic_profile not in {"capsid", "generic"}:
-            raise ValueError("automatic_profile must be capsid or generic.")
+        if self.automatic_profile not in {"capsid", "capsid-learned", "generic"}:
+            raise ValueError("automatic_profile must be capsid, capsid-learned, or generic.")
+        if self.capsid_prior_path is not None and (not isinstance(self.capsid_prior_path, str) or not self.capsid_prior_path.strip()):
+            raise ValueError("capsid_prior_path must be a nonempty path string or None.")
         for name in ("cpu_threads", "points_per_side"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -936,6 +1367,8 @@ class SamRecognizer:
         self._automatic_image_key: str | None = None
         self._automatic_result: list[Candidate] | None = None
         self.last_detection: dict | None = None
+        self._appearance_profile = None
+        self._appearance_profile_loaded = False
         self._active_cancel: CancelCheck = None
         self.device: str | None = None
 
@@ -996,9 +1429,9 @@ class SamRecognizer:
                 # The capsid pass needs inner candidates that generic SAM's
                 # stability gate can omit. Domain filtering follows inference;
                 # these permissive proposal thresholds are not acceptance scores.
-                pred_iou_thresh=(0.50 if self.config.automatic_profile == "capsid"
+                pred_iou_thresh=(0.50 if self.config.automatic_profile in {"capsid", "capsid-learned"}
                                  else self.config.pred_iou_thresh),
-                stability_score_thresh=(0.75 if self.config.automatic_profile == "capsid"
+                stability_score_thresh=(0.75 if self.config.automatic_profile in {"capsid", "capsid-learned"}
                                        else self.config.stability_score_thresh),
                 box_nms_thresh=0.7,
                 crop_n_layers=0,
@@ -1091,24 +1524,90 @@ class SamRecognizer:
         except Exception as exc:
             raise RecognitionError(f"SAM prompted segmentation failed: {exc}") from exc
 
+    def _get_appearance_profile(self):
+        """Load a stable optional numeric profile once per recognizer instance."""
+        if self.config.automatic_profile != "capsid-learned":
+            return None
+        if not self._appearance_profile_loaded:
+            try:
+                path = resolve_profile_path(self.config.checkpoint, self.config.capsid_prior_path)
+                if path is None:
+                    raise ValueError("The experimental capsid profile is not installed. Keep capsid-profile.json beside Setup and reinstall, Select capsid for the earlier texture detector.")
+                self._appearance_profile = load_profile(path)
+            except (OSError, ValueError) as exc:
+                raise RecognitionError(
+                    f"Could not load the capsid appearance profile: {exc}. "
+                    "Reinstall the accompanying capsid-profile.json. Select capsid for the earlier texture detector.") from exc
+            self._appearance_profile_loaded = True
+            if self._appearance_profile is not None:
+                logging.getLogger("saru.recognition").info(
+                    "Using capsid appearance profile %s from %s", self._appearance_profile.sha256,
+                    self._appearance_profile.path)
+            else:
+                logging.getLogger("saru.recognition").info(
+                    "No capsid appearance sidecar found; using the existing SAM texture filter.")
+        return self._appearance_profile
+
     def automatic(self, rgb: np.ndarray | Image.Image,
                   cancel: CancelCheck = None) -> list[Candidate]:
-        """Generate reviewable regions using the configured automatic profile.
+        """Generate reviewable regions with a private learned profile when present.
 
-        The capsid profile refines permissive SAM proposals with local texture
-        evidence. It is a conservative image heuristic, not a trained capsid
-        classifier. Generic mode retains the previous proposal pipeline.
+        The opt-in capsid-learned path proposes at most 24 boxes from positive
+        appearance support and encodes the screenshot once. Default capsid mode
+        retains its earlier sparse-grid texture path. A missing selected learned
+        profile raises an actionable error; generic and user prompts are unchanged.
         """
         rgb = validate_rgb(rgb)
         _check_cancel(cancel)
         key = _image_key(rgb)
         if key == self._automatic_image_key and self._automatic_result is not None:
             return list(self._automatic_result)
+        profile = self._get_appearance_profile()
+        started = time.perf_counter()
+        # Validate and score before loading SAM: oversized/corrupt inputs fail
+        # before expensive model allocation, and cancellation stays responsive.
+        appearance_scores = None
+        guided = []
+        feature_seconds = proposal_seconds = 0.0
+        if profile is not None:
+            feature_started = time.perf_counter()
+            try:
+                appearance_scores = score_image(rgb, profile, lambda: _check_cancel(cancel))
+                feature_seconds = time.perf_counter() - feature_started
+                proposal_started = time.perf_counter()
+                guided = capsid_guided_prompts(
+                    appearance_scores, check_cancel=lambda: _check_cancel(cancel),
+                    min_area_ratio=self.config.min_area_ratio,
+                    max_area_ratio=min(self.config.max_area_ratio, .40))
+                proposal_seconds = time.perf_counter() - proposal_started
+            except Cancelled:
+                raise
+            except (ValueError, MemoryError) as exc:
+                raise RecognitionError(f"Capsid appearance scoring failed: {exc}") from exc
         self._ensure_model(cancel)
         self._active_cancel = cancel
         try:
+            sam_started = time.perf_counter()
             with self._torch.inference_mode():
-                raw = self._generator.generate(rgb)
+                if profile is None:
+                    raw = self._generator.generate(rgb)
+                else:
+                    raw = []
+                    if guided:
+                        self._set_image(rgb, key, cancel)
+                    for prompt in guided:
+                        _check_cancel(cancel)
+                        masks, scores, _ = self._predictor.predict(
+                            point_coords=np.asarray([prompt['point']], dtype=np.float32),
+                            point_labels=np.asarray([1], dtype=np.int32),
+                            box=np.asarray(prompt['box'], dtype=np.float32),
+                            multimask_output=True)
+                        _check_cancel(cancel)
+                        for mask, score in zip(masks, scores):
+                            if float(score) >= .50:
+                                raw.append({'segmentation': mask, 'predicted_iou': float(score),
+                                            'source': 'learned capsid box prompt'})
+            sam_seconds = time.perf_counter() - sam_started
             _check_cancel(cancel)
             for item in raw:
                 _check_cancel(cancel)
@@ -1116,12 +1615,19 @@ class SamRecognizer:
                 if mask.shape != rgb.shape[:2]:
                     raise RecognitionError("SAM returned a mask with the wrong image dimensions.")
             raw_count = len(raw)
-            is_capsid = self.config.automatic_profile == "capsid"
+            is_capsid = self.config.automatic_profile in {"capsid", "capsid-learned"}
+            refinement_started = time.perf_counter()
             if is_capsid:
-                raw = filter_capsid_proposals(
-                    rgb, raw, check_cancel=lambda: _check_cancel(cancel),
-                    min_area_ratio=self.config.min_area_ratio,
-                    max_area_ratio=min(self.config.max_area_ratio, .40))
+                if profile is not None:
+                    raw = filter_capsid_with_profile(
+                        rgb, raw, appearance_scores, check_cancel=lambda: _check_cancel(cancel),
+                        min_area_ratio=self.config.min_area_ratio,
+                        max_area_ratio=min(self.config.max_area_ratio, .40))
+                else:
+                    raw = filter_capsid_proposals(
+                        rgb, raw, check_cancel=lambda: _check_cancel(cancel),
+                        min_area_ratio=self.config.min_area_ratio,
+                        max_area_ratio=min(self.config.max_area_ratio, .40))
             candidates = []
             evidence = {}
             for item in raw:
@@ -1140,13 +1646,23 @@ class SamRecognizer:
             result = filter_candidates(candidates, self.config, cancel,
                                        suppress_duplicates=not is_capsid)
             _check_cancel(cancel)
+            appearance = (profile.describe() if profile is not None else
+                          {'status': 'disabled', 'fallback_used': False})
+            if profile is not None:
+                appearance.update(inference_executed=True, scored_pixels=int(rgb.shape[0] * rgb.shape[1]),
+                                  guided_boxes=len(guided), fallback_used=False)
             self.last_detection = {
                 "profile": self.config.automatic_profile,
-                "sam_proposals": raw_count,
-                "selected_contours": len(result),
+                "sam_proposals": raw_count, "selected_contours": len(result),
+                "appearance_model": appearance,
+                "timing_seconds": {"appearance": feature_seconds, "guided_proposals": proposal_seconds,
+                                   "sam": sam_seconds, "refinement": time.perf_counter() - refinement_started,
+                                   "total_including_initial_model_load": time.perf_counter() - started},
                 "capsid_evidence": {c.id: evidence[c.id] for c in result if c.id in evidence},
-                "note": ("Dense-core filter with bounded polygonal boundaries; "
-                         "not a trained or calibrated capsid classifier."
+                "note": ("Positive-unlabeled appearance profile guides SAM boxes and bounded polygonal cores; "
+                         "scores are not calibrated capsid probabilities."
+                         if profile is not None else
+                         "Dense-core texture filter with bounded polygonal boundaries; no trained appearance profile."
                          if is_capsid else "Unclassified generic SAM proposals."),
             }
             self._automatic_image_key, self._automatic_result = key, result
@@ -1156,11 +1672,9 @@ class SamRecognizer:
         except Exception as exc:
             raise RecognitionError(
                 f"SAM automatic proposals failed: {exc}. For memory errors, reduce "
-                "points_per_batch or select CPU; for missing targets, use a box/point prompt.") from exc
+                "the selected screen area or points_per_batch; for missing targets, use a box/point prompt.") from exc
         finally:
             self._active_cancel = None
-            # Automatic generator resets its own predictor. It does not replace
-            # the independent prompted predictor's cached image embedding.
 
     def close(self) -> None:
         """Release model/cache resources when no inference is running."""
@@ -2923,6 +3437,31 @@ class ScreenOverlay(_ScreenSurface):
             self.canvas.delete("all")
         self._mask_photo = None
 
+    def _retire_surface(self):
+        """Release a previous painted buffer without closing the overlay owner.
+
+        Clearing Canvas items on a withdrawn layered HWND does not clear the
+        compositor's last frame. New strokes, selections, and mask sets must
+        not remap that HWND. The control panel is a separate persistent window.
+        """
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen overlay is closed.")
+        if self.window is not None:
+            self.hide()
+            self.clear()
+            self.window.destroy()
+            self.window = self.canvas = None
+
+    def begin_selection(self):
+        """Prepare a fresh hidden, blank surface for a region or box gesture.
+
+        A selection can follow displayed contours or an earlier selection.
+        Retire that painted window before showing any new selection geometry.
+        """
+        self._retire_surface()
+        self._ensure()
+
     def begin_trace(self, screen_xy):
         """Start a manual stroke on a fresh native annotation surface.
 
@@ -2937,11 +3476,7 @@ class ScreenOverlay(_ScreenSurface):
             raise OverlayError("The screen overlay is closed.")
         # Validate before retiring the old surface so bad input has no effect.
         points = [_screen_xy(*point) for point in screen_xy]
-        if self.window is not None:
-            self.hide()
-            self.clear()
-            self.window.destroy()
-            self.window = self.canvas = None
+        self._retire_surface()
         self.draw_trace(points)
 
     def draw_trace(self, screen_xy):
@@ -2961,8 +3496,19 @@ class ScreenOverlay(_ScreenSurface):
                                      outline="#63dbe9", width=2, tags="region")
 
     def draw_masks(self, candidates, geometry: CaptureGeometry, selected_ids=(), preview=None):
-        self._ensure()
+        """Prepare a complete current mask set on a fresh hidden surface.
+
+        In semi-auto mode the previous surface was hidden during picking and
+        can still contain the completed contour in its native painted buffer.
+        Validate the new bitmap before retiring it, then populate the new
+        canvas before the controller calls show(). No old contour is remapped.
+        """
+        self._check_thread()
+        if self.closed:
+            raise OverlayError("The screen overlay is closed.")
         bitmap = _mask_image(candidates, geometry, selected_ids, preview)
+        self._retire_surface()
+        self._ensure()
         if self._photo_factory is None:
             from PIL import ImageTk
             self._photo_factory = ImageTk.PhotoImage
@@ -4060,7 +4606,7 @@ class ScreenPickerApp:
             self._hide_overlays()
             bounds = CaptureGeometry(0, 0, width, height)
             self.input_kind = "region"
-            self.ensure_overlay().clear()
+            self.ensure_overlay().begin_selection()
             self.overlay.show()
             self.input_surface = InputSurface(self.root, bounds, self._input_press,
                                               self._input_move, self._input_release,
@@ -4180,6 +4726,9 @@ class ScreenPickerApp:
         self._show_panel()
         self._close_input()
         if self.mode == "manual" or self.geometry is None or not self.candidates:
+            if self.overlay is not None:
+                self.overlay.hide()
+                self.overlay.clear()
             return
         overlay = self.ensure_overlay()
         overlay.draw_masks(self.candidates, self.geometry, selected_ids=[c.id for c in self.candidates])
@@ -4211,7 +4760,7 @@ class ScreenPickerApp:
             self._hide_overlays()
             self._check_panel_clear(self.geometry)
             self.input_kind = "box"
-            self.ensure_overlay().clear()
+            self.ensure_overlay().begin_selection()
             self.overlay.draw_region(self.geometry)
             self.overlay.show()
             self.input_surface = InputSurface(self.root, self.geometry, self._input_press,
@@ -4662,9 +5211,9 @@ class ScreenPickerApp:
             self.ttk.Button(frame, text="Browse…", command=browse).grid(row=1, column=2, padx=4)
             for index, (label, variable, values) in enumerate((("Device", self.device, ("auto", "cpu", "cuda")),
                                                                ("Model type", self.model_type, ("vit_b", "vit_l", "vit_h")),
-                                                               ("Detection profile", self.automatic_profile, ("capsid", "generic"))), 2):
+                                                               ("Detection profile", self.automatic_profile, ("capsid", "capsid-learned", "generic"))), 2):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
-                self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=10).grid(row=index, column=1)
+                self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=18 if label == "Detection profile" else 10).grid(row=index, column=1)
             for index, (label, variable, low, high, step) in enumerate((("Automatic grid / side", self.grid_side, 4, 32, 1),
                                                                         ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01)), 5):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
@@ -4676,7 +5225,7 @@ class ScreenPickerApp:
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Label(frame, text="capsid: dense interiors; generic: all SAM regions", wraplength=410).grid(
+            self.ttk.Label(frame, text="capsid: existing dense-interior filter (default).\ncapsid-learned: learned capsids — experimental; review contours.\ngeneric: all SAM regions.", wraplength=410).grid(
                 row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
             self.ttk.Label(frame, text="Click delay is in seconds. 0 removes the added wait; increase it if cryoSPARC misses picks.",
                            wraplength=410).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -4762,7 +5311,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
@@ -5225,7 +5774,40 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
                             (geometry.height, geometry.width))
         candidates.append(make_candidate(mask, source="synthetic lifecycle check"))
     completed = []
+    annotation_presentations, retired_windows = [], []
+    panel_handle = int(root.winfo_id())
     delayed_fraction = 0.0
+
+    def inspect_annotation(expected_candidates):
+        # Inspect the actual Tk PhotoImage attached to the sole Canvas item,
+        # not a second rendering through the production outline function.
+        from PIL import ImageTk
+        overlay = picker.overlay
+        if overlay is None or not overlay.visible or overlay._mask_photo is None:
+            raise RuntimeError("Remaining contours have no visible annotation bitmap.")
+        items = overlay.canvas.find_all()
+        if (len(items) != 1 or len(overlay.canvas.find_withtag("masks")) != 1
+                or overlay.canvas.itemcget(items[0], "image") != str(overlay._mask_photo)):
+            raise RuntimeError("A previous annotation remained alongside the current mask bitmap.")
+        pixels = np.asarray(ImageTk.getimage(overlay._mask_photo).convert("RGB"))
+        painted = np.any(pixels != TRANSPARENT_RGB, axis=2)
+        remaining = np.zeros((geometry.height, geometry.width), dtype=bool)
+        for candidate in expected_candidates:
+            remaining |= candidate.mask
+            if not np.any(painted & candidate.mask):
+                raise RuntimeError("A remaining contour disappeared from its annotation bitmap.")
+        if np.any(painted & ~remaining):
+            raise RuntimeError("Completed contours or stale geometry remained in the annotation bitmap.")
+        if any(window.winfo_exists() for window in retired_windows):
+            raise RuntimeError("A retired contour window was reused or remained alive.")
+        annotation_presentations.append({
+            "tk_window": str(overlay.window),
+            "native_window": int(overlay.window.winfo_id()),
+            "remaining_contour_ids": [candidate.id for candidate in expected_candidates],
+            "only_remaining_contours_in_bitmap": True,
+            "one_current_canvas_image": True,
+        })
+
     try:
         picker.desktop, picker.hotkeys, picker.mouse_observer = desktop, Hooks(), Hooks()
         picker.geometry, picker.target = geometry, 12345
@@ -5240,6 +5822,9 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
         picker._present_masks()
         root.update()
         for index, candidate in enumerate(candidates):
+            inspect_annotation(candidates[index:])
+            previous_annotation = picker.overlay.window
+            previous_canvas = picker.overlay.canvas
             surface = picker.input_surface
             if surface is None or not surface.visible:
                 raise RuntimeError(f"Clickable overlay missing before contour {index+1}.")
@@ -5262,10 +5847,21 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
             root.update()
             if picker.disabled.get() or any(c.id == candidate.id for c in picker.candidates):
                 raise RuntimeError(f"Contour {index+1} failed: {picker.status.get()}")
-            if root.state() != "normal" or not root.winfo_viewable():
+            if (picker.root is not root or int(root.winfo_id()) != panel_handle
+                    or root.state() != "normal" or not root.winfo_viewable()
+                    or not root.tk.getboolean(root.attributes("-topmost"))):
                 raise RuntimeError(f"Control panel disappeared after contour {index+1}.")
             if index < len(candidates)-1 and (picker.input_surface is None or not picker.input_surface.visible):
                 raise RuntimeError(f"Next contour was not selectable after contour {index+1}.")
+            if index < len(candidates)-1:
+                if (picker.overlay.window is previous_annotation
+                        or picker.overlay.canvas is previous_canvas
+                        or previous_annotation.winfo_exists() or previous_canvas.winfo_exists()):
+                    raise RuntimeError("Semi-auto remapped the previous contour's painted window.")
+                retired_windows.append(previous_annotation)
+            elif (picker.overlay.visible or picker.overlay.canvas.find_all()
+                    or picker.overlay._mask_photo is not None or picker.input_surface is not None):
+                raise RuntimeError("The final contour left a visible or uncleared annotation surface.")
             completed.append(len(desktop.clicks))
             if index == 0:
                 desktop.paint_delayed_markers()
@@ -5280,8 +5876,14 @@ def _smoke_repeated_screen_picks(picker) -> dict[str, Any]:
                 "delayed_marker_changed_fraction": delayed_fraction,
                 "separate_worker_jobs": True, "real_tk_input_events": True,
                 "remaining_contours_selectable": True, "panel_visible_throughout": True,
+                "panel_identity_preserved": True,
+                "fresh_annotation_surface_after_selection": True,
+                "retired_annotation_windows_destroyed": len(retired_windows),
+                "completed_contours_absent_from_bitmaps": True,
+                "final_annotation_cleared": True,
+                "annotation_presentations": annotation_presentations,
                 "unique_test_picks": len(desktop.clicks), "desktop_events_sent": 0,
-                "note": "Real controller/worker/Windows overlays; in-memory target and click sink, not cryoSPARC."}
+                "note": "Real controller/worker/Windows overlays; in-memory target and click sink, not cryoSPARC. Checks window retirement and actual Tk bitmap contents, not every compositor frame."}
     finally:
         picker.stop()
         if not picker.runner.shutdown(wait=True, timeout=5):
@@ -5814,6 +6416,38 @@ def _smoke_sam(checkpoint: Path) -> dict[str, Any]:
         recognizer.close()
 
 
+def _smoke_capsid_profile(checkpoint: Path) -> dict[str, Any]:
+    """Resolve the production sidecar and execute its actual numeric model.
+
+    Public builds normally have no learned profile and retain the existing
+    detector. The installer integration check supplies a nonprivate constant
+    model whose expected output can be verified independently after install.
+    """
+    path = resolve_profile_path(checkpoint)
+    if path is None:
+        return {"profile_status": "missing", "fallback_used": True,
+                "profile_inference_executed": False,
+                "note": "No optional capsid profile; the existing capsid heuristic remains available."}
+    profile = load_profile(path)
+    yy, xx = np.mgrid[:96, :128]
+    grey = (70 + (xx * 3 + yy * 5) % 80).astype(np.uint8)
+    rgb = np.repeat(grey[..., None], 3, axis=2)
+    scores = score_image(rgb, profile)
+    if (scores.shape != rgb.shape[:2] or not np.isfinite(scores).all()
+            or np.any(scores < 0) or np.any(scores > 1)):
+        raise RuntimeError("The capsid profile returned an invalid inference map.")
+    return {"profile_status": "loaded", "fallback_used": False,
+            "profile_inference_executed": True,
+            "profile_path": profile.path, "profile_sha256": profile.sha256,
+            "format": profile.format,
+            "inference": {"input_shape": list(rgb.shape), "score_shape": list(scores.shape),
+                          "scored_pixels": int(scores.size), "minimum": float(scores.min()),
+                          "maximum": float(scores.max()), "mean": float(scores.mean(dtype=np.float64)),
+                          "score_sha256": hashlib.sha256(scores.astype("<f4").tobytes()).hexdigest()},
+            "score_is_calibrated_probability": False,
+            "note": "Actual profile inference on a synthetic image; not recognition accuracy."}
+
+
 def run_smoke_test(checkpoint: Path, log_path: Path) -> dict[str, Any]:
     """Noninteractive build validation; deliberately never sends desktop input."""
     report = diagnostic_report(log_path, checkpoint)
@@ -5827,6 +6461,7 @@ def run_smoke_test(checkpoint: Path, log_path: Path) -> dict[str, Any]:
         report["checks"].append({"name": "windows_runtime", "status": "skipped",
                                   "reason": "Requires the Windows build host."})
     checks.append(("sam_cpu_inference", lambda: _smoke_sam(checkpoint)))
+    checks.append(("capsid_profile", lambda: _smoke_capsid_profile(checkpoint)))
     for name, function in checks:
         started = time.perf_counter()
         try:
@@ -6834,8 +7469,8 @@ def build_parser():
     parser.add_argument("--box", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--point", nargs=3, action="append", type=float, metavar=("X", "Y", "LABEL"), help="Repeatable foreground(1)/background(0) prompt.")
     parser.add_argument("--points-per-side", type=int, default=8)
-    parser.add_argument("--automatic-profile", choices=("capsid", "generic"), default="capsid",
-                        help="Automatic recognition profile; generic retains unclassified SAM proposals.")
+    parser.add_argument("--automatic-profile", choices=("capsid", "capsid-learned", "generic"), default="capsid",
+                        help="capsid keeps the existing filter; capsid-learned selects the optional experimental profile; generic returns unclassified SAM proposals.")
     parser.add_argument("--spacing", type=int, default=13)
     parser.add_argument("--inset", type=float, default=2)
     parser.add_argument("--output", type=Path, help="Headless segmentation output directory; defaults to writable user data when installed.")

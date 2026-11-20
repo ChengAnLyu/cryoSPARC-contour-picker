@@ -78,11 +78,15 @@ class Surface:
         self.closed = True
     def clear(self):
         self.traces = []
+        self.masks = []
     def draw_trace(self, points):
         self.traces.append(tuple(points))
     def begin_trace(self, points):
         self.clear()
         self.draw_trace(points)
+    def begin_selection(self):
+        self.hide()
+        self.clear()
     def draw_masks(self, candidates, geometry, selected_ids=(), preview=None):
         self.masks = list(candidates)
     def draw_region(self, geometry):
@@ -694,6 +698,9 @@ class ScreenControllerTests(unittest.TestCase):
                 self.assertEqual(app.desktop.clicks, observed_clicks)
                 self.assertFalse(app.disabled.get())
                 self.assertEqual([item.id for item in app.candidates], [item.id for item in candidates[number+1:]])
+                self.assertEqual([item.id for item in app.overlay.masks],
+                                 [item.id for item in candidates[number+1:]])
+                self.assertEqual(app.overlay.visible, number < len(candidates)-1)
                 self.assertFalse(app.root.hidden)
                 self.assertFalse(app.root.destroyed)
             self.assertIsNone(app.input_surface)

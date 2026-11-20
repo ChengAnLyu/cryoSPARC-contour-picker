@@ -3,7 +3,7 @@
 This directory turns the source into an installed Windows x64 application. The
 installer includes the Python interpreter, Tcl/Tk, CPU PyTorch/torchvision,
 desktop automation libraries, and the original SAM ViT-B weights. End users
-install `SARU-Picker-Setup-2.5.0-win64.exe` and open **SARU Picker** from the Start
+install `SARU-Picker-Setup-2.6.0-win64.exe` and open **SARU Picker** from the Start
 menu or desktop shortcut. The installed application does not download models.
 
 The source archive is not itself an installer. A successful Windows workflow
@@ -166,7 +166,7 @@ acceptance test until those steps have actually been completed.
 Build outputs:
 
 - `dist/SARU_Picker/`: full portable application directory.
-- `artifacts/SARU-Picker-Setup-2.5.0-win64.exe`: Windows installer.
+- `artifacts/SARU-Picker-Setup-2.6.0-win64.exe`: Windows installer.
 - `artifacts/frozen-smoke-test.json`: frozen application validation.
 - `artifacts/installed-smoke-test.json`: installation validation when requested.
 - `artifacts/build-manifest.json`: versions, source commit, and model checksum.
@@ -174,3 +174,8 @@ Build outputs:
 
 Review these reports and exercise normal capture, mask review, hotkeys, and
 live-click alignment on the intended workstation before a production release.
+
+
+## Optional learned profile in version 2.6
+
+The public build includes the profile inference module but rejects a private `capsid-profile.json` embedded in its distribution. Setup optionally copies that external sidecar from its own folder into `_internal/models`. Installer verification generates a nonprivate constant-score fixture, requires actual installed profile inference, and checks its bytes, SHA-256, resolved path and numeric outputs independently. The temporary build fixture directory is removed after testing; verification reports remain in `artifacts`. `capsid-profile-install-verification.json` accompanies the verified installer. See [CAPSID_PROFILE.md](../CAPSID_PROFILE.md).

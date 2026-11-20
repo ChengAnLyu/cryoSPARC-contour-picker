@@ -242,6 +242,133 @@ class ScreenSurfaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dimensions"):
             _mask_image([candidate], CaptureGeometry(30, 40, 9, 7))
 
+    def test_each_remaining_mask_set_retires_old_surface_before_mapping(self):
+        geometry = CaptureGeometry(100, 200, 60, 30)
+        candidates = []
+        for index, left in enumerate((2, 22, 42)):
+            mask = np.zeros((30, 60), bool)
+            mask[5:25, left:left+14] = True
+            candidates.append(SimpleNamespace(id=str(index), mask=mask))
+        photo_factory = lambda bitmap, master: SimpleNamespace(
+            pixels=np.asarray(bitmap).copy(), master=master)
+        overlay = ScreenOverlay(self.root, photo_factory=photo_factory, **self.options)
+        overlay.draw_masks(candidates, geometry)
+        overlay.show()
+        for completed_count in (1, 2):
+            previous_window, previous_canvas = overlay.window, overlay.canvas
+            previous_photo = overlay._mask_photo
+            previous_calls = list(previous_window.calls)
+            overlay.hide()
+            # Logical repaint while withdrawn is not evidence that Windows
+            # has discarded the old layered-window pixels. The HWND itself
+            # must be retired, with the replacement populated before mapping.
+            overlay.draw_masks(candidates[completed_count:], geometry)
+            self.assertTrue(previous_window.destroyed)
+            self.assertIsNot(overlay.window, previous_window)
+            self.assertIsNot(overlay.canvas, previous_canvas)
+            self.assertIsNot(overlay._mask_photo, previous_photo)
+            self.assertIs(overlay._mask_photo.master, overlay.window)
+            self.assertFalse(overlay.visible)
+            self.assertNotIn(("state", "normal"), overlay.window.calls)
+            self.assertEqual(len(overlay.canvas.items), 1)
+            self.assertEqual(overlay.canvas.items[0][2]["tags"], "masks")
+            pixels = overlay._mask_photo.pixels
+            for candidate in candidates[:completed_count]:
+                self.assertTrue(np.all(pixels[candidate.mask] == TRANSPARENT_RGB))
+            for candidate in candidates[completed_count:]:
+                self.assertTrue(np.any(pixels[candidate.mask] != TRANSPARENT_RGB))
+            overlay.show()
+            self.assertEqual(previous_window.calls.count(("state", "normal")),
+                             previous_calls.count(("state", "normal")))
+            self.assertEqual(sum(not window.destroyed for window in self.root.windows), 1)
+            self.assertEqual(self.styles.raised[-1], self.root.winfo_id())
+        overlay.close()
+        self.assertTrue(all(window.destroyed for window in self.root.windows))
+
+    def test_invalid_mask_replacement_preserves_current_surface(self):
+        geometry = CaptureGeometry(100, 200, 20, 16)
+        candidate = SimpleNamespace(id="one", mask=np.ones((16, 20), bool))
+        photo_factory = lambda bitmap, master: object()
+        overlay = ScreenOverlay(self.root, photo_factory=photo_factory, **self.options)
+        overlay.draw_masks([candidate], geometry)
+        overlay.show()
+        previous_window, previous_photo = overlay.window, overlay._mask_photo
+        with self.assertRaisesRegex(ValueError, "dimensions"):
+            overlay.draw_masks([candidate], CaptureGeometry(100, 200, 21, 16))
+        self.assertIs(overlay.window, previous_window)
+        self.assertIs(overlay._mask_photo, previous_photo)
+        self.assertFalse(previous_window.destroyed)
+        self.assertTrue(overlay.visible)
+
+    def test_region_and_box_selection_never_remap_the_previous_annotation(self):
+        from screen_app import ScreenPickerApp
+
+        geometry = CaptureGeometry(100, 200, 60, 30)
+        candidate = SimpleNamespace(id="previous", mask=np.ones((30, 60), bool))
+        for method, kind in (("select_region", "region"), ("box_prompt", "box")):
+            with self.subTest(method=method):
+                overlay = ScreenOverlay(self.root, photo_factory=lambda *a, **k: object(), **self.options)
+                overlay.draw_masks([candidate], geometry)
+                overlay.show()
+                old_window, old_canvas = overlay.window, overlay.canvas
+                old_maps = old_window.calls.count(("state", "normal"))
+                app = ScreenPickerApp.__new__(ScreenPickerApp)
+                app.root, app.overlay = self.root, overlay
+                app.mode, app.geometry = "semi-auto", geometry
+                app.desktop = SimpleNamespace(size=lambda: (800, 600))
+                app.runner = SimpleNamespace(busy=False)
+                app.advanced = app.input_surface = app.input_kind = app.input_start = None
+                app.transition = app.drawing = False
+                app.auto_remaining = 0
+                app.panel_bounds = self.styles.panel_rectangle
+                app._gate_manual = app._remember_panel = lambda: None
+                app._show_panel = lambda: keep_control_panel_above(
+                    self.root, style_api=self.styles, platform_name="Windows")
+                app.stop = lambda: None
+                app._error = lambda error: self.fail(str(error))
+                with patch("screen_app.InputSurface", side_effect=lambda *a, **k: InputSurface(
+                        *a, **k, **self.options)):
+                    getattr(app, method)()
+                self.assertTrue(old_window.destroyed)
+                self.assertIsNot(overlay.window, old_window)
+                self.assertIsNot(overlay.canvas, old_canvas)
+                self.assertEqual(old_window.calls.count(("state", "normal")), old_maps)
+                self.assertIsNone(overlay._mask_photo)
+                self.assertEqual([item[2]["tags"] for item in overlay.canvas.items],
+                                 ["region"] if kind == "box" else [])
+                self.assertEqual(app.input_kind, kind)
+                self.assertTrue(app.input_surface.visible)
+                self.assertTrue(overlay.visible)
+                self.assertEqual(self.styles.raised[-1], self.root.winfo_id())
+                app.input_surface.close()
+                overlay.close()
+                self.assertTrue(all(window.destroyed for window in self.root.windows))
+
+    def test_failed_mask_photo_never_maps_partial_surface_and_can_recover(self):
+        candidate = SimpleNamespace(id="one", mask=np.ones((16, 20), bool))
+        geometry = CaptureGeometry(100, 200, 20, 16)
+        overlay = ScreenOverlay(self.root, photo_factory=lambda *a, **kw: object(), **self.options)
+        overlay.draw_masks([candidate], geometry)
+        overlay.show()
+        previous = overlay.window
+        def failed_photo(*args, **kwargs):
+            raise RuntimeError("synthetic photo allocation failure")
+        overlay._photo_factory = failed_photo
+        with self.assertRaisesRegex(RuntimeError, "allocation failure"):
+            overlay.draw_masks([candidate], geometry)
+        failed_window = overlay.window
+        self.assertTrue(previous.destroyed)
+        self.assertFalse(overlay.visible)
+        self.assertNotIn(("state", "normal"), failed_window.calls)
+        self.assertEqual(overlay.canvas.items, [])
+        self.assertIsNone(overlay._mask_photo)
+        overlay._photo_factory = lambda *a, **kw: object()
+        overlay.draw_masks([candidate], geometry)
+        overlay.show()
+        self.assertTrue(failed_window.destroyed)
+        self.assertTrue(overlay.visible)
+        self.assertEqual(sum(not window.destroyed for window in self.root.windows), 1)
+
     def test_trace_box_region_and_points_use_unscaled_screen_coordinates(self):
         overlay = ScreenOverlay(self.root, **self.options)
         overlay.draw_trace([(110, 205), (121, 217)])

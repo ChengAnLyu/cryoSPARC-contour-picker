@@ -1,6 +1,6 @@
 ; Inno Setup 6.3+ / 7. Build through packaging/build.ps1.
 #ifndef AppVersion
-  #define AppVersion "2.5.0"
+  #define AppVersion "2.6.0"
 #endif
 #ifndef AppSourceDir
   #define AppSourceDir "..\dist\SARU_Picker"
@@ -41,6 +41,8 @@ Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdi
 ; Optional sidecars remain beside Setup and are never part of the public build.
 Source: "{src}\app-icon.png"; DestDir: "{app}\_internal\assets"; Flags: external ignoreversion skipifsourcedoesntexist
 Source: "{src}\app-icon.ico"; DestDir: "{app}\_internal\assets"; Flags: external ignoreversion skipifsourcedoesntexist
+; The learned capsid profile stays private and is read as bounded JSON data.
+Source: "{src}\capsid-profile.json"; DestDir: "{app}\_internal\models"; Flags: external ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\SARU Picker"; Filename: "{app}\SARU Picker.exe"; WorkingDir: "{app}"; IconFilename: "{app}\_internal\assets\app-icon.ico"; AppUserModelID: "SARU.Picker.Desktop"
