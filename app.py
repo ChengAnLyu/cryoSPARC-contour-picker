@@ -48,7 +48,7 @@ from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fr
 from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.7.2"
+APP_VERSION = "2.8.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 

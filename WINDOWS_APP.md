@@ -1,12 +1,18 @@
-# SARU Picker 2.7.2 for Windows
+# SARU Picker 2.8.0 for Windows
 
-Install **SARU-Picker-Setup-2.7.2-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.8.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
 to the installed application, its EXE and its shortcuts. The setup EXE itself
 uses the public geometric icon. Setup also works without the optional sidecars,
 using that fallback for the installed app.
+
+## Version 2.8.0: training with confirmed blank examples
+
+The private download combines examples 1–120 to update the learned appearance profile. Large-capsid markings are confirmed positives; the 43 confirmed blank images provide explicit negative supervision, including their carbon edges, debris and other unwanted structures. Other unmarked areas remain unknown. Keep `capsid-profile.json` beside setup during installation and choose **Advanced → Detection profile → capsid-learned**. The private guide contains the measured comparison and model identity.
+
+This update preserves manual picking, the floating panel, repeated semi-auto selection, auto navigation, speed settings, carbon checks and the 3,500-screen-pixel minimum automatic contour area. The default `capsid` heuristic and the SAM checkpoint are unchanged. A negative training example means no wanted large-capsid picks in that image; it need not be visually empty.
 
 ## Version 2.7.2: repeated semi-auto selections
 

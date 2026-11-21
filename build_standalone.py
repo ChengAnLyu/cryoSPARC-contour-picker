@@ -16,7 +16,7 @@ def build(destination: Path | None = None) -> Path:
     names = ("application_icon", "capsid_prior", "carbon_support", "capsid", "recognition", "execution", "desktop", "manual_sampling", "micrograph_navigation", "screen_overlay", "screen_app", "app")
     sections = [
         '#!/usr/bin/env python3\n',
-        '"""SARU Picker 2.7.2: direct screen contours and model-assisted desktop picking.\n',
+        '"""SARU Picker 2.8.0: direct screen contours and model-assisted desktop picking.\n',
         'Generated from the companion tested modules. Run python main.py --help.\n',
         '"""\nfrom __future__ import annotations\n\n',
     ]

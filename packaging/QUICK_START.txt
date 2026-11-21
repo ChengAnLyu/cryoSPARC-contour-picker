@@ -1,4 +1,4 @@
-SARU Picker 2.7.2 — Windows CPU edition
+SARU Picker 2.8.0 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -36,8 +36,8 @@ hidden. Each remaining proposal is checked against actual completed picks.
 A covered selection now says it is already covered, and a contour with no grid
 sites reports the current spacing. Later valid contours remain selectable.
 When none remain, the status points to Next micrograph or Detect. The log records
-raw, blocked, eligible and sent counts. Manual behavior and model weights stay
-the same; the 3,500-screen-pixel automatic capsid cutoff is retained.
+raw, blocked, eligible and sent counts. This selection behavior is retained in
+2.8.0, along with the 3,500-screen-pixel automatic capsid cutoff.
 
 SEMI-AUTO
 Move the panel outside the intended micrograph area. Select screen area,
@@ -84,10 +84,12 @@ browser still need time to process picks; detection and image loading are
 separate. Use the lowest setting that registers reliably on your workstation.
 
 DETECTION
-The private 2.7.0 profile is trained with examples 1-80. Model selection gives
-large capsids and their contour boundaries priority; small-target gains are
-secondary. Compact interior seeds can recover capsids whose attached support
-previously prevented a SAM query. Final shape and carbon checks still apply.
+The private 2.8.0 profile is trained with examples 1-120. It uses confirmed
+large-capsid markings as positives and 43 confirmed blank images as negatives.
+Small markings and unmarked areas in other images remain unknown. Negative
+training includes carbon edges, debris and other unwanted structures within
+the confirmed blank images. Model selection balances blank-image false picks
+against coverage of known large capsids. Final shape and carbon checks apply.
 
 The default capsid profile retains the earlier texture heuristic. The
 capsid-learned option uses the experimental appearance model to locate dense
@@ -98,7 +100,7 @@ this option has not replaced the default detector. Its screen selection must
 contain no more than 4,194,304 pixels; select a smaller region if asked.
 Neither path guarantees every target or excludes every membrane fragment.
 The learned score is not a calibrated capsid probability; SAM weights remain
-unchanged. Unmarked regions in sparse examples are not negative labels.
+unchanged. Unmarked regions in nonblank examples are not negative labels.
 Review the contours in semi-auto before running automatic picking.
 Advanced > Detection profile > generic restores unclassified SAM proposals.
 
@@ -133,4 +135,4 @@ Both capsid profiles now skip final connected regions below 3,500 screen pixels.
 Advanced > Minimum capsid area (screen px²) changes this cutoff; 0 allows all
 sizes. Zoom changes apparent size. Manual drawing and Box prompts are unchanged.
 Changing recognition settings clears old proposals; choose Detect again.
-This is a size-filter update using the unchanged 80-example appearance profile.
+The size filter is retained in 2.8.0 alongside the updated 120-example profile.

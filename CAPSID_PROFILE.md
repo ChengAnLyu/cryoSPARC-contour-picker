@@ -1,6 +1,6 @@
 # Experimental learned capsid appearance profile
 
-SARU Picker 2.7 can use a locally trained capsid appearance profile alongside the existing SAM ViT-B checkpoint. The floating panel, manual drawing, contour selection and click executor remain the same. The appearance profile is separate from SAM; installing it does not fine-tune or replace SAM's weights.
+SARU Picker 2.8 can use a locally trained capsid appearance profile alongside the existing SAM ViT-B checkpoint. The floating panel, manual drawing, contour selection and click executor remain the same. The appearance profile is separate from SAM; installing it does not fine-tune or replace SAM's weights.
 
 ## Install and select
 
@@ -26,6 +26,18 @@ Positive-unlabeled learning is an appropriate reference for this incomplete-labe
 - [Kiryo et al., Non-negative PU learning (2017)](https://arxiv.org/abs/1703.00593).
 
 Selecting only the most confident positives introduces selection bias. The positive prevalence used by PU learning is also an assumption. Consequently, this profile's bounded score must not be described as a calibrated probability that a region is a capsid.
+
+## Confirmed large positives and blank images in 2.8.0
+
+The private 120-example update adds explicit supervision supplied by the user: the blank images in examples 1–80 and all 40 images in examples 81–120 are confirmed negatives for wanted large-capsid picks. The earlier large-capsid markings are confirmed positives. Small markings and other unmarked pixels in nonblank images are not relabeled as negatives. The combined manifest records the confirmation, exact positive region IDs and source-deck hashes for every image.
+
+`--positive-policy confirmed-large` uses only those explicitly confirmed IDs. `--negative-weight` adds a separate logistic loss on valid pixels from confirmed blank images to the existing non-negative positive-unlabeled objective. Confirmed blanks do not enter the unlabeled pool in this mode. Negative batches give each confirmed blank screenshot equal expected weight; `--positive-sampling case-balanced` does the same for positive screenshots. `--positive-prior` exposes the assumed prevalence in the unlabeled pool and defaults to 0.15. Legacy policies with zero negative weight retain the original sampling and loss behavior.
+
+For this dataset, large marked extents are identified by at least 5,000 annotated screen pixels and a nonempty six-pixel-eroded valid core. This yields 95 usable large regions in 55 images. The training selection is an annotation-based size proxy, distinct from the unchanged 3,500-pixel final runtime contour cutoff. The 43 blank images include debris, support-film edges and small objects that should not trigger wanted picks. Only invalid screenshot margins are excluded from their negative masks.
+
+Ten grouped folds hold out each of the 120 examples once. The earlier 80 examples retain their prior fold membership; the new blank examples are added before looking at model results. All three sample pools, feature normalizers, parameters, row indices and batch-draw evidence are bound to the training split. Candidate selection checks actual production SAM contours on held-out images, balancing false picks on confirmed blanks against coverage of the confirmed large marked cores. The release evidence distinguishes this internal candidate comparison from the final profile fitted on all 120 examples. It does not claim independent external validation or calibrated biological probabilities.
+
+The public repository contains the trainer and inference implementation. The private bundle supplies the trained profile, data provenance and measured results. Only `capsid-learned` loads these weights; the default `capsid` heuristic and SAM checkpoint are unchanged.
 
 ## Training with additional examples in 2.7.0
 

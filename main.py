@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.7.2: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 2.8.0: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
@@ -5918,7 +5918,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.7.2"
+APP_VERSION = "2.8.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 
