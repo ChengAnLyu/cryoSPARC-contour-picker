@@ -10,6 +10,8 @@ models/
 capsid-profile.json
 *.pth
 *.pt
+*.h5
+/logs/
 *.log
 benchmark_output/
 validation_results/

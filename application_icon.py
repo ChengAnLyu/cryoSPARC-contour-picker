@@ -25,7 +25,7 @@ def application_icon_paths() -> tuple[Path, Path]:
     return base / "assets" / "app-icon.ico", base / "assets" / "app-icon.png"
 
 
-def configure_application_identity() -> bool:
+def configure_application_identity(application_id: str = APPLICATION_USER_MODEL_ID) -> bool:
     """Give source and installed Windows launches the same taskbar identity.
 
     Invoke before creating the first Tk window. Failure to set this optional
@@ -38,7 +38,7 @@ def configure_application_identity() -> bool:
         setter = shell32.SetCurrentProcessExplicitAppUserModelID
         setter.argtypes = [ctypes.c_wchar_p]
         setter.restype = ctypes.c_long
-        result = setter(APPLICATION_USER_MODEL_ID)
+        result = setter(application_id)
         if result != 0:
             raise OSError(f"SetCurrentProcessExplicitAppUserModelID returned {result:#x}.")
         return True

@@ -1,0 +1,37 @@
+SARU Picker crYOLO — parallel 2.9.0 edition
+
+This is a separate application. It does not replace the SAM edition.
+
+1. Keep cryolo-capsids.h5, cryolo-config.json, capsid-profile.json and the two
+   app-icon files beside the crYOLO Setup program before running Setup.
+2. Install the separate crYOLO CPU runtime once. Open PowerShell in the
+   installed application directory and run:
+
+       powershell -ExecutionPolicy Bypass -File .\setup-runtime.ps1
+
+   The script downloads stock crYOLO and a private Python 3.7 interpreter if
+   required. It does not change your system PATH or the SAM installation.
+   An internet connection is needed. crYOLO is provided for non-commercial
+   academic/research use under its own license:
+   https://cryolo-doc.readthedocs.io/en/stable/other/license.html
+
+   If you already have a working crYOLO installation, skip this step and
+   select its Python executable in Advanced instead.
+3. Launch SARU Picker crYOLO. Use the same manual, semi-auto and auto controls,
+   screen selection, sampling spacing, click delay and Next micrograph flow.
+4. Advanced shows the crYOLO weights/config/runtime and detection threshold.
+   The capsid-learned profile uses the supplied 160-example appearance model
+   to trace contours inside the crYOLO detections. The default minimum contour
+   area remains 3,500 screen pixels. Check results at your normal screen zoom.
+
+crYOLO predicts boxes. Its boxes are refined into reviewable contours using
+SARU's existing image-based contour processing; crYOLO does not predict exact
+biological capsid boundaries. Box/point prompts select detections, rather than
+performing SAM-style interactive segmentation. No SAM model is used in this edition.
+
+Diagnostics tests GUI/runtime metadata. Actual model inference additionally
+requires the user's trained H5 model, matching config and installed runtime.
+Public build checks are not a biological accuracy or trained-model benchmark.
+
+Logs and runtime setup reports:
+  %LOCALAPPDATA%\SARU_Picker_crYOLO

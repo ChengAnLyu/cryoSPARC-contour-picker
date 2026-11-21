@@ -61,8 +61,25 @@ class RecognitionConfig:
     automatic_profile: str = "capsid"
     capsid_prior_path: str | None = None
     min_capsid_area_px: int = DEFAULT_MIN_CAPSID_AREA_PX
+    backend: str = "sam"
+    cryolo_config: str | None = None
+    cryolo_python: str | None = None
+    cryolo_threshold: float = 0.3
+    cryolo_timeout: float = 180.0
 
     def __post_init__(self) -> None:
+        if self.backend not in {"sam", "cryolo"}:
+            raise ValueError("backend must be sam or cryolo.")
+        for name in ("cryolo_config", "cryolo_python"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{name} must be a nonempty path string or None.")
+        if (isinstance(self.cryolo_threshold, bool) or not math.isfinite(self.cryolo_threshold)
+                or not 0 <= self.cryolo_threshold <= 1):
+            raise ValueError("cryolo_threshold must be between 0 and 1.")
+        if (isinstance(self.cryolo_timeout, bool) or not math.isfinite(self.cryolo_timeout)
+                or self.cryolo_timeout <= 0):
+            raise ValueError("cryolo_timeout must be positive and finite.")
         if self.model_type not in {"vit_b", "vit_l", "vit_h"}:
             raise ValueError("model_type must be vit_b, vit_l, or vit_h.")
         if self.device not in {"auto", "cpu", "cuda"}:
@@ -280,6 +297,14 @@ def _filter_capsid_area(proposals, minimum_area_px: int, cancel: CancelCheck = N
                              'capsid_evidence': evidence})
     summary['retained_count'] = len(retained)
     return retained, summary
+
+
+def create_recognizer(config: RecognitionConfig):
+    """Select the explicit backend; a missing crYOLO model never falls back to SAM."""
+    if config.backend == "cryolo":
+        from cryolo_recognition import CryoloRecognizer
+        return CryoloRecognizer(config)
+    return SamRecognizer(config)
 
 
 class SamRecognizer:

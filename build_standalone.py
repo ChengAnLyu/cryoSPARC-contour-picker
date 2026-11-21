@@ -13,7 +13,7 @@ from pathlib import Path
 def build(destination: Path | None = None) -> Path:
     directory = Path(__file__).resolve().parent
     destination = destination or directory / "main.py"
-    names = ("application_icon", "capsid_prior", "carbon_support", "capsid", "recognition", "execution", "desktop", "manual_sampling", "micrograph_navigation", "screen_overlay", "screen_app", "app")
+    names = ("application_icon", "capsid_prior", "carbon_support", "capsid", "recognition", "cryolo_recognition", "execution", "desktop", "manual_sampling", "micrograph_navigation", "screen_overlay", "screen_app", "app")
     sections = [
         '#!/usr/bin/env python3\n',
         '"""SARU Picker 2.9.0: direct screen contours and model-assisted desktop picking.\n',
@@ -25,7 +25,7 @@ def build(destination: Path | None = None) -> Path:
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
         removed = set()
-        for node in tree.body:
+        for node in ast.walk(tree):
             skip = isinstance(node, ast.ImportFrom) and (node.module in names or node.module == "__future__")
             skip = skip or (node is tree.body[0] and isinstance(node, ast.Expr)
                             and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))

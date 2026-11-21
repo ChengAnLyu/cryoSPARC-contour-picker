@@ -1,0 +1,96 @@
+name: Build parallel crYOLO Windows edition
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'parallel/**'
+    paths:
+      - '*.py'
+      - 'tests/**'
+      - 'assets/**'
+      - 'packaging/cryolo/**'
+      - '.github/workflows/build-cryolo-windows.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cryolo-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gui-installer:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+      - name: Install verified Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $download = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.1-x64.exe'
+          $compiler = Join-Path $env:RUNNER_TEMP 'Inno Setup 7.1.1'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_1/innosetup-7.1.1-x64.exe' -OutFile $download
+          if ((Get-FileHash $download -Algorithm SHA256).Hash.ToLowerInvariant() -ne '8a5a6711c3766a6e5fb74f280ba0e3551e719ce94538d901fdbd1f8f9920b3f0') { throw 'Compiler checksum mismatch.' }
+          $process = Start-Process -FilePath $download -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$compiler`"" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Compiler setup failed.' }
+          "SARU_CRYOLO_ISCC=$(Join-Path $compiler 'ISCC.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build and verify separate GUI and installer
+        shell: pwsh
+        run: ./packaging/cryolo/build.ps1 -PythonExe (Get-Command python).Source -IsccPath $env:SARU_CRYOLO_ISCC -TestInstaller
+      - name: Upload GUI installer and verification
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-crYOLO-Windows-${{ github.run_number }}
+          path: artifacts/cryolo/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Preserve GUI build diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-crYOLO-GUI-diagnostics-${{ github.run_number }}
+          path: |
+            artifacts/cryolo/**/*.json
+            artifacts/cryolo/**/*.png
+            build/cryolo/pyinstaller/**/warn-*.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  native-cryolo-runtime:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.7'
+          architecture: 'x64'
+      - name: Install upstream CPU runtime and exercise its CLI
+        shell: pwsh
+        run: |
+          $runtime = Join-Path $env:RUNNER_TEMP 'saru-cryolo-env'
+          ./packaging/cryolo/setup-runtime.ps1 -Python37 (Get-Command python).Source -RuntimeDirectory $runtime -Report (Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime-install.json')
+      - name: Exercise stock model inference on synthetic data
+        shell: pwsh
+        run: |
+          $python = Join-Path $env:RUNNER_TEMP 'saru-cryolo-env/Scripts/python.exe'
+          & $python packaging/cryolo/verify_runtime.py artifacts/cryolo-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic runtime inference failed.' }
+      - name: Preserve runtime installation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-crYOLO-runtime-check-${{ github.run_number }}
+          path: |
+            artifacts/cryolo-runtime-install.json
+            artifacts/cryolo-runtime/runtime-inference.json
+            artifacts/cryolo-runtime/synthetic-cli.log
+          if-no-files-found: warn
+          retention-days: 14
