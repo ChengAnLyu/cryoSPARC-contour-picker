@@ -106,10 +106,13 @@ def _stop(process):
     if process.poll() is not None:
         return
     if sys.platform == 'win32':
-        with external_process_environment() as env:
-            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
-                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=20)
+        try:
+            with external_process_environment() as env:
+                subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
     else:
         process.terminate()
     try:

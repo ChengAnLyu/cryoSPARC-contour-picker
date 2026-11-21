@@ -1400,7 +1400,9 @@ class ScreenPickerApp:
             self.profile_selector.grid(row=0, column=1, sticky="w")
             def path_row(index, label, variable, filetypes):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
-                self.ttk.Entry(frame, textvariable=variable, width=38).grid(row=index, column=1, sticky="ew")
+                # Keep paths editable and horizontally scrollable without making
+                # the whole dialog wider than a 1024px desktop at 200% scaling.
+                self.ttk.Entry(frame, textvariable=variable, width=24).grid(row=index, column=1, sticky="ew")
                 def browse():
                     path = self.filedialog.askopenfilename(parent=window, filetypes=filetypes)
                     if path:
@@ -1419,12 +1421,12 @@ class ScreenPickerApp:
                 ("SAM model type", self.model_type, ("vit_b", "vit_l", "vit_h"))), 4):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Combobox(frame, textvariable=variable, values=choices, state="readonly", width=12).grid(row=index, column=1, sticky="w")
-            self.ttk.Label(frame, text="crYOLO confidence threshold").grid(row=6, column=0, sticky="w", pady=3)
+            self.ttk.Label(frame, text="crYOLO confidence").grid(row=6, column=0, sticky="w", pady=3)
             self.ttk.Entry(frame, textvariable=self.cryolo_threshold, width=12).grid(row=6, column=1, sticky="w")
             for index, (label, variable, low, high, step) in enumerate((
                 ("SAM automatic grid / side", self.grid_side, 4, 32, 1),
-                ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01),
-                ("Minimum capsid area (screen px²)", self.min_capsid_area, 0, 1000000, 500)), 7):
+                ("Click delay (s; all modes)", self.click_delay, 0, 2, .01),
+                ("Minimum area (screen px²)", self.min_capsid_area, 0, 1000000, 500)), 7):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
                 self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1, sticky="w")
             index = 10
@@ -1442,7 +1444,7 @@ class ScreenPickerApp:
                     self._present_masks()
             self.ttk.Label(frame, text="capsid, capsid-learned and generic use SAM. crYOLO uses its trained detector with learned contour refinement.",
                            wraplength=settings_wrap).grid(row=index, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Minimum area applies to capsid contours; 0 allows all sizes.",
+            self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
                            wraplength=settings_wrap).grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
             self.ttk.Button(frame, text="Done", command=close_settings).grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)

@@ -146,7 +146,7 @@ at epoch 18. Its SHA-256 is
 The exact H5 weights, fixed 320×320 inference configuration and all-160
 appearance profile are carried forward. No additional model training is claimed.
 
-The Windows installer is `SARU-Picker-crYOLO-Setup-3.0.0-win64.exe`.
+The Windows installer is `SARU-Picker-Setup-3.0.0-win64.exe`.
 Application diagnostics, the EXE's Windows version metadata, the installer and
 release manifest identify version 3.0.0. The four-profile selector keeps SAM and
 crYOLO configuration separate. The managed crYOLO runtime path is retained. Private model sidecars are installed automatically from
