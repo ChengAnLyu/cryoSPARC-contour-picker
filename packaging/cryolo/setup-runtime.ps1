@@ -10,7 +10,7 @@ private environment is repaired. crYOLO itself remains unmodified upstream code.
 [CmdletBinding()]
 param(
     [string]$Python37 = "", # Hidden command-line override; never requested by GUI.
-    [string]$RuntimeDirectory = (Join-Path $env:LOCALAPPDATA "SARU_Picker_crYOLO\cryolo-env"),
+    [string]$RuntimeDirectory = "",
     [string]$Report = "",
     [switch]$ForcePrivatePython,
     [switch]$CheckOnly
@@ -98,27 +98,41 @@ function Copy-PrivateVCRuntime {
     }
 }
 
-$RuntimeDirectory = [IO.Path]::GetFullPath($RuntimeDirectory)
-$ParentDirectory = Split-Path $RuntimeDirectory -Parent
-$RuntimePython = Join-Path $RuntimeDirectory "Scripts\python.exe"
-$OwnerMarker = Join-Path $RuntimeDirectory "saru-cryolo-runtime.json"
-$Started = [DateTime]::UtcNow.ToString("o")
-if (-not $Report) { $Report = Join-Path $ParentDirectory "runtime-install-report.json" }
-$Report = [IO.Path]::GetFullPath($Report)
-Assert-NoReparsePoint $ParentDirectory
-Assert-NoReparsePoint $RuntimeDirectory
-New-Item -ItemType Directory -Force -Path $ParentDirectory | Out-Null
-New-Item -ItemType Directory -Force -Path (Split-Path $Report -Parent) | Out-Null
-$InstallReport = @{ status = "running"; stage = "health-check"; started_utc = $Started;
-    python = $RuntimePython; reused = $false; vc_runtime_files = @(); private_python_requested = [bool]$ForcePrivatePython;
-    cryolo_version = "1.9.9"; tensorflow_version = "1.15.4";
-    scope = "private CPU runtime and upstream initialization weights; no trained capsid model" }
 $Lock = $null
+$InstallReport = $null
 $OldEnvironment = @{}
-foreach ($Name in @('CUDA_VISIBLE_DEVICES', 'TF_CPP_MIN_LOG_LEVEL', 'OMP_NUM_THREADS', 'PYTHONNOUSERSITE', 'PYTHONPATH', 'PYTHONHOME', 'PIP_CONFIG_FILE')) {
+foreach ($Name in @('CUDA_VISIBLE_DEVICES', 'TF_CPP_MIN_LOG_LEVEL', 'OMP_NUM_THREADS', 'PYTHONNOUSERSITE', 'PYTHONPATH', 'PYTHONHOME', 'PIP_CONFIG_FILE', 'PSModulePath')) {
     $OldEnvironment[$Name] = [Environment]::GetEnvironmentVariable($Name, 'Process')
 }
 try {
+    # Inno/Python launched from PowerShell 7 inherits its incompatible module path.
+    # Resolve this host's built-ins explicitly; do not change user/machine settings.
+    # https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_psmodulepath
+    $HostModuleRoot = [IO.Path]::Combine($PSHOME, 'Modules')
+    $env:PSModulePath = $HostModuleRoot
+    foreach ($Module in @('Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Security', 'Microsoft.PowerShell.Archive')) {
+        Import-Module ([IO.Path]::Combine($HostModuleRoot, $Module, "$Module.psd1")) -ErrorAction Stop
+    }
+    if (-not $RuntimeDirectory) {
+        $RuntimeDirectory = [IO.Path]::Combine($env:LOCALAPPDATA, 'SARU_Picker_crYOLO', 'cryolo-env')
+    }
+    $RuntimeDirectory = [IO.Path]::GetFullPath($RuntimeDirectory)
+    $ParentDirectory = Split-Path $RuntimeDirectory -Parent
+    $RuntimePython = Join-Path $RuntimeDirectory "Scripts\python.exe"
+    $OwnerMarker = Join-Path $RuntimeDirectory "saru-cryolo-runtime.json"
+    $Started = [DateTime]::UtcNow.ToString("o")
+    if (-not $Report) { $Report = Join-Path $ParentDirectory "runtime-install-report.json" }
+    $Report = [IO.Path]::GetFullPath($Report)
+    Assert-NoReparsePoint $ParentDirectory
+    Assert-NoReparsePoint $RuntimeDirectory
+    New-Item -ItemType Directory -Force -Path $ParentDirectory | Out-Null
+    New-Item -ItemType Directory -Force -Path (Split-Path $Report -Parent) | Out-Null
+    $InstallReport = @{ status = "running"; stage = "health-check"; started_utc = $Started;
+        python = $RuntimePython; reused = $false; vc_runtime_files = @(); private_python_requested = [bool]$ForcePrivatePython;
+        cryolo_version = "1.9.9"; tensorflow_version = "1.15.4";
+        scope = "private CPU runtime and upstream initialization weights; no trained capsid model" }
+    $InstallReport.powershell_version = $PSVersionTable.PSVersion.ToString()
+    $InstallReport.powershell_module_root = $HostModuleRoot
     # An interrupted process releases the OS lock; first-use and installer serialize.
     $Deadline = [DateTime]::UtcNow.AddMinutes(45)
     while (-not $Lock) {
@@ -238,11 +252,14 @@ try {
     Write-Host "crYOLO is ready. SARU Picker detects the private runtime automatically."
     exit 0
 } catch {
-    $InstallReport.status = "error"
-    $InstallReport.error = $_.Exception.Message
-    $InstallReport.completed_utc = [DateTime]::UtcNow.ToString("o")
-    Save-Report
-    Write-Error -Message $InstallReport.error -ErrorAction Continue
+    $FailureMessage = $_.Exception.Message
+    if ($InstallReport) {
+        $InstallReport.status = "error"
+        $InstallReport.error = $FailureMessage
+        $InstallReport.completed_utc = [DateTime]::UtcNow.ToString("o")
+        Save-Report
+    }
+    Write-Error -Message $FailureMessage -ErrorAction Continue
     exit 1
 } finally {
     foreach ($Name in $OldEnvironment.Keys) { [Environment]::SetEnvironmentVariable($Name, $OldEnvironment[$Name], 'Process') }

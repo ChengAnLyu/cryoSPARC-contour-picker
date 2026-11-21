@@ -72,3 +72,28 @@ def test_owned_partial_environment_enters_repair(powershell, tmp_path):
     report = json.loads((tmp_path / 'runtime-install-report.json').read_text(encoding='utf-8-sig'))
     assert report['stage'] == 'python' and 'exit code 7' in report['error']
     assert sentinel.read_text() == 'preserved'
+
+
+def test_bootstrap_uses_host_modules_with_incompatible_inherited_path(powershell, tmp_path):
+    source = Path(__file__).resolve().parents[1] / 'packaging' / 'cryolo' / 'setup-runtime.ps1'
+    script = tmp_path / 'setup-runtime.ps1'
+    shutil.copyfile(source, script)
+    # A deliberately invalid package makes setup exercise Get-FileHash without
+    # downloading anything or installing a runtime. The old Windows host resolved
+    # Utility against an incompatible inherited PS7 path and failed command lookup.
+    (tmp_path / 'python.3.7.9.nupkg').write_bytes(b'checksum-regression-test')
+    incompatible = tmp_path / 'foreign-powershell-modules'
+    incompatible.mkdir()
+    restore_report = tmp_path / 'restored-module-path.txt'
+    quoted = lambda value: "'" + str(value).replace("'", "''") + "'"
+    command = (f'$env:PSModulePath = {quoted(incompatible)}; '
+               f'try {{ & {quoted(script)} -RuntimeDirectory {quoted(tmp_path / "owned" / "cryolo-env")} }} '
+               f'finally {{ [IO.File]::WriteAllText({quoted(restore_report)}, $env:PSModulePath) }}; exit $LASTEXITCODE')
+    result = subprocess.run([powershell, '-NoProfile', '-Command', command],
+        env=dict(os.environ, OS='Windows_NT', LOCALAPPDATA=str(tmp_path)),
+        text=True, capture_output=True, timeout=30)
+    assert result.returncode == 1
+    report = json.loads((tmp_path / 'owned' / 'runtime-install-report.json').read_text(encoding='utf-8-sig'))
+    assert 'bundled Python package failed its checksum' in report['error']
+    assert Path(report['powershell_module_root']) == Path(powershell).resolve().parent / 'Modules'
+    assert restore_report.read_text() == str(incompatible)

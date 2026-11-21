@@ -84,8 +84,17 @@ jobs:
         shell: pwsh
         run: |
           $runtime = Join-Path $env:RUNNER_TEMP 'saru-cryolo-env'
-          & "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -ExecutionPolicy Bypass -File ./packaging/cryolo/setup-runtime.ps1 -ForcePrivatePython -RuntimeDirectory $runtime -Report (Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime-install.json')
-          if ($LASTEXITCODE -ne 0) { throw 'Private runtime setup failed under the Windows PowerShell host used by Setup.' }
+          $setup = Join-Path $env:GITHUB_WORKSPACE 'packaging/cryolo/setup-runtime.ps1'
+          $report = Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime-install.json'
+          $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $setup + '" -ForcePrivatePython -RuntimeDirectory "' + $runtime + '" -Report "' + $report + '"'
+          # Start-Process preserves the raw inherited PSModulePath, like Inno
+          # Exec. Direct powershell.exe invocation from pwsh repairs that path
+          # specially and previously hid a real installer bootstrap defect.
+          $process = Start-Process -FilePath "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -ArgumentList $arguments -NoNewWindow -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Raw }
+            throw 'Private runtime setup failed under the Windows PowerShell host and inheritance used by Setup.'
+          }
       - name: Exercise stock model inference on synthetic data
         shell: pwsh
         run: |
