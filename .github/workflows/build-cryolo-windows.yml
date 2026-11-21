@@ -1,4 +1,4 @@
-name: Build parallel crYOLO Windows edition
+name: Build SARU Picker crYOLO 3.0.0 for Windows
 
 on:
   workflow_dispatch:
@@ -46,7 +46,7 @@ jobs:
       - name: Upload GUI installer and verification
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: SARU-Picker-crYOLO-Windows-${{ github.run_number }}
+          name: SARU-Picker-crYOLO-Windows-3.0.0-${{ github.run_number }}
           path: artifacts/cryolo/*
           if-no-files-found: error
           compression-level: 0
@@ -55,7 +55,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: SARU-Picker-crYOLO-GUI-diagnostics-${{ github.run_number }}
+          name: SARU-Picker-crYOLO-GUI-diagnostics-3.0.0-${{ github.run_number }}
           path: |
             artifacts/cryolo/**/*.json
             artifacts/cryolo/**/*.png
@@ -87,7 +87,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: SARU-Picker-crYOLO-runtime-check-${{ github.run_number }}
+          name: SARU-Picker-crYOLO-runtime-check-3.0.0-${{ github.run_number }}
           path: |
             artifacts/cryolo-runtime-install.json
             artifacts/cryolo-runtime/runtime-inference.json

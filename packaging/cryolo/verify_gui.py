@@ -11,17 +11,19 @@ from screen_app import ScreenPickerApp
 def verify(destination):
     if sys.platform != "win32":
         raise RuntimeError("Native GUI verification requires Windows.")
+    assert app.APP_VERSION == "3.0.0", app.APP_VERSION
     app.ACTIVE_BACKEND = "cryolo"
     log_path = app.setup_logging()
     shared = app._smoke_windows_runtime(log_path, screenshot_dir=destination / "ui")
     import tkinter as tk
-    args = app.build_parser().parse_args(["--backend", "cryolo", "--automatic-profile", "capsid-learned"])
+    args = app.build_parser().parse_args([])
+    assert args.backend == "cryolo" and args.automatic_profile == "capsid-learned"
     root = tk.Tk()
     picker = None
     try:
         picker = ScreenPickerApp(root, args, log_path, app.resolve_checkpoint(backend="cryolo"), start_listeners=False)
         root.update()
-        assert "crYOLO" in root.title(), root.title()
+        assert "crYOLO" in root.title() and "3.0.0" in root.title(), root.title()
         config = picker._model_config()
         assert config.backend == "cryolo" and config.min_capsid_area_px == 3500
         assert config.automatic_profile == "capsid-learned"
@@ -29,7 +31,8 @@ def verify(destination):
         root.update()
         assert picker.advanced is not None
         assert picker._listeners_requested is False
-        return {"status": "ok", "shared_controls": shared,
+        return {"status": "ok", "version": app.APP_VERSION, "default_backend": args.backend,
+                "shared_controls": shared,
                 "cryolo_panel": {"title": root.title(), "minimum_contour_area": 3500,
                                  "profile": "capsid-learned", "advanced_opened": True},
                 "note": "Native Tk/shared-controller checks with synthetic input sinks; no trained-model inference or live picking."}

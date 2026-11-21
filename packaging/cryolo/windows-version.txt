@@ -1,0 +1,26 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(3, 0, 0, 0),
+    prodvers=(3, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable('040904B0', [
+        StringStruct('CompanyName', 'SARU Picker'),
+        StringStruct('FileDescription', 'SARU Picker crYOLO 3.0.0 — contour particle picking'),
+        StringStruct('FileVersion', '3.0.0'),
+        StringStruct('InternalName', 'SARU Picker crYOLO'),
+        StringStruct('OriginalFilename', 'SARU Picker crYOLO.exe'),
+        StringStruct('ProductName', 'SARU Picker crYOLO'),
+        StringStruct('ProductVersion', '3.0.0')
+      ])
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

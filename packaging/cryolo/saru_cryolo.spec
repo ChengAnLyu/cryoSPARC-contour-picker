@@ -29,5 +29,6 @@ pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="SARU Picker crYOLO",
           debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
           console=False, disable_windowed_traceback=False, icon=str(icon), uac_admin=False,
+          version=str(project / "packaging" / "cryolo" / "windows-version.txt"),
           contents_directory="_internal")
 coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="SARU_Picker_crYOLO")

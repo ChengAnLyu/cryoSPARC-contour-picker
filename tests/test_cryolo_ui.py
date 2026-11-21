@@ -14,7 +14,7 @@ import screen_app
 from recognition import RecognitionConfig
 
 
-def test_parallel_launcher_defaults_preserve_existing_sam_launcher():
+def test_primary_and_compatibility_launchers_default_to_trained_cryolo():
     with tempfile.TemporaryDirectory() as directory, \
          patch.object(app, "user_state_directory", return_value=Path(directory)), \
          patch.object(app, "_run_application", return_value=0) as run:
@@ -24,8 +24,35 @@ def test_parallel_launcher_defaults_preserve_existing_sam_launcher():
             "cryolo", "capsid-learned", 3500)
         assert options.review is False
         app.main([])
+        assert run.call_args.args[0].backend == "cryolo"
+        assert run.call_args.args[0].automatic_profile == "capsid-learned"
+        assert app.APP_VERSION == "3.0.0"
+
+
+def test_explicit_sam_backend_keeps_legacy_profile_and_honors_override():
+    with patch.object(app, "_run_application", return_value=0) as run:
+        app.main(["--backend", "sam"])
         assert run.call_args.args[0].backend == "sam"
         assert run.call_args.args[0].automatic_profile == "capsid"
+        app.main(["--backend", "sam", "--automatic-profile", "capsid-learned"])
+        assert run.call_args.args[0].automatic_profile == "capsid-learned"
+
+
+def test_parser_defaults_select_cryolo_and_explicit_sam_selects_legacy_profile():
+    args = app.build_parser().parse_args([])
+    assert (args.backend, args.automatic_profile) == ("cryolo", "capsid-learned")
+    args = app.build_parser().parse_args(["--backend", "sam"])
+    assert (args.backend, args.automatic_profile) == ("sam", "capsid")
+
+
+def test_explicit_sam_smoke_routes_to_legacy_runtime_only():
+    with tempfile.TemporaryDirectory() as directory, \
+         patch.object(app, "setup_logging", return_value=Path(directory) / "test.log"), \
+         patch.object(app, "run_smoke_test", return_value={"status": "ok"}) as sam, \
+         patch.object(app, "run_cryolo_smoke_test") as cryolo:
+        assert app.main(["--backend", "sam", "--smoke-test"]) == 0
+        sam.assert_called_once()
+        cryolo.assert_not_called()
 
 
 def test_parallel_screen_launch_has_distinct_taskbar_identity():
@@ -57,7 +84,7 @@ def test_saved_settings_apply_only_to_cryolo_and_cli_wins():
         assert options.cryolo_python == "chosen-python"
         assert options.cryolo_threshold == .42
         assert options.min_capsid_area == 4100
-        app.main([])
+        app.main(["--backend", "sam"])
         assert run.call_args.args[0].cryolo_python is None
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parallel SARU Picker crYOLO launcher based on the 2.9.0 interface."""
+"""Compatibility launcher for SARU Picker 3.0.0, whose default is now crYOLO."""
 from app import main as application_main
 
 

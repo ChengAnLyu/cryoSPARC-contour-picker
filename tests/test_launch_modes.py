@@ -27,6 +27,14 @@ class LaunchModeTests(unittest.TestCase):
         self.assertIs(screen.call_args.args[0], root)
         self.assertEqual(screen.call_args.args[3], Path("bundled-model.pth"))
         self.assertEqual(screen.call_args.args[1].min_capsid_area, 3500)
+        self.assertEqual(screen.call_args.args[1].backend, "cryolo")
+        self.assertEqual(screen.call_args.args[1].automatic_profile, "capsid-learned")
+        review.assert_not_called()
+
+    def test_explicit_sam_source_backend_preserves_screen_workflow(self):
+        _, screen, review = self.launch(["--backend", "sam"])
+        self.assertEqual(screen.call_args.args[1].backend, "sam")
+        self.assertEqual(screen.call_args.args[1].automatic_profile, "capsid")
         review.assert_not_called()
 
     def test_size_filter_override_is_available_without_changing_launch_mode(self):

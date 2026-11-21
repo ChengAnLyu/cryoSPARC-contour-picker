@@ -288,7 +288,7 @@ class ScreenPickerApp:
     def _build_ui(self, checkpoint_path):
         tk, ttk, root = self.tk, self.ttk, self.root
         is_cryolo = getattr(self.args, "backend", "sam") == "cryolo"
-        root.title("SARU PICKER crYOLO" if is_cryolo else "SARU PICKER")
+        root.title("SARU PICKER 3.0.0 crYOLO" if is_cryolo else "SARU PICKER 3.0.0 SAM")
         root.resizable(False, False)
         root.attributes("-topmost", True)
         scale = max(1.0, float(root.tk.call("tk", "scaling")) / (96 / 72))
@@ -730,7 +730,10 @@ class ScreenPickerApp:
             self.picked_points.clear()
             self.region_label.set(f"Screen area: {region.width} × {region.height} px at {region.left}, {region.top}")
             self._show_panel()
-            self.status.set("Screen area selected. Choose Detect or draw a Box prompt.")
+            if getattr(getattr(self, "args", None), "backend", "sam") == "cryolo":
+                self.status.set("Screen area selected. Choose Detect, then review the contours. Use manual mode for missed targets.")
+            else:
+                self.status.set("Screen area selected. Choose Detect or draw a Box prompt.")
         self._schedule(90, complete)
 
     def _model_config(self):
@@ -1123,7 +1126,10 @@ class ScreenPickerApp:
                     self.status.set(f"{len(self.candidates)} proposals. " + ("Uncheck Disable Picking to select on screen." if self.disabled.get()
                                     else "Click an intended green region to pick it."))
                 else:
-                    self.status.set("No proposals. Try a tight Box prompt around a target.")
+                    if getattr(getattr(self, "args", None), "backend", "sam") == "cryolo":
+                        self.status.set("No proposals. Use manual mode to draw missed targets; Select by box only selects detections.")
+                    else:
+                        self.status.set("No proposals. Try a tight Box prompt around a target.")
         elif kind == "model picks":
             if value.get("frame_id", self.frame_id) != self.frame_id:
                 return

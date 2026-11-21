@@ -1,6 +1,6 @@
-# SARU Picker crYOLO — parallel 2.9.0 edition
+# SARU Picker 3.0.0 — integrated crYOLO model
 
-This edition replaces SAM proposals with the real crYOLO 1.9.9 detector. It keeps
+Version 3.0.0 makes the real crYOLO 1.9.9 detector the default model. It keeps
 the 2.9.0 screen capture, manual contours, selection overlays, grid sampling,
 click delay, cancellation and micrograph navigation. It has a separate launcher,
 Windows installation and settings directory.
@@ -15,9 +15,9 @@ Box/point prompts select crYOLO detections. They cannot make crYOLO segment an
 object it missed; manual drawing remains available. Object confidence is kept
 separate from mask IoU and is not presented as a calibrated capsid probability.
 
-## Run the parallel edition
+## Run version 3.0.0
 
-Install the current GUI requirements in Python 3.10 or newer:
+Install the current GUI requirements in Python 3.12:
 
 ```sh
 python -m pip install -r requirements.txt
@@ -28,8 +28,8 @@ python main_cryolo.py --checkpoint /path/to/cryolo-capsids.h5 \
 
 Place `capsid-profile.json` beside the H5 weights. Configure the model paths,
 runtime and confidence threshold under Advanced. Settings are remembered in
-the separate crYOLO user directory. `main.py` continues to default to SAM;
-`main_cryolo.py` defaults to crYOLO with the learned capsid contour profile.
+the separate crYOLO user directory. Both `main.py` and `main_cryolo.py` default to crYOLO with the learned capsid
+contour profile. Legacy SAM remains an explicit `--backend sam` source option.
 
 The Windows release includes a separate GUI installer. Keep its private model,
 config, profile and icon sidecars beside Setup when installing. Run the included
@@ -135,20 +135,18 @@ Windows build checks cover packaging and interface behavior; they do not measure
 biological detection accuracy on private examples.
 
 
-## Windows build provenance
+## Version 3.0.0 integration
 
-[Windows build 3](https://github.com/ChengAnLyu/cryoSPARC-contour-picker/actions/runs/44942803369)
-completed successfully from application commit
-`f7f7f31dae0e2f24d1b370f39cfeb42fe632e04c`. It checks the GUI and installer,
-the actual crYOLO Advanced panel, and a separately installed native Windows
-crYOLO runtime using synthetic input and an untrained detection head. The
-installer's metadata checks intentionally ran without private weights. Those
-checks establish packaging/runtime operation; they do not establish private
-model training completion or capsid accuracy.
+This release integrates the completed 160-example, 20-epoch checkpoint selected
+at epoch 18. Its SHA-256 is
+`a883be0bf39f0a93b0e2c36441c062fac5ab3672c044a7cf0703dc01853d3761`.
+The exact H5 weights, fixed 320×320 inference configuration and all-160
+appearance profile are carried forward. No additional model training is claimed.
 
-The verified installer is
-`SARU-Picker-crYOLO-Setup-2.9.0-cryolo.1-win64.exe`, SHA-256
-`7fc1f634883e163c6cd9cd31185f0e4b6ba9e62c18ad8c5753bc1dd1c8f90b47`.
-See [the packaging notes](packaging/cryolo/README.md) for exact sidecar names,
-portable installation and the separation between application-build provenance
-and the later training-driver/model provenance.
+The Windows installer is `SARU-Picker-crYOLO-Setup-3.0.0-win64.exe`.
+Application diagnostics, the EXE's Windows version metadata, the installer and
+release manifest identify version 3.0.0. Existing crYOLO runtime and settings
+paths are retained. Private model sidecars are installed automatically from
+beside Setup. See [the packaging notes](packaging/cryolo/README.md) for the
+build procedure. The private release record identifies the actual successful
+3.0.0 build commit, artifact hashes and trained-model integration checks.

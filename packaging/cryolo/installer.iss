@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.9.0-cryolo.1"
+  #define AppVersion "3.0.0"
 #endif
 #ifndef AppSourceDir
   #define AppSourceDir "..\..\dist\SARU_Picker_crYOLO"
@@ -12,6 +12,8 @@
 AppId={{FB137682-60A8-4BC1-AC91-518AE16F0E8E}
 AppName=SARU Picker crYOLO
 AppVersion={#AppVersion}
+VersionInfoVersion={#AppVersion}
+VersionInfoProductVersion={#AppVersion}
 AppPublisher=SARU Picker
 AppVerName=SARU Picker crYOLO {#AppVersion}
 DefaultDirName={localappdata}\Programs\SARU Picker crYOLO

@@ -1595,6 +1595,15 @@ class ScreenControllerTests(unittest.TestCase):
                                      "prompt": False, "candidates": [make_candidate(mask)]})
         self.assertEqual(app.picked_points, set())
 
+    def test_no_cryolo_proposals_direct_review_to_manual_contours(self):
+        app = app_state("semi-auto")
+        app.args = SimpleNamespace(backend="cryolo")
+        app._result("recognition", {"rgb": app.rgb, "candidates": [], "auto": False, "prompt": False})
+        self.assertIn("manual mode", app.status.get())
+        self.assertIn("only selects detections", app.status.get())
+        self.assertNotIn("tight Box prompt", app.status.get())
+        self.assertEqual(app.desktop.clicks, [])
+
     def test_no_proposals_advance_auto_without_sending_any_picks(self):
         app = app_state("auto")
         app.auto_remaining = 2

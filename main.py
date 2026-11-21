@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.9.0: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 3.0.0: direct screen contours and crYOLO-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
@@ -5359,7 +5359,7 @@ class ScreenPickerApp:
     def _build_ui(self, checkpoint_path):
         tk, ttk, root = self.tk, self.ttk, self.root
         is_cryolo = getattr(self.args, "backend", "sam") == "cryolo"
-        root.title("SARU PICKER crYOLO" if is_cryolo else "SARU PICKER")
+        root.title("SARU PICKER 3.0.0 crYOLO" if is_cryolo else "SARU PICKER 3.0.0 SAM")
         root.resizable(False, False)
         root.attributes("-topmost", True)
         scale = max(1.0, float(root.tk.call("tk", "scaling")) / (96 / 72))
@@ -5801,7 +5801,10 @@ class ScreenPickerApp:
             self.picked_points.clear()
             self.region_label.set(f"Screen area: {region.width} × {region.height} px at {region.left}, {region.top}")
             self._show_panel()
-            self.status.set("Screen area selected. Choose Detect or draw a Box prompt.")
+            if getattr(getattr(self, "args", None), "backend", "sam") == "cryolo":
+                self.status.set("Screen area selected. Choose Detect, then review the contours. Use manual mode for missed targets.")
+            else:
+                self.status.set("Screen area selected. Choose Detect or draw a Box prompt.")
         self._schedule(90, complete)
 
     def _model_config(self):
@@ -6194,7 +6197,10 @@ class ScreenPickerApp:
                     self.status.set(f"{len(self.candidates)} proposals. " + ("Uncheck Disable Picking to select on screen." if self.disabled.get()
                                     else "Click an intended green region to pick it."))
                 else:
-                    self.status.set("No proposals. Try a tight Box prompt around a target.")
+                    if getattr(getattr(self, "args", None), "backend", "sam") == "cryolo":
+                        self.status.set("No proposals. Use manual mode to draw missed targets; Select by box only selects detections.")
+                    else:
+                        self.status.set("No proposals. Try a tight Box prompt around a target.")
         elif kind == "model picks":
             if value.get("frame_id", self.frame_id) != self.frame_id:
                 return
@@ -6553,7 +6559,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.9.0"
+APP_VERSION = "3.0.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 DEFAULT_CRYOLO_CHECKPOINT = "cryolo-capsids.h5"
 ACTIVE_BACKEND = "sam"
@@ -8201,7 +8207,7 @@ class PickerApp:
     def _build_ui(self):
         tk, ttk, root = self.tk, self.ttk, self.root
         is_cryolo = getattr(self.args, "backend", "sam") == "cryolo"
-        root.title("SARU Picker crYOLO — review masks, then pick" if is_cryolo else "SARU Picker 2 — review masks, then pick")
+        root.title("SARU Picker 3.0.0 crYOLO — review masks, then pick" if is_cryolo else "SARU Picker 3.0.0 SAM — review masks, then pick")
         root.geometry("1280x900")
         root.minsize(1040, 760)
         root.columnconfigure(1, weight=1)
@@ -8221,7 +8227,7 @@ class PickerApp:
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
-        ttk.Label(controls, text="SARU PICKER", font=("Arial", 17, "bold")).pack(anchor="w")
+        ttk.Label(controls, text="SARU PICKER 3.0.0", font=("Arial", 17, "bold")).pack(anchor="w")
         ttk.Label(controls, text="Capture • segment • review • pick").pack(anchor="w", pady=(0, 8))
         source = ttk.LabelFrame(controls, text="1. Image", padding=7)
         source.pack(fill="x", pady=4)
@@ -9011,11 +9017,21 @@ class PickerApp:
         self.root.destroy()
 
 
+class PickerArgumentParser(argparse.ArgumentParser):
+    """Apply the selected backend's profile unless a profile was explicitly set."""
+    def parse_args(self, args=None, namespace=None):
+        result = super().parse_args(args, namespace)
+        if result.automatic_profile is None:
+            result.automatic_profile = "capsid-learned" if result.backend == "cryolo" else "capsid"
+        return result
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(description="SARU Picker: manual and model-assisted picking directly over cryoSPARC.")
+    parser = PickerArgumentParser(description="SARU Picker 3.0.0: crYOLO-assisted picking directly over cryoSPARC.")
     parser.add_argument("--review", action="store_true", help="Open the optional snapshot review editor instead of the screen overlay.")
     parser.add_argument("--image", help="Open an image in the optional offline review editor.")
-    parser.add_argument("--backend", choices=("sam", "cryolo"), default="sam")
+    parser.add_argument("--backend", choices=("sam", "cryolo"), default="cryolo",
+                        help="Detection backend (default: cryolo). Select sam explicitly for the legacy source backend.")
     parser.add_argument("--checkpoint", help="Model weights: SAM .pth or crYOLO .h5; otherwise use the selected backend's bundled model.")
     parser.add_argument("--cryolo-config", help="crYOLO JSON configuration; defaults to cryolo-config.json beside its weights.")
     parser.add_argument("--cryolo-python", help="Python executable in the separate crYOLO environment.")
@@ -9025,15 +9041,15 @@ def build_parser():
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--segment-image", help="Run headless recognition on a clean image, without any desktop events.")
-    modes.add_argument("--diagnostics", action="store_true", help="Report installed dependency metadata without loading SAM.")
+    modes.add_argument("--diagnostics", action="store_true", help="Report installed dependency metadata without loading a detector.")
     modes.add_argument("--smoke-test", action="store_true", help="Noninteractive native-library, Tk, and CPU model check; never sends desktop input.")
     parser.add_argument("--box", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--point", nargs=3, action="append", type=float, metavar=("X", "Y", "LABEL"), help="Repeatable foreground(1)/background(0) prompt.")
     parser.add_argument("--points-per-side", type=int, default=8)
-    parser.add_argument("--automatic-profile", choices=("capsid", "capsid-learned", "generic"), default="capsid",
-                        help="capsid keeps the existing filter; capsid-learned selects the optional experimental profile; generic returns unclassified SAM proposals.")
+    parser.add_argument("--automatic-profile", choices=("capsid", "capsid-learned", "generic"), default=None,
+                        help="Defaults to capsid-learned for crYOLO or capsid for explicit SAM. Generic returns unclassified SAM masks; crYOLO generic still uses texture-based contour refinement.")
     parser.add_argument("--min-capsid-area", type=int, default=DEFAULT_MIN_CAPSID_AREA_PX, metavar="PIXELS",
-                        help="Minimum connected capsid area in native screenshot pixels for automatic detection (default: 3500; 0 allows all sizes). Manual, explicit prompts, and generic detection are unchanged.")
+                        help="Minimum connected contour area in screenshot pixels (default: 3500; 0 allows all sizes). Applies to every crYOLO automatic profile and SAM capsid profiles; manual, explicit prompts and SAM generic bypass it.")
     parser.add_argument("--spacing", type=int, default=13)
     parser.add_argument("--inset", type=float, default=2)
     parser.add_argument("--output", type=Path, help="Headless segmentation output directory; defaults to writable user data when installed.")
@@ -9138,13 +9154,12 @@ def _run_application(args, *, console_available: bool) -> int:
         return 1
 
 
-def main(argv=None, *, default_backend="sam"):
+def main(argv=None, *, default_backend="cryolo"):
     global ACTIVE_BACKEND
     console_available = sys.stderr is not None
     with windowed_console_streams():
         parser = build_parser()
-        if default_backend == "cryolo":
-            parser.set_defaults(backend="cryolo", automatic_profile="capsid-learned")
+        parser.set_defaults(backend=default_backend)
         args = parser.parse_args(argv)
         previous_backend, ACTIVE_BACKEND = ACTIVE_BACKEND, args.backend
         try:
