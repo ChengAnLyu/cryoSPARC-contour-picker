@@ -118,6 +118,27 @@ try {
     foreach ($Runtime in @('MSVCP140.dll','VCRUNTIME140.dll','VCRUNTIME140_1.dll','torch\lib\fbgemm.dll','torch\lib\asmjit.dll','torch\lib\libiomp5md.dll')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Distribution "_internal\$Runtime"))) { throw "Required native library is absent: $Runtime" }
     }
+    # Check exactly the canonical DLLs that runtime setup will copy. Keeping
+    # this evidence before Setup exposes signature failures even if setup fails.
+    $VCFiles = @()
+    $VCFailures = @()
+    foreach ($Name in @('msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcruntime140.dll','vcruntime140_1.dll','concrt140.dll')) {
+        $Path = Join-Path $Distribution "_internal\$Name"
+        if (-not (Test-Path -LiteralPath $Path)) { continue }
+        $Signature = Get-AuthenticodeSignature -LiteralPath $Path
+        $Subject = if ($Signature.SignerCertificate) { $Signature.SignerCertificate.Subject } else { '' }
+        $Bytes = [IO.File]::ReadAllBytes($Path)
+        $Offset = [BitConverter]::ToInt32($Bytes, 0x3c)
+        $Machine = [BitConverter]::ToUInt16($Bytes, $Offset + 4)
+        $VCFiles += @{name=$Name; signature_status=[string]$Signature.Status; signature_message=$Signature.StatusMessage; signer=$Subject; machine=$Machine; sha256=(Get-FileHash -LiteralPath $Path).Hash.ToLowerInvariant()}
+        if ($Signature.Status -ne 'Valid' -or $Subject -notmatch 'Microsoft Corporation' -or $Machine -ne 0x8664) {
+            $VCFailures += "$Name : $($Signature.Status) : $($Signature.StatusMessage) : $Subject : machine=$Machine"
+        }
+    }
+    $VCJson = @{status=$(if ($VCFailures.Count) { 'error' } else { 'ok' }); files=$VCFiles} | ConvertTo-Json -Depth 5
+    $VCJson | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'bundled-vc-runtime.json') -Encoding UTF8
+    Write-Host $VCJson
+    if ($VCFailures.Count) { throw "Bundled VC runtime verification failed: $($VCFailures -join '; ')" }
     foreach ($File in @('setup-runtime.ps1','runtime_health.py','runtime-requirements-windows.txt','Install-crYOLO-Runtime.cmd')) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $File) -Destination $Distribution -Force
     }
@@ -143,9 +164,15 @@ try {
             Copy-Item -LiteralPath (Join-Path $ProjectRoot 'assets\app-icon.ico'),(Join-Path $ProjectRoot 'assets\app-icon.png') -Destination $SidecarStage
             $InstallLog = Join-Path $ArtifactDirectory 'installer-smoke.log'
             $Process = Start-Process -FilePath $StagedInstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$InstallDirectory`" /LOG=`"$InstallLog`"" -Wait -PassThru
-            if ($Process.ExitCode -ne 0) { throw "Installer exited $($Process.ExitCode); inspect its runtime setup report." }
             $RuntimeReport = Join-Path $env:LOCALAPPDATA 'SARU_Picker_crYOLO\runtime-install-report.json'
-            Copy-Item -LiteralPath $RuntimeReport -Destination (Join-Path $ArtifactDirectory 'installed-runtime-setup.json')
+            if (Test-Path -LiteralPath $RuntimeReport) {
+                Copy-Item -LiteralPath $RuntimeReport -Destination (Join-Path $ArtifactDirectory 'installed-runtime-setup.json')
+                Write-Host (Get-Content -LiteralPath $RuntimeReport -Raw)
+            }
+            if ($Process.ExitCode -ne 0) {
+                Write-Host (Get-Content -LiteralPath $InstallLog -Tail 50 | Out-String)
+                throw "Installer exited $($Process.ExitCode); inspect installed-runtime-setup.json and installer-smoke.log."
+            }
             $RuntimeResult = Get-Content -LiteralPath $RuntimeReport -Raw | ConvertFrom-Json
             if ($RuntimeResult.status -ne 'ok') { throw 'Setup did not finish a healthy crYOLO runtime.' }
             $RuntimePython = Join-Path $env:LOCALAPPDATA 'SARU_Picker_crYOLO\cryolo-env\Scripts\python.exe'
