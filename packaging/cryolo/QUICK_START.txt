@@ -4,10 +4,9 @@ This is a separate application. It does not replace the SAM edition.
 
 1. Keep cryolo-capsids.h5, cryolo-config.json, capsid-profile.json and the two
    app-icon files beside the crYOLO Setup program before running Setup.
-2. Install the separate crYOLO CPU runtime once. Open PowerShell in the
-   installed application directory and run:
-
-       powershell -ExecutionPolicy Bypass -File .\setup-runtime.ps1
+2. Install the separate crYOLO CPU runtime once. Double-click
+   Install-crYOLO-Runtime.cmd in the installed application folder, or choose
+   "Install crYOLO runtime" from its Start-menu folder.
 
    The script downloads stock crYOLO and a private Python 3.7 interpreter if
    required. It does not change your system PATH or the SAM installation.

@@ -35,7 +35,7 @@ try {
     Invoke-Checked $BuildPython @("-m", "pip", "install", "pip==26.3", "setuptools==80.9.0", "wheel==0.45.1")
     Invoke-Checked $BuildPython @("-m", "pip", "install", "-r", (Join-Path $PSScriptRoot "requirements-build.txt"))
     Invoke-Checked $BuildPython @("-m", "pip", "check")
-    Invoke-Checked $BuildPython @("-m", "unittest", "discover", "-s", "tests", "-v")
+    Invoke-Checked $BuildPython @("-m", "pytest", "-q")
     Invoke-Checked $BuildPython @("packaging\cryolo\verify_gui.py", $ArtifactDirectory)
     Invoke-Checked $BuildPython @("packaging\cryolo\collect_notices.py", (Join-Path $BuildDirectory "third-party-notices"))
     Invoke-Checked $BuildPython @("-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", "dist", "--workpath", (Join-Path $BuildDirectory "pyinstaller"), "packaging\cryolo\saru_cryolo.spec")
@@ -47,7 +47,7 @@ try {
     foreach ($Library in @('torch','tensorflow','keras','cryolo','segment_anything')) {
         if (Test-Path -LiteralPath (Join-Path $Distribution "_internal\$Library")) { throw "Unexpected model runtime bundled: $Library" }
     }
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'setup-runtime.ps1'),(Join-Path $PSScriptRoot 'runtime-requirements-windows.txt') -Destination $Distribution -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'setup-runtime.ps1'),(Join-Path $PSScriptRoot 'runtime-requirements-windows.txt'),(Join-Path $PSScriptRoot 'Install-crYOLO-Runtime.cmd') -Destination $Distribution -Force
     Invoke-Diagnostics $Executable (Join-Path $ArtifactDirectory 'frozen-diagnostics.json')
     Compress-Archive -Path $Distribution -DestinationPath (Join-Path $ArtifactDirectory "SARU-Picker-crYOLO-GUI-$Version-win64.zip") -Force
     if ($IsccPath) {

@@ -37,6 +37,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "Install-crYOLO-Runtime.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "setup-runtime.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "runtime-requirements-windows.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; These user's sidecars are supplied privately beside Setup, not in the public build.
@@ -48,6 +49,7 @@ Source: "{src}\app-icon.png"; DestDir: "{app}\_internal\assets"; Flags: external
 
 [Icons]
 Name: "{group}\SARU Picker crYOLO"; Filename: "{app}\SARU Picker crYOLO.exe"; WorkingDir: "{app}"; IconFilename: "{app}\_internal\assets\app-icon.ico"; AppUserModelID: "SARU.Picker.crYOLO"
+Name: "{group}\Install crYOLO runtime"; Filename: "{app}\Install-crYOLO-Runtime.cmd"; WorkingDir: "{app}"
 Name: "{group}\Quick start"; Filename: "{app}\_internal\QUICK_START.txt"
 Name: "{autodesktop}\SARU Picker crYOLO"; Filename: "{app}\SARU Picker crYOLO.exe"; WorkingDir: "{app}"; IconFilename: "{app}\_internal\assets\app-icon.ico"; AppUserModelID: "SARU.Picker.crYOLO"; Tasks: desktopicon
 
