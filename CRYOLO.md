@@ -34,7 +34,9 @@ settings remember separate SAM and crYOLO paths. `main.py` defaults to the origi
 Advanced → Detection profile to use the trained detector. `main_cryolo.py`
 remains a compatibility shortcut. All four choices are available in one GUI.
 
-The Windows release includes one combined installer. Keep its private model,
+The Windows release includes one combined installer, delivered in an installer
+ZIP and a separate trained-model ZIP to fit the download size limit. Extract both
+archives into the same folder. Keep its private model,
 config, profile and icon sidecars beside Setup when installing. Setup includes the verified private Python 3.7 package and automatically
 acquires and verifies stock crYOLO in its isolated CPU environment. A healthy existing runtime
 is reused. No Python executable picker is required. First-time setup requires
