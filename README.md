@@ -1,10 +1,12 @@
-# SARU Picker 2.8.0
+# SARU Picker 2.9.0
 
 SARU Picker works directly over the cryoSPARC screen. cryoSPARC remains the image viewer, with its existing layout and controls. A compact, always-on-top **SARU PICKER** panel selects manual, semi-auto, or auto mode.
 
 ## Windows application
 
-The CPU installer is named **SARU-Picker-Setup-2.8.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+The CPU installer is named **SARU-Picker-Setup-2.9.0-win64.exe**. It includes Python, the desktop libraries, and the original SAM ViT-B model. After installation, launch **SARU Picker** from the Start menu. See [Windows installation](WINDOWS_APP.md) and [maintainer build instructions](packaging/README.md).
+
+Version 2.9.0 supports the private appearance profile trained with all 160 supplied examples. Examples 121–160 add confirmed large-capsid picks; the 43 previously confirmed blank images remain negatives. Small markings and unmarked regions in nonblank images remain unknown. Select **Advanced → Detection profile → capsid-learned** to use the updated profile. Learned-mode geometry calculations now run only over the relevant local image regions, avoiding repeated full-image work while preserving the existing prompt and contour rules. The full image is still scored, SAM is encoded once, and automatic prompting retains its 24-prompt limit. The private guide reports measured coverage and runtime comparisons. Manual picking, the floating panel, click pacing, carbon checks, the 3,500-pixel automatic area floor and SAM weights retain their existing behavior. Full-image search does not guarantee exhaustive capsid detection or exact biological boundaries.
 
 Version 2.8.0 adds explicit confirmed-blank supervision to appearance-profile training. The private update combines 120 examples, uses confirmed large-capsid markings as positives, and treats the 43 confirmed blank images as negative examples. Unmarked regions in other images remain unknown. Select **Advanced → Detection profile → capsid-learned** to use the updated private profile. The learned detector also adds tight prompts for strong cores missed inside merged support, and checks final contour size before overlap suppression so a rejected small fragment cannot hide a usable larger contour. The installed profile, training audit and measured internal comparison are supplied in the private release bundle. The on-screen workflow, manual picking, picking speed, carbon checks, 3,500-pixel automatic size floor and SAM checkpoint retain their existing behavior.
 

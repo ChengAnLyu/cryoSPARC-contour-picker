@@ -30,7 +30,7 @@ $BuildDirectory = Join-Path $ProjectRoot "build"
 $ArtifactDirectory = Join-Path $ProjectRoot "artifacts"
 $VenvDirectory = Join-Path $ProjectRoot ".build-venv"
 $VenvPython = Join-Path $VenvDirectory "Scripts\python.exe"
-$AppVersion = "2.8.0"
+$AppVersion = "2.9.0"
 $Manifest = Get-Content (Join-Path $PSScriptRoot "model-manifest.json") -Raw | ConvertFrom-Json
 
 function Invoke-Checked {

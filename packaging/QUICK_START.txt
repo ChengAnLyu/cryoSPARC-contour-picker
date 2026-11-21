@@ -1,4 +1,4 @@
-SARU Picker 2.8.0 — Windows CPU edition
+SARU Picker 2.9.0 — Windows CPU edition
 
 Install once and open SARU Picker from the Start menu. Python, its libraries,
 and the SAM ViT-B model are included.
@@ -37,7 +37,7 @@ A covered selection now says it is already covered, and a contour with no grid
 sites reports the current spacing. Later valid contours remain selectable.
 When none remain, the status points to Next micrograph or Detect. The log records
 raw, blocked, eligible and sent counts. This selection behavior is retained in
-2.8.0, along with the 3,500-screen-pixel automatic capsid cutoff.
+2.9.0, along with the 3,500-screen-pixel automatic capsid cutoff.
 
 SEMI-AUTO
 Move the panel outside the intended micrograph area. Select screen area,
@@ -84,7 +84,7 @@ browser still need time to process picks; detection and image loading are
 separate. Use the lowest setting that registers reliably on your workstation.
 
 DETECTION
-The private 2.8.0 profile is trained with examples 1-120. It uses confirmed
+The private 2.9.0 profile is trained with examples 1-160. It uses confirmed
 large-capsid markings as positives and 43 confirmed blank images as negatives.
 Small markings and unmarked areas in other images remain unknown. Negative
 training includes carbon edges, debris and other unwanted structures within
@@ -94,6 +94,12 @@ Strong compact cores can now receive an additional tight SAM prompt when their
 weaker surrounding support previously hid them. Original prompts retain their
 priority and the same 24-prompt limit. Final polygon size is checked before
 overlap suppression, so a rejected small fragment cannot hide a larger contour.
+
+Learned mode scores the whole selected image. Local prompt-point, texture-ring
+and overlap calculations now avoid repeated full-image computation while
+preserving their results. SAM still uses one image encoding and at most 24
+prompts. The private guide reports measured runtime and coverage. Full-image
+scoring does not guarantee that every capsid is found or perfectly outlined.
 
 The default capsid profile retains the earlier texture heuristic. The
 capsid-learned option uses the experimental appearance model to locate dense
@@ -139,4 +145,4 @@ Both capsid profiles now skip final connected regions below 3,500 screen pixels.
 Advanced > Minimum capsid area (screen px²) changes this cutoff; 0 allows all
 sizes. Zoom changes apparent size. Manual drawing and Box prompts are unchanged.
 Changing recognition settings clears old proposals; choose Detect again.
-The size filter is retained in 2.8.0 alongside the updated 120-example profile.
+The size filter is retained in 2.9.0 alongside the updated 160-example profile.

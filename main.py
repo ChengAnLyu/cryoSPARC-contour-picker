@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SARU Picker 2.8.0: direct screen contours and model-assisted desktop picking.
+"""SARU Picker 2.9.0: direct screen contours and model-assisted desktop picking.
 Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
@@ -1447,11 +1447,19 @@ def _capsid_guided_prompts_at_threshold(scores: np.ndarray, *, threshold=.5,
         box = [max(0, x - margin), max(0, y - margin),
                min(scores.shape[1], x + width + margin),
                min(scores.shape[0], y + height + margin)]
-        distances = ndi.distance_transform_edt(mask)
-        cy, cx = np.unravel_index(np.argmax(distances * scores), scores.shape)
-        rank = float(np.mean(scores[mask]) * math.sqrt(mask.sum()))
+        # One background-pixel halo contains every nearest zero needed by the
+        # foreground EDT. Clip at real image edges: padding those with zeros
+        # would change point placement for a frame-truncated capsid.
+        region = (slice(max(0, y - 1), min(scores.shape[0], y + height + 1)),
+                  slice(max(0, x - 1), min(scores.shape[1], x + width + 1)))
+        local_mask, local_scores = mask[region], scores[region]
+        distances = ndi.distance_transform_edt(local_mask)
+        cy, cx = np.unravel_index(np.argmax(distances * local_scores), local_mask.shape)
+        cy, cx = cy + region[0].start, cx + region[1].start
+        area = int(local_mask.sum())
+        rank = float(np.mean(local_scores[local_mask]) * math.sqrt(area))
         proposals.append({'box': box, 'point': [int(cx), int(cy)], 'rank': rank,
-                          'support_area': int(mask.sum()), 'shape': shape})
+                          'support_area': area, 'shape': shape})
     # Existing eligible prompts retain their order and budget. New provisional
     # boxes only fill unused slots, even if a broad component has a high rank.
     return sorted(proposals, key=lambda item: (item['shape'].get('provisional', False), -item['rank']))[:max_prompts]
@@ -1509,7 +1517,10 @@ def _profile_masks_overlap(first, second):
     bx, by, bw, bh = second['bbox']
     if ax + aw <= bx or bx + bw <= ax or ay + ah <= by or by + bh <= ay:
         return False
-    return (np.count_nonzero(first['segmentation'] & second['segmentation'])
+    intersection = (slice(max(ay, by), min(ay + ah, by + bh)),
+                    slice(max(ax, bx), min(ax + aw, bx + bw)))
+    return (np.count_nonzero(first['segmentation'][intersection]
+                            & second['segmentation'][intersection])
             / min(first['area'], second['area']) >= .80)
 
 
@@ -1591,10 +1602,18 @@ def filter_capsid_with_profile(rgb: np.ndarray, raw_proposals, scores: np.ndarra
         support = ndi.binary_closing(allowed & (scores >= .5), iterations=4, border_value=1) & allowed
         for component, shape in _profile_components(support, min_area, max_area, check_cancel):
             component_area = int(component.sum())
-            annulus = (ndi.binary_dilation(component, iterations=20)
-                       & ~ndi.binary_dilation(component, iterations=3) & valid)
+            bbox = _capsid_bbox(component)
+            x, y, width, height = bbox
+            # A dilation cannot reach beyond its iteration radius. Work on
+            # that exact halo instead of traversing the whole screenshot for
+            # every alternative SAM mask; preserve real image-edge clipping.
+            region = (slice(max(0, y - 20), min(scores.shape[0], y + height + 20)),
+                      slice(max(0, x - 20), min(scores.shape[1], x + width + 20)))
+            local_component = component[region]
+            annulus = (ndi.binary_dilation(local_component, iterations=20)
+                       & ~ndi.binary_dilation(local_component, iterations=3) & valid[region])
             inside = float(np.median(texture[component]))
-            outside = float(np.median(texture[annulus])) if np.any(annulus) else global_median
+            outside = float(np.median(texture[region][annulus])) if np.any(annulus) else global_median
             local_ratio = inside / max(outside, 1e-7)
             global_ratio = inside / global_median
             # Require either a local grain increase or strong field-relative
@@ -1611,7 +1630,7 @@ def filter_capsid_with_profile(rgb: np.ndarray, raw_proposals, scores: np.ndarra
                         'proposal_stability_score': proposal.get('stability_score'),
                         'is_calibrated_probability': False}
             record = {'segmentation': component, 'area': component_area,
-                            'bbox': _capsid_bbox(component), 'predicted_iou': None,
+                            'bbox': bbox, 'predicted_iou': None,
                             'stability_score': None, 'capsid_score': rank,
                             'capsid_evidence': evidence, '_allowed': allowed,
                             'source': 'learned capsid core (review)'}
@@ -6003,7 +6022,7 @@ from PIL import Image, ImageDraw
 
 
 APP_LOG = logging.getLogger("saru_picker")
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
 
 

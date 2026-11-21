@@ -1,6 +1,6 @@
 # Experimental learned capsid appearance profile
 
-SARU Picker 2.8 can use a locally trained capsid appearance profile alongside the existing SAM ViT-B checkpoint. The floating panel, manual drawing, contour selection and click executor remain the same. The appearance profile is separate from SAM; installing it does not fine-tune or replace SAM's weights.
+SARU Picker 2.9 can use a locally trained capsid appearance profile alongside the existing SAM ViT-B checkpoint. The floating panel, manual drawing, contour selection and click executor remain the same. The appearance profile is separate from SAM; installing it does not fine-tune or replace SAM's weights.
 
 ## Install and select
 
@@ -9,6 +9,14 @@ Extract the complete Windows download. If the package includes `capsid-profile.j
 For a source installation, place `capsid-profile.json` beside the configured SAM checkpoint. A custom checkpoint in another folder needs its profile beside it as well. Advanced settings retain **generic** for unclassified SAM proposals. Manual drawing and user box prompts do not require the learned profile.
 
 The experimental setting requires its profile file. A missing or invalid profile produces an actionable error; select **capsid** to use the earlier texture-based detector. Detection diagnostics record the loaded file's identity and SHA-256.
+
+## 160-example update and local computation in 2.9.0
+
+The private profile update uses examples 1–160. Examples 121–160 supply additional confirmed large-capsid picks. The 43 confirmed blank images from the previous dataset remain explicit negative examples; small marks and unmarked pixels in other images remain unknown. The same annotation-derived large-reference criterion and conservative eroded cores are used. The runtime area cutoff remains a separate 3,500-screen-pixel setting. Source decks, per-case confirmations, split membership and profile identity are recorded in the private reproduction package.
+
+The learned detector already evaluates appearance features across the entire selected image. This release avoids repeated full-image geometry work: the distance transform used to place each prompt is computed over its bounding box with the required background halo, the surrounding texture ring uses a crop extended by its dilation radius, and overlap counts use only the shared mask bounding box. Crops are clipped at the actual image boundary, preserving edge behavior. These changes retain prompt positions, ranking, thresholds, contour decisions and the 24-prompt budget for a fixed score image and SAM proposals.
+
+A single SAM image encoding is reused for the image's prompts. This bounds expensive model work but does not establish exhaustive capsid recall: the appearance model can miss a region, candidate filtering can reject it, and the prompt budget can omit candidates in a crowded image. The private guide distinguishes known marked-core coverage, false contours on confirmed blanks and measured runtime. These labels still do not define exact biological segmentation boundaries or all capsids in each nonblank image.
 
 ## Shared carbon-boundary check in 2.6.1
 

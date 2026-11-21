@@ -1,12 +1,18 @@
-# SARU Picker 2.8.0 for Windows
+# SARU Picker 2.9.0 for Windows
 
-Install **SARU-Picker-Setup-2.8.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
+Install **SARU-Picker-Setup-2.9.0-win64.exe**, then open **SARU Picker** from the Start menu or desktop shortcut. This x64 CPU edition includes Python, its libraries, and the original SAM ViT-B checkpoint. No separate Python or model setup is needed. It upgrades the existing SARU Picker installation.
 
 When the download includes a custom icon, first **extract the whole ZIP** so
 `app-icon.png` and `app-icon.ico` are beside setup. The installer applies them
 to the installed application, its EXE and its shortcuts. The setup EXE itself
 uses the public geometric icon. Setup also works without the optional sidecars,
 using that fallback for the installed app.
+
+## Version 2.9.0: 160 examples and less repeated computation
+
+The private appearance profile uses all 160 examples, including the newly confirmed large capsid picks in examples 121–160 and the same 43 confirmed blank images. Keep `capsid-profile.json` beside setup and choose **Advanced → Detection profile → capsid-learned**. The private guide identifies the exact profile and records its measured coverage, unwanted detections and runtime comparison.
+
+The learned detector still scores the full screen selection and uses one SAM image encoding with at most 24 prompts. Prompt-point, surrounding-texture and mask-overlap calculations now operate on the relevant local regions instead of repeatedly traversing the full image. This preserves their mathematical results and avoids adding SAM passes. It does not make the search exhaustive or validate the exact biological boundary of every contour. The floating panel, manual mode, click pacing, navigation, carbon checks, minimum automatic area of 3,500 screen pixels, default capsid heuristic and SAM checkpoint retain their existing behavior.
 
 ## Version 2.8.0: training with confirmed blank examples
 
