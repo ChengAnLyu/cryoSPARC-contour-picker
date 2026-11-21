@@ -39,6 +39,12 @@ Ten grouped folds hold out each of the 120 examples once. The earlier 80 example
 
 The public repository contains the trainer and inference implementation. The private bundle supplies the trained profile, data provenance and measured results. Only `capsid-learned` loads these weights; the default `capsid` heuristic and SAM checkpoint are unchanged.
 
+## Strong-core prompts and size eligibility in 2.8.0
+
+A clear, strongly scored capsid can be joined to weaker surrounding material in the appearance map. The resulting irregular support component may fail the prompt geometry checks before SAM sees the intended core. The learned detector now adds a compact seed pass at appearance score 0.9 after the original 0.5 prompt pass. Existing prompts keep their geometry, order and priority; additional boxes fill only unused slots within the same 24-prompt budget and near-duplicate boxes are skipped. These scores remain uncalibrated. A seed only asks SAM for a proposal; the final appearance, shape, carbon and minimum-size checks still determine whether a contour is selectable.
+
+With a positive minimum capsid area, the learned refiner fits its final polygon and checks each four-connected foreground component before overlap suppression and the final selection limit. A polygon below the cutoff cannot suppress an eligible larger alternative and then disappear at the later size gate. The check uses final polygon pixels, excluding holes; it does not approximate final area with the earlier support mask. The zero-cutoff refinement path retains its earlier behavior, and the final automatic output gate remains in place. The default capsid heuristic, explicit prompts, manual drawing and picking controls are unchanged.
+
 ## Training with additional examples in 2.7.0
 
 The private 2.7.0 update combines examples 1–40 and 41–80. Every clean screenshot contributes unlabeled samples; positive supervision comes only from supplied markings. Unmarked screenshots remain unlabeled. Model metadata records both source-deck hashes, the exact manifest, grouped folds, feature and trainer source hashes, and the actual training cases. The installed profile is fitted using all 80 examples after internal comparison with the previous profile.

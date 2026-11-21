@@ -705,9 +705,10 @@ def _profile_components(support: np.ndarray, min_area: int, max_area: float,
                     yield mask, shape
 
 
-def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
+def _capsid_guided_prompts_at_threshold(scores: np.ndarray, *, threshold=.5,
+                          allow_provisional=True, min_area_ratio=.002,
                           max_area_ratio=.40, max_prompts=24, check_cancel=None):
-    """Bounded SAM boxes, prioritizing compact support before provisional boxes."""
+    """Run the existing prompt geometry at one appearance threshold."""
     _capsid_check(check_cancel)
     scores = np.asarray(scores)
     if scores.ndim != 2 or not scores.size or not np.isfinite(scores).all():
@@ -719,13 +720,13 @@ def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
     max_prompts = min(24, max_prompts)
     min_area = max(64, math.ceil(min_area_ratio * scores.size))
     max_area = max_area_ratio * scores.size
-    support = ndi.binary_closing(scores >= .5, iterations=4, border_value=1)
+    support = ndi.binary_closing(scores >= threshold, iterations=4, border_value=1)
     _capsid_check(check_cancel)
     support &= scores > 0
     support = ndi.binary_opening(support, iterations=3, border_value=0)
     proposals = []
     for mask, shape in _profile_components(support, min_area, max_area, check_cancel,
-                                           allow_provisional=True):
+                                           allow_provisional=allow_provisional):
         _capsid_check(check_cancel)
         x, y, width, height = _capsid_bbox(mask)
         margin = max(6, min(24, round(max(width, height) * .12)))
@@ -739,7 +740,45 @@ def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
                           'support_area': int(mask.sum()), 'shape': shape})
     # Existing eligible prompts retain their order and budget. New provisional
     # boxes only fill unused slots, even if a broad component has a high rank.
-    return sorted(proposals, key=lambda item: (item['shape']['provisional'], -item['rank']))[:max_prompts]
+    return sorted(proposals, key=lambda item: (item['shape'].get('provisional', False), -item['rank']))[:max_prompts]
+
+
+def _prompt_box_iou(first, second):
+    ax1, ay1, ax2, ay2 = first
+    bx1, by1, bx2, by2 = second
+    intersection = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - intersection
+    return intersection / max(1, union)
+
+
+def capsid_guided_prompts(scores: np.ndarray, *, min_area_ratio=.002,
+                          max_area_ratio=.40, max_prompts=24, check_cancel=None):
+    """Append compact high-score seeds to unused prompt slots.
+
+    The original .5 prompts retain exact geometry, rank and priority. Strict .9
+    components may add a tighter box when a broad .5 component merges the capsid
+    with surrounding dense texture. Box IoU, not containment, rejects duplicate
+    prompts so that a compact box inside a much larger one can still be useful.
+    No final acceptance, refinement or size-filter thresholds are changed.
+    """
+    primary = _capsid_guided_prompts_at_threshold(
+        scores, threshold=.5, allow_provisional=True, min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio, max_prompts=max_prompts, check_cancel=check_cancel)
+    selected = [{**prompt, 'seed_threshold': .5} for prompt in primary]
+    budget = min(24, max_prompts)
+    if len(selected) >= budget or budget <= 0:
+        return selected
+    compact = _capsid_guided_prompts_at_threshold(
+        scores, threshold=.9, allow_provisional=False, min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio, max_prompts=24, check_cancel=check_cancel)
+    for prompt in compact:
+        _capsid_check(check_cancel)
+        if any(_prompt_box_iou(prompt['box'], old['box']) >= .80 for old in selected):
+            continue
+        selected.append({**prompt, 'seed_threshold': .9})
+        if len(selected) >= budget:
+            break
+    return selected
 
 
 def _profile_pool_offer(pool, record, serial):
@@ -760,9 +799,39 @@ def _profile_masks_overlap(first, second):
             / min(first['area'], second['area']) >= .80)
 
 
+def _profile_fitted_eligible_records(record, minimum_area_px, check_cancel=None):
+    """Yield actual final polygons eligible to participate in overlap suppression.
+
+    The minimum counts four-connected foreground pixels after polygon fitting,
+    excluding holes. A small rejected polygon must not suppress a larger usable
+    alternative. This is intentionally not a cutoff on the pre-polygon mask.
+    """
+    _capsid_check(check_cancel)
+    fitted, polygon_evidence = polygonal_capsid_mask(
+        record['segmentation'], allowed_mask=record['_allowed'], check_cancel=check_cancel)
+    labels, count = ndi.label(fitted)
+    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+    eligible = np.flatnonzero(sizes[1:] >= minimum_area_px) + 1
+    for label in eligible:
+        _capsid_check(check_cancel)
+        component = fitted if count == 1 else labels == label
+        evidence = dict(record['capsid_evidence'])
+        evidence['polygon'] = polygon_evidence
+        evidence['area_filter'] = {
+            'minimum_area_px': minimum_area_px, 'source_area': int(sizes[1:].sum()),
+            'source_component_count': count, 'component_area': int(sizes[label]),
+            'before_overlap_suppression': True,
+            'inherited_evidence_applies_to_source_mask': count > 1}
+        result = {**record, 'segmentation': component, 'area': int(sizes[label]),
+                  'bbox': _capsid_bbox(component), 'capsid_evidence': evidence,
+                  'source': 'learned capsid polygon (review)'}
+        result.pop('_allowed', None)
+        yield result
+
+
 def filter_capsid_with_profile(rgb: np.ndarray, raw_proposals, scores: np.ndarray, *,
                                check_cancel=None, min_area_ratio=.002,
-                               max_area_ratio=.40, max_candidates=24):
+                               max_area_ratio=.40, max_candidates=24, min_capsid_area_px=0):
     """Refine guided SAM masks with the same learned support used for prompting.
 
     The resulting bitmap is used for overlay, hit testing and picking. This
@@ -776,6 +845,9 @@ def filter_capsid_with_profile(rgb: np.ndarray, raw_proposals, scores: np.ndarra
         raise ValueError('Capsid profile scores and screenshot must have matching image dimensions.')
     if not 0 <= min_area_ratio < max_area_ratio <= 1:
         raise ValueError('Capsid area ratios must satisfy 0 <= min < max <= 1.')
+    if (isinstance(min_capsid_area_px, bool) or not isinstance(min_capsid_area_px, int)
+            or min_capsid_area_px < 0):
+        raise ValueError('min_capsid_area_px must be a nonnegative integer.')
     if max_candidates <= 0:
         return []
     max_candidates = min(24, max_candidates)
@@ -836,12 +908,24 @@ def filter_capsid_with_profile(rgb: np.ndarray, raw_proposals, scores: np.ndarra
     selected = []
     for record in ranked:
         _capsid_check(check_cancel)
+        if min_capsid_area_px:
+            for fitted in _profile_fitted_eligible_records(record, min_capsid_area_px, check_cancel):
+                if any(_profile_masks_overlap(fitted, previous) for previous in selected):
+                    continue
+                selected.append(fitted)
+                if len(selected) >= max_candidates:
+                    break
+            if len(selected) >= max_candidates:
+                break
+            continue
         if any(_profile_masks_overlap(record, previous) for previous in selected):
             continue
         selected.append(record)
         if len(selected) >= max_candidates:
             break
     ranked.clear()
+    if min_capsid_area_px:
+        return selected
     for record in selected:
         fitted, evidence = polygonal_capsid_mask(record['segmentation'],
                                                 allowed_mask=record.pop('_allowed'),

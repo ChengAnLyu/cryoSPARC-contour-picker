@@ -560,7 +560,8 @@ class SamRecognizer:
                     raw = filter_capsid_with_profile(
                         rgb, raw, appearance_scores, check_cancel=lambda: _check_cancel(cancel),
                         min_area_ratio=self.config.min_area_ratio,
-                        max_area_ratio=min(self.config.max_area_ratio, .40))
+                        max_area_ratio=min(self.config.max_area_ratio, .40),
+                        min_capsid_area_px=self.config.min_capsid_area_px)
                 else:
                     raw = filter_capsid_proposals(
                         rgb, raw, check_cancel=lambda: _check_cancel(cancel),

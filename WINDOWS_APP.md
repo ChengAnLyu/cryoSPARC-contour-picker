@@ -12,7 +12,7 @@ using that fallback for the installed app.
 
 The private download combines examples 1–120 to update the learned appearance profile. Large-capsid markings are confirmed positives; the 43 confirmed blank images provide explicit negative supervision, including their carbon edges, debris and other unwanted structures. Other unmarked areas remain unknown. Keep `capsid-profile.json` beside setup during installation and choose **Advanced → Detection profile → capsid-learned**. The private guide contains the measured comparison and model identity.
 
-This update preserves manual picking, the floating panel, repeated semi-auto selection, auto navigation, speed settings, carbon checks and the 3,500-screen-pixel minimum automatic contour area. The default `capsid` heuristic and the SAM checkpoint are unchanged. A negative training example means no wanted large-capsid picks in that image; it need not be visually empty.
+The learned detector adds tight prompts around strongly scored cores that were previously merged with surrounding support. It also checks final contour size before overlap suppression, so an undersized fragment cannot hide a usable larger contour. This update preserves manual picking, the floating panel, repeated semi-auto selection, auto navigation, speed settings, carbon checks and the 3,500-screen-pixel minimum automatic contour area. The default `capsid` heuristic and the SAM checkpoint are unchanged. A negative training example means no wanted large-capsid picks in that image; it need not be visually empty.
 
 ## Version 2.7.2: repeated semi-auto selections
 

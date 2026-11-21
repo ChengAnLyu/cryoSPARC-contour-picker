@@ -90,6 +90,10 @@ Small markings and unmarked areas in other images remain unknown. Negative
 training includes carbon edges, debris and other unwanted structures within
 the confirmed blank images. Model selection balances blank-image false picks
 against coverage of known large capsids. Final shape and carbon checks apply.
+Strong compact cores can now receive an additional tight SAM prompt when their
+weaker surrounding support previously hid them. Original prompts retain their
+priority and the same 24-prompt limit. Final polygon size is checked before
+overlap suppression, so a rejected small fragment cannot hide a larger contour.
 
 The default capsid profile retains the earlier texture heuristic. The
 capsid-learned option uses the experimental appearance model to locate dense
