@@ -75,11 +75,11 @@ def test_parallel_checkpoint_does_not_select_sam_weights():
         models = Path(directory) / "models"
         models.mkdir()
         (models / app.DEFAULT_CHECKPOINT).write_bytes(b"sam")
-        assert app.resolve_checkpoint(backend="cryolo") == models / "cryolo-capsids.h5"
+        assert app.resolve_checkpoint(backend="cryolo") == (models / "cryolo-capsids.h5").resolve()
         (models / "cryolo-capsids.h5").write_bytes(b"cryolo")
         assert app.resolve_checkpoint(backend="cryolo").read_bytes() == b"cryolo"
         explicit = Path(directory) / "missing.h5"
-        assert app.resolve_checkpoint(explicit, backend="cryolo") == explicit
+        assert app.resolve_checkpoint(explicit, backend="cryolo") == explicit.resolve()
 
 
 def test_screen_settings_reach_cryolo_configuration():

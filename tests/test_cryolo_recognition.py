@@ -255,8 +255,10 @@ def test_automatic_cache_restores_its_report_after_prompt(runtime):
 def test_relative_runtime_is_resolved_before_changing_child_directory(runtime, monkeypatch):
     tmp_path, script, config = runtime
     script.write_text(blank_program())
-    monkeypatch.chdir(tmp_path)
-    relative_python = os.path.relpath(sys.executable, tmp_path)
+    # Windows runners can put the interpreter and temp files on different
+    # drives, between which a relative path cannot exist.
+    monkeypatch.chdir(Path(sys.executable).parent)
+    relative_python = os.path.join('.', Path(sys.executable).name)
     model = CryoloRecognizer(replace(config, cryolo_python=relative_python))
     assert Path(model._paths()[0]).is_absolute()
     image = np.zeros((80, 120, 3), np.uint8)
