@@ -29,7 +29,7 @@ jobs:
           import hashlib, json, os, urllib.request, urllib.error
           from pathlib import Path
 
-          expected = {'repository': 'ChengAnLyu/cryoSPARC-contour-picker', 'branch': 'packaging/windows-installer-20261119', 'artifact_id': 14708536031, 'artifact_name': 'SARU-Picker-Windows-CPU-21', 'sha256': 'd4d3d0e52e932772828491843e85cd74de5e400f94fd9a32cac100b2cc809359', 'bytes': 480745328, 'source_run_id': 44906926368, 'source_job_id': 136854396302, 'source_commit': 'ca74fd0232a9cefee6098d16a067f768faa470a0'}
+          expected = {'repository': 'ChengAnLyu/cryoSPARC-contour-picker', 'branch': 'packaging/windows-installer-20261119', 'artifact_id': 14709674214, 'artifact_name': 'SARU-Picker-Windows-CPU-22', 'sha256': 'd910fb4a462b711d875b5a1efba456af84d1bae36d754296a0db8c391d1f3ff7', 'bytes': 480763339, 'source_run_id': 44911396191, 'source_job_id': 136867789523, 'source_commit': '56fe25d1fd462ec9a1fa39ef7d45c7cfd4557fe8'}
 
           def need(condition, message):
               if not condition:
