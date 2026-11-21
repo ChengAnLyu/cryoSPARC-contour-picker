@@ -1,5 +1,6 @@
 """crYOLO protocol/coordinate tests; synthetic child runtime, never model claims."""
 from dataclasses import replace
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from recognition import RecognitionConfig, RecognitionError, Cancelled
 from cryolo_recognition import CryoloBox, CryoloRecognizer, read_cbox
+from runtime_management import RuntimeSetupError, RuntimeSetupCancelled
 
 
 HEADER = '''data_global
@@ -110,6 +112,15 @@ def runtime(tmp_path, monkeypatch):
     config = tmp_path / 'config.json'
     config.write_text(json.dumps({'model': {'architecture': 'PhosaurusNet'}}))
     monkeypatch.setenv('PYTHONPATH', str(tmp_path))
+    # The synthetic module lives only on this test's PYTHONPATH. Production
+    # sanitization is tested independently; this seam proves the adapter uses
+    # the external-process context and keeps subprocess execution real.
+    @contextmanager
+    def synthetic_external_environment(env):
+        child = dict(env)
+        child['SARU_TEST_EXTERNAL_CONTEXT'] = '1'
+        yield child
+    monkeypatch.setattr('cryolo_recognition.external_process_environment', synthetic_external_environment)
     cfg = RecognitionConfig(str(weights), backend='cryolo', cryolo_config=str(config),
                             cryolo_python=sys.executable, device='cpu', cryolo_timeout=5,
                             automatic_profile='capsid', min_capsid_area_px=0)
@@ -122,6 +133,7 @@ from pathlib import Path
 from PIL import Image
 args=sys.argv[1:]
 assert os.environ['CUDA_VISIBLE_DEVICES']=='-1'
+assert os.environ['SARU_TEST_EXTERNAL_CONTEXT']=='1'
 assert '-g' not in args
 assert '--write_empty' in args
 image = Image.open(Path(args[args.index('-i')+1])/'screen.png')
@@ -265,3 +277,55 @@ def test_relative_runtime_is_resolved_before_changing_child_directory(runtime, m
     image[0] = 222
     image[-1] = 11
     assert model.automatic(image) == []
+
+
+def test_runtime_setup_error_never_requests_interpreter_selection(runtime, monkeypatch):
+    _, _, config = runtime
+    monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    model = CryoloRecognizer(replace(config, cryolo_python=None))
+    with patch('cryolo_recognition.ensure_cryolo_runtime', side_effect=RuntimeSetupError('Run SARU Picker Setup to repair it.')):
+        with pytest.raises(RecognitionError, match='Run SARU Picker Setup') as error:
+            model._paths()
+    assert 'Select the Python' not in str(error.value)
+
+
+def test_implicit_runtime_is_prepared_automatically(runtime, monkeypatch):
+    _, _, config = runtime
+    monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    model = CryoloRecognizer(replace(config, cryolo_python=None))
+    cancel = lambda: False
+    with patch('cryolo_recognition.ensure_cryolo_runtime', return_value=Path(sys.executable)) as setup:
+        executable, _, _ = model._paths(cancel)
+    setup.assert_called_once_with(cancel=cancel)
+    assert executable == os.path.abspath(sys.executable)
+
+
+@pytest.mark.parametrize('use_environment_override', [False, True])
+def test_explicit_runtime_override_bypasses_managed_setup(runtime, monkeypatch, use_environment_override):
+    _, _, config = runtime
+    if use_environment_override:
+        monkeypatch.setenv('SARU_CRYOLO_PYTHON', sys.executable)
+        config = replace(config, cryolo_python=None)
+    else:
+        monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    with patch('cryolo_recognition.ensure_cryolo_runtime', side_effect=AssertionError('Must not install an overridden runtime')):
+        assert CryoloRecognizer(config)._paths()[0] == os.path.abspath(sys.executable)
+
+
+def test_setup_cancellation_uses_standard_cancelled_exception(runtime, monkeypatch):
+    _, _, config = runtime
+    monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    model = CryoloRecognizer(replace(config, cryolo_python=None))
+    with patch('cryolo_recognition.ensure_cryolo_runtime', side_effect=RuntimeSetupCancelled('cancelled by user')):
+        with pytest.raises(Cancelled, match='cancelled by user'):
+            model._paths()
+
+
+def test_missing_model_does_not_start_runtime_installation(runtime, monkeypatch):
+    _, _, config = runtime
+    monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    Path(config.checkpoint).unlink()
+    model = CryoloRecognizer(replace(config, cryolo_python=None))
+    with patch('cryolo_recognition.ensure_cryolo_runtime', side_effect=AssertionError('Unnecessary install')):
+        with pytest.raises(RecognitionError, match='weights not found'):
+            model._paths()

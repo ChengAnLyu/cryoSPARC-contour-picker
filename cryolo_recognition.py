@@ -30,6 +30,8 @@ from recognition import (Cancelled, RecognitionConfig, RecognitionError,
 from capsid import filter_capsid_proposals, filter_capsid_with_profile
 from capsid_prior import load_profile, resolve_profile_path, score_image
 from carbon_support import detect_carbon_edges, guard_proposals
+from runtime_management import (ensure_cryolo_runtime, RuntimeSetupError, RuntimeSetupCancelled,
+                                external_process_environment)
 
 
 @dataclass(frozen=True)
@@ -189,30 +191,12 @@ class CryoloRecognizer:
         self._profile = None
         self._process = None
 
-    def _paths(self):
+    def _paths(self, cancel=None):
         weights = Path(self.config.checkpoint).expanduser().resolve()
         config_value = getattr(self.config, "cryolo_config", None)
         config_path = (Path(config_value).expanduser().resolve() if config_value
                        else weights.with_name("cryolo-config.json"))
-        python_value = getattr(self.config, "cryolo_python", None) or os.environ.get("SARU_CRYOLO_PYTHON")
-        if not python_value and os.name == "nt":
-            local_app_data = os.environ.get("LOCALAPPDATA")
-            if local_app_data:
-                runtime = Path(local_app_data) / "SARU_Picker_crYOLO" / "cryolo-env"
-                for installed in (runtime / "Scripts" / "python.exe", runtime / "python.exe"):
-                    if installed.is_file():
-                        python_value = str(installed)
-                        break
-        if not python_value:
-            raise RecognitionError("Select the Python executable in your installed crYOLO environment (crYOLO settings).")
-        executable = shutil.which(str(python_value))
-        if executable is None and Path(python_value).expanduser().is_file():
-            executable = os.path.abspath(os.path.expanduser(python_value))
-        if not executable:
-            raise RecognitionError(f"crYOLO Python executable was not found: {python_value}")
-        # Keep the venv executable spelling: resolving its symlink would
-        # bypass pyvenv.cfg and lose the separately installed crYOLO packages.
-        executable = os.path.abspath(executable)
+        # Check the chosen model before spending time preparing its runtime.
         for label, path in (("weights", weights), ("configuration", config_path)):
             if not path.is_file():
                 raise RecognitionError(f"crYOLO {label} not found: {path}")
@@ -222,11 +206,28 @@ class CryoloRecognizer:
                 raise ValueError("Missing model configuration.")
         except (OSError, ValueError) as exc:
             raise RecognitionError(f"Invalid crYOLO configuration: {exc}") from exc
+        python_value = getattr(self.config, "cryolo_python", None) or os.environ.get("SARU_CRYOLO_PYTHON")
+        if not python_value:
+            try:
+                python_value = str(ensure_cryolo_runtime(cancel=cancel))
+            except RuntimeSetupCancelled as exc:
+                raise Cancelled(str(exc)) from exc
+            except (RuntimeSetupError, OSError) as exc:
+                raise RecognitionError(f"Could not prepare the crYOLO runtime: {exc}") from exc
+        _check_cancel(cancel)
+        executable = shutil.which(str(python_value))
+        if executable is None and Path(python_value).expanduser().is_file():
+            executable = os.path.abspath(os.path.expanduser(python_value))
+        if not executable:
+            raise RecognitionError(f"The configured crYOLO runtime was not found: {python_value}. Run SARU Picker Setup to repair the runtime, or correct the explicit --cryolo-python override.")
+        # Keep the venv executable spelling: resolving its symlink would
+        # bypass pyvenv.cfg and lose the separately installed crYOLO packages.
+        executable = os.path.abspath(executable)
         return executable, weights, config_path
 
     def _predict(self, rgb, cancel):
         _check_cancel(cancel)
-        executable, weights, config_path = self._paths()
+        executable, weights, config_path = self._paths(cancel)
         signature = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns)
                           for p in (weights, config_path))
         key = _image_key(rgb)
@@ -268,10 +269,11 @@ class CryoloRecognizer:
             started = time.monotonic()
             try:
                 with log_path.open("wb") as log:
-                    self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
-                                                     stdout=log, stderr=subprocess.STDOUT,
-                                                     cwd=folder, env=env,
-                                                     start_new_session=os.name != "nt")
+                    with external_process_environment(env) as child_env:
+                        self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                                         stdout=log, stderr=subprocess.STDOUT,
+                                                         cwd=folder, env=child_env,
+                                                         start_new_session=os.name != "nt")
                     while self._process.poll() is None:
                         _check_cancel(cancel)
                         if time.monotonic() - started > getattr(self.config, "cryolo_timeout", 180):

@@ -1,4 +1,4 @@
-"""Collect GUI notices without claiming to redistribute SAM or crYOLO."""
+"""Collect bundled GUI/SAM notices and identify the external crYOLO dependency."""
 from pathlib import Path
 import sys
 
@@ -10,9 +10,5 @@ if __name__ == "__main__":
     collect(target)
     overview = target / "THIRD_PARTY_NOTICES.txt"
     text = overview.read_text(encoding="utf-8")
-    text = text.replace("The bundled original SAM ViT-B model is distributed under Apache-2.0.\n"
-                        "Model source: https://github.com/facebookresearch/segment-anything", 
-                        "This GUI bundle contains neither SAM nor the crYOLO software/runtime.\n"
-                        "crYOLO is installed separately from its official distribution.\n"
-                        "crYOLO license: https://cryolo-doc.readthedocs.io/en/stable/other/license.html")
+    text += "\ncrYOLO is installed separately from its official distribution; its software and\ngeneral pretrained weights are not redistributed in this bundle.\ncrYOLO license: https://cryolo-doc.readthedocs.io/en/stable/other/license.html\n"
     overview.write_text(text, encoding="utf-8")

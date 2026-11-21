@@ -11,7 +11,7 @@ import sys
 import time
 
 
-def verify(directory):
+def verify(directory, keep_fixture=False):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
@@ -61,7 +61,8 @@ def verify(directory):
     cboxes = list(output.rglob('synthetic.cbox'))
     if len(cboxes) != 1:
         raise RuntimeError('Stock crYOLO did not write exactly one synthetic CBOX result.')
-    weights.unlink()  # Never deliver the synthetic untrained detector as a model.
+    if not keep_fixture:
+        weights.unlink()  # Never deliver the synthetic detector as a model.
     report = {'status': 'ok', 'platform': sys.platform, 'python': sys.version,
               'tensorflow': tf.__version__, 'network_output_shape': list(prediction.shape),
               'elapsed_seconds': time.monotonic() - started, 'cbox_created': True,
@@ -71,4 +72,10 @@ def verify(directory):
 
 
 if __name__ == '__main__':
-    print(json.dumps(verify(sys.argv[1]), indent=2))
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory")
+    parser.add_argument("--keep-fixture", action="store_true",
+                        help="Keep the temporary synthetic checkpoint for frozen-process integration testing.")
+    args = parser.parse_args()
+    print(json.dumps(verify(args.directory, keep_fixture=args.keep_fixture), indent=2))

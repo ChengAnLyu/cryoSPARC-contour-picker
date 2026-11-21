@@ -1,9 +1,10 @@
-# SARU Picker 3.0.0 — integrated crYOLO model
+# SARU Picker 3.0.0 — fourth detection profile
 
-Version 3.0.0 makes the real crYOLO 1.9.9 detector the default model. It keeps
+The corrected version 3.0.0 adds real crYOLO 1.9.9 as the fourth detection profile
+alongside the existing SAM-based capsid, capsid-learned and generic choices. It keeps
 the 2.9.0 screen capture, manual contours, selection overlays, grid sampling,
-click delay, cancellation and micrograph navigation. It has a separate launcher,
-Windows installation and settings directory.
+click delay, cancellation and micrograph navigation. All four detection profiles
+share the same application and unified settings.
 
 crYOLO predicts boxes, not segmentation masks. The existing capsid appearance
 and texture processing traces contours inside its detections; carbon rejection
@@ -21,21 +22,23 @@ Install the current GUI requirements in Python 3.12:
 
 ```sh
 python -m pip install -r requirements.txt
-python main_cryolo.py --checkpoint /path/to/cryolo-capsids.h5 \
+python main.py --automatic-profile cryolo --checkpoint /path/to/cryolo-capsids.h5 \
   --cryolo-config /path/to/cryolo-config.json \
   --cryolo-python /path/to/cryolo-environment/bin/python
 ```
 
-Place `capsid-profile.json` beside the H5 weights. Configure the model paths,
-runtime and confidence threshold under Advanced. Settings are remembered in
-the separate crYOLO user directory. Both `main.py` and `main_cryolo.py` default to crYOLO with the learned capsid
-contour profile. Legacy SAM remains an explicit `--backend sam` source option.
+Place `capsid-profile.json` beside the H5 weights. Configure model paths and
+confidence under Advanced. The managed Windows runtime is found automatically;
+`--cryolo-python` remains an optional source-only override. Unified detector
+settings remember separate SAM and crYOLO paths. `main.py` defaults to the original SAM capsid profile; select `cryolo` in
+Advanced → Detection profile to use the trained detector. `main_cryolo.py`
+remains a compatibility shortcut. All four choices are available in one GUI.
 
-The Windows release includes a separate GUI installer. Keep its private model,
-config, profile and icon sidecars beside Setup when installing. Run the included
-`Install-crYOLO-Runtime.cmd` once (also available from the application's
-Start-menu folder) to acquire stock crYOLO and its isolated Python 3.7 CPU
-environment, or choose an existing compatible crYOLO interpreter in Advanced. The modern
+The Windows release includes one combined installer. Keep its private model,
+config, profile and icon sidecars beside Setup when installing. Setup includes the verified private Python 3.7 package and automatically
+acquires and verifies stock crYOLO in its isolated CPU environment. A healthy existing runtime
+is reused. No Python executable picker is required. First-time setup requires
+internet access. The modern
 GUI and legacy model environment run in separate processes. Setup does not
 replace the SAM installation or alter the system Python PATH.
 
@@ -145,8 +148,8 @@ appearance profile are carried forward. No additional model training is claimed.
 
 The Windows installer is `SARU-Picker-crYOLO-Setup-3.0.0-win64.exe`.
 Application diagnostics, the EXE's Windows version metadata, the installer and
-release manifest identify version 3.0.0. Existing crYOLO runtime and settings
-paths are retained. Private model sidecars are installed automatically from
+release manifest identify version 3.0.0. The four-profile selector keeps SAM and
+crYOLO configuration separate. The managed crYOLO runtime path is retained. Private model sidecars are installed automatically from
 beside Setup. See [the packaging notes](packaging/cryolo/README.md) for the
 build procedure. The private release record identifies the actual successful
 3.0.0 build commit, artifact hashes and trained-model integration checks.

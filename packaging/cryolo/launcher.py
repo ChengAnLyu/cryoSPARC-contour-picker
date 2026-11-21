@@ -1,4 +1,4 @@
-"""Windowed entry point for the separately installed crYOLO edition."""
+"""Windowed entry point for SARU 3.0 with four detection profiles."""
 from __future__ import annotations
 
 import faulthandler
@@ -18,8 +18,8 @@ def launch() -> int:
             if getattr(sys, name) is None:
                 setattr(sys, name, (directory / "startup.log").open("a", encoding="utf-8", buffering=1))
         faulthandler.enable(file=fault_stream, all_threads=True)
-        import main_cryolo
-        return int(main_cryolo.main() or 0)
+        import app
+        return int(app.main() or 0)
     except Exception as exc:
         detail = traceback.format_exc()
         (directory / "startup-error.txt").write_text(detail, encoding="utf-8")
@@ -28,8 +28,8 @@ def launch() -> int:
         if not headless and sys.platform == "win32":
             import ctypes
             ctypes.windll.user32.MessageBoxW(None,
-                f"SARU Picker crYOLO could not start.\n\n{exc}\n\nDetails: {directory}",
-                "SARU Picker crYOLO", 0x10)
+                f"SARU Picker 3.0 could not start.\n\n{exc}\n\nDetails: {directory}",
+                "SARU Picker 3.0", 0x10)
         else:
             print(detail, file=sys.stderr)
         return 1

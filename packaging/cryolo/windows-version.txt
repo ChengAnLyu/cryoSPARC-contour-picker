@@ -13,11 +13,11 @@ VSVersionInfo(
     StringFileInfo([
       StringTable('040904B0', [
         StringStruct('CompanyName', 'SARU Picker'),
-        StringStruct('FileDescription', 'SARU Picker crYOLO 3.0.0 — contour particle picking'),
+        StringStruct('FileDescription', 'SARU Picker 3.0.0 — four detection profiles'),
         StringStruct('FileVersion', '3.0.0'),
         StringStruct('InternalName', 'SARU Picker crYOLO'),
         StringStruct('OriginalFilename', 'SARU Picker crYOLO.exe'),
-        StringStruct('ProductName', 'SARU Picker crYOLO'),
+        StringStruct('ProductName', 'SARU Picker'),
         StringStruct('ProductVersion', '3.0.0')
       ])
     ]),

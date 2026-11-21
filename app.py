@@ -44,7 +44,10 @@ from execution import (
 )
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
 from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fraction,
-                        screen_region_overlaps_panel, save_cryolo_settings)
+                        screen_region_overlaps_panel, initialize_detector_fields, detector_config_from_fields,
+                        detection_profile_value, persist_detector_fields, apply_detector_args)
+from detector_selection import (DETECTION_PROFILES, canonical_detection_profile, resolve_detection_profile,
+                                load_detector_settings)
 from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_overlay
 
 APP_LOG = logging.getLogger("saru_picker")
@@ -59,9 +62,9 @@ def user_state_directory() -> Path:
     if sys.platform == "win32":
         local_app_data = os.environ.get("LOCALAPPDATA")
         if local_app_data and Path(local_app_data).is_absolute():
-            return Path(local_app_data) / ("SARU_Picker_crYOLO" if ACTIVE_BACKEND == "cryolo" else "SARU_Picker")
-        return Path.home() / "AppData" / "Local" / ("SARU_Picker_crYOLO" if ACTIVE_BACKEND == "cryolo" else "SARU_Picker")
-    return Path.home() / (".saru_picker_cryolo" if ACTIVE_BACKEND == "cryolo" else ".saru_picker")
+            return Path(local_app_data) / "SARU_Picker"
+        return Path.home() / "AppData" / "Local" / "SARU_Picker"
+    return Path.home() / ".saru_picker"
 
 
 def resolve_checkpoint(explicit: str | Path | None = None, *, backend: str = "sam") -> Path:
@@ -144,7 +147,7 @@ def diagnostic_report(log_path: Path, checkpoint: Path) -> dict[str, Any]:
         except importlib.metadata.PackageNotFoundError:
             dependencies[package] = None
     return {
-        "status": "ok", "mode": "diagnostics", "version": APP_VERSION,
+        "status": "ok", "mode": "diagnostics", "version": APP_VERSION, "backend": "sam",
         "python": sys.version, "platform": sys.platform,
         "frozen": bool(getattr(sys, "frozen", False)),
         "dependencies": dependencies,
@@ -1696,7 +1699,7 @@ class PickerApp:
     def _build_ui(self):
         tk, ttk, root = self.tk, self.ttk, self.root
         is_cryolo = getattr(self.args, "backend", "sam") == "cryolo"
-        root.title("SARU Picker 3.0.0 crYOLO — review masks, then pick" if is_cryolo else "SARU Picker 3.0.0 SAM — review masks, then pick")
+        root.title("SARU Picker 3.0.0 — review masks, then pick")
         root.geometry("1280x900")
         root.minsize(1040, 760)
         root.columnconfigure(1, weight=1)
@@ -1727,37 +1730,40 @@ class PickerApp:
                    command=lambda: self.capture(False)).pack(fill="x")
         self.source_label = tk.StringVar(value="No image loaded")
         ttk.Label(source, textvariable=self.source_label, wraplength=305).pack(anchor="w", pady=3)
-        model = ttk.LabelFrame(controls, text="2. crYOLO model" if is_cryolo else "2. SAM model", padding=7)
+        model = ttk.LabelFrame(controls, text="2. Detection", padding=7)
         model.pack(fill="x", pady=4)
-        checkpoint = str(resolve_checkpoint(self.args.checkpoint, backend="cryolo") if is_cryolo
-                         else resolve_checkpoint(self.args.checkpoint))
-        self.checkpoint = tk.StringVar(value=checkpoint)
-        ttk.Entry(model, textvariable=self.checkpoint, width=36).pack(fill="x")
-        row = ttk.Frame(model)
-        row.pack(fill="x", pady=3)
-        ttk.Button(row, text="Browse…", command=self.browse_model).pack(side="left")
-        self.device = tk.StringVar(value=self.args.device)
-        ttk.Combobox(row, textvariable=self.device, values=("auto", "cpu", "cuda"),
-                     state="readonly", width=7).pack(side="left", padx=5)
-        self.model_type = tk.StringVar(value=self.args.model_type)
-        if not is_cryolo:
-            ttk.Combobox(row, textvariable=self.model_type, values=("vit_b", "vit_l", "vit_h"),
-                         state="readonly", width=6).pack(side="left")
-        self.grid_side = tk.IntVar(value=8)
-        self.cryolo_config = tk.StringVar(value=getattr(self.args, "cryolo_config", None) or "")
-        self.cryolo_python = tk.StringVar(value=getattr(self.args, "cryolo_python", None) or "")
-        self.cryolo_threshold = tk.StringVar(value=str(getattr(self.args, "cryolo_threshold", .3)))
-        if is_cryolo:
-            for label, variable in (("crYOLO configuration (.json)", self.cryolo_config),
-                                    ("crYOLO Python executable", self.cryolo_python),
-                                    ("Detection confidence threshold", self.cryolo_threshold)):
-                ttk.Label(model, text=label).pack(anchor="w")
-                ttk.Entry(model, textvariable=variable, width=36).pack(fill="x")
-        else:
+        checkpoint = (resolve_checkpoint(self.args.checkpoint, backend="cryolo") if is_cryolo
+                      else resolve_checkpoint(self.args.checkpoint))
+        initialize_detector_fields(self, tk, self.args, checkpoint)
+        ttk.Label(model, text="Detection profile").pack(anchor="w")
+        self.profile_selector = ttk.Combobox(model, textvariable=self.detection_profile,
+                                             values=DETECTION_PROFILES, state="readonly", width=24)
+        self.profile_selector.pack(fill="x")
+        self.profile_selector.bind("<<ComboboxSelected>>", self._profile_draft_changed)
+        for label, variable, backend in (("SAM checkpoint", self.sam_checkpoint, "sam"),
+                                         ("crYOLO weights", self.cryolo_checkpoint, "cryolo")):
+            ttk.Label(model, text=label).pack(anchor="w")
             row = ttk.Frame(model)
             row.pack(fill="x")
-            ttk.Label(row, text="Auto grid / side").pack(side="left")
-            ttk.Spinbox(row, from_=4, to=32, width=5, textvariable=self.grid_side).pack(side="right")
+            ttk.Entry(row, textvariable=variable, width=29).pack(side="left", fill="x", expand=True)
+            ttk.Button(row, text="…", width=3, command=lambda backend=backend: self.browse_model(backend)).pack(side="right")
+        ttk.Label(model, text="crYOLO configuration (.json)").pack(anchor="w")
+        ttk.Entry(model, textvariable=self.cryolo_config, width=36).pack(fill="x")
+        row = ttk.Frame(model)
+        row.pack(fill="x", pady=3)
+        ttk.Label(row, text="Device").pack(side="left")
+        ttk.Combobox(row, textvariable=self.device, values=("auto", "cpu", "cuda"), state="readonly", width=7).pack(side="left", padx=4)
+        ttk.Label(row, text="SAM").pack(side="left")
+        ttk.Combobox(row, textvariable=self.model_type, values=("vit_b", "vit_l", "vit_h"), state="readonly", width=6).pack(side="left", padx=3)
+        for label, variable in (("SAM auto grid / side", self.grid_side),
+                                ("crYOLO confidence", self.cryolo_threshold),
+                                ("Minimum capsid area (px²)", self.min_capsid_area)):
+            row = ttk.Frame(model)
+            row.pack(fill="x")
+            ttk.Label(row, text=label).pack(side="left")
+            ttk.Entry(row, textvariable=variable, width=9).pack(side="right")
+        self._applied_model_config = detector_config_from_fields(self)
+        ttk.Button(model, text="Apply detection settings", command=self._apply_model_settings).pack(fill="x", pady=5)
         self.tool = tk.StringVar(value="box")
         tools_frame = ttk.LabelFrame(controls, text="3. Draw on preview", padding=7)
         tools_frame.pack(fill="x", pady=4)
@@ -1767,16 +1773,18 @@ class PickerApp:
             ttk.Radiobutton(tools_frame, text=label, value=value, variable=self.tool).pack(anchor="w")
         row = ttk.Frame(tools_frame)
         row.pack(fill="x", pady=(5, 0))
-        ttk.Button(row, text="Select detections" if is_cryolo else "Segment prompt", command=self.segment_prompt).pack(side="left")
+        self.prompt_button = ttk.Button(row, text="Select detections" if is_cryolo else "Segment prompt", command=self.segment_prompt)
+        self.prompt_button.pack(side="left")
         ttk.Button(row, text="Clear prompt", command=self.clear_prompt).pack(side="left", padx=4)
         row = ttk.Frame(tools_frame)
         row.pack(fill="x", pady=3)
         ttk.Button(row, text="Next alternative", command=self.cycle_alternative).pack(side="left")
         ttk.Button(row, text="Accept mask", command=self.accept_alternative).pack(side="left", padx=4)
         ttk.Button(tools_frame, text="Generate automatic proposals", command=self.auto_proposals).pack(fill="x")
-        ttk.Label(tools_frame, text=("Yellow: proposal / preview. Green: selected.\nBoxes and points select crYOLO detections; manual contours remain available."
-                                    if is_cryolo else "Yellow: proposal / preview. Green: selected.\nSAM scores estimate mask quality, not target identity."),
-                  wraplength=310).pack(anchor="w", pady=4)
+        self.detector_note = ttk.Label(tools_frame, text=("Yellow: proposal / preview. Green: selected.\n"
+            "SAM profiles segment prompts. crYOLO boxes and points select existing detections; use manual contours for missed targets."),
+            wraplength=310)
+        self.detector_note.pack(anchor="w", pady=4)
         picking = ttk.LabelFrame(controls, text="4. Sampling and playback", padding=7)
         picking.pack(fill="x", pady=4)
         self.spacing, self.inset = tk.IntVar(value=13), tk.DoubleVar(value=2.0)
@@ -1867,38 +1875,74 @@ class PickerApp:
             self.root.after_cancel(identifier)
         self.scheduled.clear()
 
-    def _ensure_idle(self):
-        if self.runner.busy or self.playback_pending or self.capture_pending or self.batch_remaining:
+    def _ensure_idle(self, *, allow_model_changes=False):
+        if self.runner.busy or self.playback_pending or self.capture_pending or self.batch_remaining or getattr(self, "auto_running", False):
             raise RuntimeError("An operation is active. Stop it and wait for the worker to finish first.")
+        if not allow_model_changes and self._model_settings_pending():
+            raise RuntimeError("Apply detection settings before detecting or selecting contours.")
 
     def _error(self, error):
         APP_LOG.error("%s", error)
         self.status.set(str(error))
         self.messagebox.showerror("SARU Picker", f"{error}\n\nDetails: {self.log_path}", parent=self.root)
 
-    def browse_model(self):
-        is_cryolo = getattr(self.args, "backend", "sam") == "cryolo"
-        path = self.filedialog.askopenfilename(filetypes=([("crYOLO weights", "*.h5")] if is_cryolo else
+    def browse_model(self, backend=None):
+        backend = backend or resolve_detection_profile(detection_profile_value(self))[0]
+        path = self.filedialog.askopenfilename(filetypes=([("crYOLO weights", "*.h5")] if backend == "cryolo" else
                                                         [("PyTorch checkpoint", "*.pth *.pt")]) + [("All files", "*")])
         if path:
-            self.checkpoint.set(path)
-            for kind in ("vit_b", "vit_l", "vit_h"):
-                if kind in Path(path).name:
-                    self.model_type.set(kind)
-                    break
+            (self.cryolo_checkpoint if backend == "cryolo" else self.sam_checkpoint).set(path)
+            if backend == "sam":
+                for kind in ("vit_b", "vit_l", "vit_h"):
+                    if kind in Path(path).name:
+                        self.model_type.set(kind)
+                        break
 
     def _model_config(self):
-        runtime = model_runtime_options(self.args)
-        if runtime["backend"] == "cryolo":
-            runtime.update(cryolo_config=self.cryolo_config.get().strip() or None,
-                           cryolo_python=self.cryolo_python.get().strip() or None,
-                           cryolo_threshold=float(self.cryolo_threshold.get()))
-        config = RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
-                                 device=self.device.get(), points_per_side=int(self.grid_side.get()),
-                                 automatic_profile=getattr(self.args, "automatic_profile", "capsid"),
-                                 min_capsid_area_px=getattr(self.args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX), **runtime)
-        save_cryolo_settings(config, getattr(self.args, "cryolo_settings_path", None))
-        return config
+        applied = getattr(self, "_applied_model_config", None)
+        return applied if applied is not None else detector_config_from_fields(self)
+
+    def _model_settings_pending(self):
+        applied = getattr(self, "_applied_model_config", None)
+        if applied is None:
+            return False
+        try:
+            return detector_config_from_fields(self) != applied
+        except (ValueError, TypeError, self.tk.TclError):
+            return True
+
+    def _profile_draft_changed(self, event=None):
+        if self.runner.busy or self.playback_pending or self.capture_pending or self.batch_remaining or getattr(self, "auto_running", False):
+            config = self._model_config()
+            self.detection_profile.set("crYOLO" if config.backend == "cryolo" else config.automatic_profile)
+            self.status.set("Stop the active operation before changing the detection profile.")
+        else:
+            self.status.set("Choose Apply detection settings to use the selected profile.")
+
+    def _apply_model_settings(self):
+        try:
+            self._ensure_idle(allow_model_changes=True)
+            config = detector_config_from_fields(self)
+            persist_detector_fields(self)
+            changed = config != getattr(self, "_applied_model_config", None)
+            self._applied_model_config = config
+            apply_detector_args(self, config)
+            if getattr(self, "prompt_button", None) is not None:
+                self.prompt_button.configure(text="Select detections" if config.backend == "cryolo" else "Segment prompt")
+            if changed:
+                # Retire proposals and prompts, retaining actual click history
+                # and the same image/coordinate frame for duplicate prevention.
+                self.candidates, self.selected, self.alternatives = [], set(), []
+                self.prompt_box, self.prompt_points, self.prompt_labels = None, [], []
+                self.alternative_index = 0
+                self.drag_start, self.trace = None, []
+                self.refresh_table()
+                self.render()
+            self.status.set("Detection settings applied. Generate new proposals for this image.")
+            return changed
+        except Exception as exc:
+            self._error(exc)
+            return False
 
     def _get_recognizer(self, config):
         # Called only by the serialized worker.
@@ -2035,7 +2079,8 @@ class PickerApp:
             return None
 
     def _editable(self):
-        return self.rgb is not None and not self.runner.busy and not self.playback_pending and not self.batch_remaining
+        return (self.rgb is not None and not self.runner.busy and not self.playback_pending
+                and not self.batch_remaining and not self._model_settings_pending())
 
     def pointer_down(self, event):
         if not self._editable():
@@ -2507,21 +2552,33 @@ class PickerApp:
 
 
 class PickerArgumentParser(argparse.ArgumentParser):
-    """Apply the selected backend's profile unless a profile was explicitly set."""
+    """Resolve four user-facing profiles into an explicit detector configuration."""
     def parse_args(self, args=None, namespace=None):
         result = super().parse_args(args, namespace)
-        if result.automatic_profile is None:
-            result.automatic_profile = "capsid-learned" if result.backend == "cryolo" else "capsid"
+        choice = result.detection_profile
+        if choice is None:
+            choice = "crYOLO" if result.backend == "cryolo" else "capsid"
+        choice = canonical_detection_profile(choice)
+        # Preserve the previous explicit crYOLO + learned-refinement CLI spelling.
+        if result.backend == "cryolo" and choice == "capsid-learned":
+            choice = "crYOLO"
+        backend, profile = resolve_detection_profile(choice)
+        if result.backend is not None and result.backend != backend:
+            self.error("The selected detection profile conflicts with --backend.")
+        result.detection_profile = choice
+        result.backend, result.automatic_profile = backend, profile
         return result
 
 
 def build_parser():
-    parser = PickerArgumentParser(description="SARU Picker 3.0.0: crYOLO-assisted picking directly over cryoSPARC.")
+    parser = PickerArgumentParser(description="SARU Picker 3.0.0: manual and model-assisted picking directly over cryoSPARC.")
     parser.add_argument("--review", action="store_true", help="Open the optional snapshot review editor instead of the screen overlay.")
     parser.add_argument("--image", help="Open an image in the optional offline review editor.")
-    parser.add_argument("--backend", choices=("sam", "cryolo"), default="cryolo",
-                        help="Detection backend (default: cryolo). Select sam explicitly for the legacy source backend.")
+    parser.add_argument("--backend", choices=("sam", "cryolo"), default=None,
+                        help="Optional explicit backend. By default the detection profile selects SAM or crYOLO.")
     parser.add_argument("--checkpoint", help="Model weights: SAM .pth or crYOLO .h5; otherwise use the selected backend's bundled model.")
+    parser.add_argument("--sam-checkpoint", help="Separate SAM weights used by the three original detection profiles.")
+    parser.add_argument("--cryolo-checkpoint", help="Separate crYOLO .h5 weights used by the crYOLO detection profile.")
     parser.add_argument("--cryolo-config", help="crYOLO JSON configuration; defaults to cryolo-config.json beside its weights.")
     parser.add_argument("--cryolo-python", help="Python executable in the separate crYOLO environment.")
     parser.add_argument("--cryolo-threshold", type=float, default=.3, help="crYOLO detector confidence threshold (0 to 1).")
@@ -2535,8 +2592,9 @@ def build_parser():
     parser.add_argument("--box", nargs=4, type=float, metavar=("X0", "Y0", "X1", "Y1"))
     parser.add_argument("--point", nargs=3, action="append", type=float, metavar=("X", "Y", "LABEL"), help="Repeatable foreground(1)/background(0) prompt.")
     parser.add_argument("--points-per-side", type=int, default=8)
-    parser.add_argument("--automatic-profile", choices=("capsid", "capsid-learned", "generic"), default=None,
-                        help="Defaults to capsid-learned for crYOLO or capsid for explicit SAM. Generic returns unclassified SAM masks; crYOLO generic still uses texture-based contour refinement.")
+    parser.add_argument("--detection-profile", "--automatic-profile", dest="detection_profile",
+                        choices=(*DETECTION_PROFILES, "cryolo"), default=None,
+                        help="capsid (default), capsid-learned and generic use SAM; crYOLO uses the trained detector with learned contour refinement.")
     parser.add_argument("--min-capsid-area", type=int, default=DEFAULT_MIN_CAPSID_AREA_PX, metavar="PIXELS",
                         help="Minimum connected contour area in screenshot pixels (default: 3500; 0 allows all sizes). Applies to every crYOLO automatic profile and SAM capsid profiles; manual, explicit prompts and SAM generic bypass it.")
     parser.add_argument("--spacing", type=int, default=13)
@@ -2555,10 +2613,19 @@ def _run_application(args, *, console_available: bool) -> int:
         APP_LOG.info("Starting SARU Picker %s; platform=%s frozen=%s", APP_VERSION,
                      sys.platform, bool(getattr(sys, "frozen", False)))
         is_cryolo = getattr(args, "backend", "sam") == "cryolo"
-        checkpoint = (resolve_checkpoint(args.checkpoint, backend="cryolo") if is_cryolo
-                      else resolve_checkpoint(args.checkpoint))
-        if is_cryolo and not args.cryolo_config:
-            args.cryolo_config = str(checkpoint.with_name("cryolo-config.json"))
+        sam_explicit = getattr(args, "sam_checkpoint", None) or (args.checkpoint if not is_cryolo else None)
+        cryolo_explicit = getattr(args, "cryolo_checkpoint", None) or (args.checkpoint if is_cryolo else None)
+        # The generic checkpoint argument overrides only the selected backend.
+        if args.checkpoint:
+            if is_cryolo:
+                cryolo_explicit = args.checkpoint
+            else:
+                sam_explicit = args.checkpoint
+        args.sam_checkpoint = str(resolve_checkpoint(sam_explicit))
+        args.cryolo_checkpoint = str(resolve_checkpoint(cryolo_explicit, backend="cryolo"))
+        checkpoint = Path(args.cryolo_checkpoint if is_cryolo else args.sam_checkpoint)
+        if not args.cryolo_config:
+            args.cryolo_config = str(Path(args.cryolo_checkpoint).with_name("cryolo-config.json"))
         if args.diagnostics or args.smoke_test:
             if is_cryolo:
                 config = RecognitionConfig(str(checkpoint), device=args.device,
@@ -2569,6 +2636,7 @@ def _run_application(args, *, console_available: bool) -> int:
             else:
                 report = (run_smoke_test(checkpoint, log_path) if args.smoke_test
                           else diagnostic_report(log_path, checkpoint))
+            report.update(backend=args.backend, detection_profile=args.detection_profile)
             if args.report:
                 write_json_report(args.report, report)
             print(json.dumps(report, indent=2))
@@ -2599,6 +2667,7 @@ def _run_application(args, *, console_available: bool) -> int:
                                "recognition": recognizer.last_detection,
                                "review_status": "unreviewed CLI outputs; no desktop clicks were sent"})
                 report = {"status": "ok", "mode": "segment-image", "version": APP_VERSION,
+                          "backend": args.backend, "detection_profile": args.detection_profile,
                           "candidates": len(candidates), "grid_points": len(points),
                           "elapsed_seconds": elapsed, "output": str(output)}
                 if args.report:
@@ -2608,10 +2677,7 @@ def _run_application(args, *, console_available: bool) -> int:
                 recognizer.close()
             return 0
         enable_dpi_awareness()
-        if is_cryolo:
-            configure_application_identity("SARU.Picker.crYOLO")
-        else:
-            configure_application_identity()
+        configure_application_identity("SARU.Picker.crYOLO")
         import tkinter as tk
         root = tk.Tk()
         if args.review or args.image:
@@ -2643,43 +2709,29 @@ def _run_application(args, *, console_available: bool) -> int:
         return 1
 
 
-def main(argv=None, *, default_backend="cryolo"):
-    global ACTIVE_BACKEND
+def main(argv=None, *, default_backend="sam"):
     console_available = sys.stderr is not None
     with windowed_console_streams():
         parser = build_parser()
-        parser.set_defaults(backend=default_backend)
-        args = parser.parse_args(argv)
-        previous_backend, ACTIVE_BACKEND = ACTIVE_BACKEND, args.backend
+        arguments = list(sys.argv[1:] if argv is None else argv)
+        settings_path = user_state_directory() / "detector-settings.json"
         try:
-            if args.backend == "cryolo":
-                settings_path = user_state_directory() / "cryolo-settings.json"
-                allowed = {"checkpoint", "device", "cryolo_config", "cryolo_python", "cryolo_threshold",
-                           "cryolo_timeout", "automatic_profile", "min_capsid_area"}
-                if settings_path.is_file():
-                    try:
-                        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-                        if not isinstance(settings, dict):
-                            raise ValueError("Settings must be a JSON object.")
-                        settings = {key: value for key, value in settings.items() if key in allowed}
-                        probe = parser.parse_args([])
-                        for key, value in settings.items():
-                            setattr(probe, key, value)
-                        RecognitionConfig(probe.checkpoint or "cryolo-capsids.h5", device=probe.device,
-                                          backend="cryolo", cryolo_config=probe.cryolo_config,
-                                          cryolo_python=probe.cryolo_python,
-                                          cryolo_threshold=probe.cryolo_threshold,
-                                          cryolo_timeout=probe.cryolo_timeout,
-                                          automatic_profile=probe.automatic_profile,
-                                          min_capsid_area_px=probe.min_capsid_area)
-                        parser.set_defaults(**settings)
-                        args = parser.parse_args(argv)  # Explicit CLI values take precedence.
-                    except (OSError, ValueError, TypeError) as exc:
-                        APP_LOG.warning("Ignoring invalid crYOLO settings: %s", exc)
-                args.cryolo_settings_path = str(settings_path)
-            return _run_application(args, console_available=console_available)
-        finally:
-            ACTIVE_BACKEND = previous_backend
+            settings = load_detector_settings(settings_path)
+        except (OSError, ValueError, TypeError) as exc:
+            APP_LOG.warning("Ignoring invalid detector settings: %s", exc)
+            settings = {}
+        if "sam_model_type" in settings:
+            settings["model_type"] = settings.pop("sam_model_type")
+        has_backend = any(value == "--backend" or value.startswith("--backend=") for value in arguments)
+        has_profile = any(value.split("=", 1)[0] in {"--detection-profile", "--automatic-profile"} for value in arguments)
+        if has_backend and not has_profile:
+            settings.pop("detection_profile", None)
+        if default_backend == "cryolo" and not has_backend and not has_profile and "detection_profile" not in settings:
+            settings["detection_profile"] = "crYOLO"
+        parser.set_defaults(**settings)
+        args = parser.parse_args(arguments)
+        args.detector_settings_path = str(settings_path)
+        return _run_application(args, console_available=console_available)
 
 
 if __name__ == "__main__":

@@ -10,21 +10,21 @@
 
 [Setup]
 AppId={{FB137682-60A8-4BC1-AC91-518AE16F0E8E}
-AppName=SARU Picker crYOLO
+AppName=SARU Picker
 AppVersion={#AppVersion}
 VersionInfoVersion={#AppVersion}
 VersionInfoProductVersion={#AppVersion}
 AppPublisher=SARU Picker
-AppVerName=SARU Picker crYOLO {#AppVersion}
+AppVerName=SARU Picker {#AppVersion}
 DefaultDirName={localappdata}\Programs\SARU Picker crYOLO
-DefaultGroupName=SARU Picker crYOLO
+DefaultGroupName=SARU Picker 3.0
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
 MinVersion=10.0
 OutputDir={#AppOutputDir}
-OutputBaseFilename=SARU-Picker-crYOLO-Setup-{#AppVersion}-win64
+OutputBaseFilename=SARU-Picker-Setup-{#AppVersion}-win64
 SetupIconFile=..\..\assets\app-icon.ico
 UninstallDisplayIcon={app}\_internal\assets\app-icon.ico
 Compression=lzma2/normal
@@ -42,7 +42,9 @@ Source: "{#AppSourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdi
 Source: "Install-crYOLO-Runtime.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "setup-runtime.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "runtime-requirements-windows.txt"; DestDir: "{app}"; Flags: ignoreversion
-; These user's sidecars are supplied privately beside Setup, not in the public build.
+Source: "runtime_health.py"; DestDir: "{app}"; Flags: ignoreversion
+; Private learned weights are supplied beside Setup. Verified public SAM ViT-B
+; is already bundled and does not need a separate sidecar.
 Source: "{src}\cryolo-capsids.h5"; DestDir: "{app}\_internal\models"; Flags: external ignoreversion skipifsourcedoesntexist
 Source: "{src}\cryolo-config.json"; DestDir: "{app}\_internal\models"; Flags: external ignoreversion skipifsourcedoesntexist
 Source: "{src}\capsid-profile.json"; DestDir: "{app}\_internal\models"; Flags: external ignoreversion skipifsourcedoesntexist
@@ -50,10 +52,76 @@ Source: "{src}\app-icon.ico"; DestDir: "{app}\_internal\assets"; Flags: external
 Source: "{src}\app-icon.png"; DestDir: "{app}\_internal\assets"; Flags: external ignoreversion skipifsourcedoesntexist
 
 [Icons]
-Name: "{group}\SARU Picker crYOLO"; Filename: "{app}\SARU Picker crYOLO.exe"; WorkingDir: "{app}"; IconFilename: "{app}\_internal\assets\app-icon.ico"; AppUserModelID: "SARU.Picker.crYOLO"
-Name: "{group}\Install crYOLO runtime"; Filename: "{app}\Install-crYOLO-Runtime.cmd"; WorkingDir: "{app}"
+Name: "{group}\SARU Picker 3.0"; Filename: "{app}\SARU Picker crYOLO.exe"; WorkingDir: "{app}"; IconFilename: "{app}\_internal\assets\app-icon.ico"; AppUserModelID: "SARU.Picker.crYOLO"
 Name: "{group}\Quick start"; Filename: "{app}\_internal\QUICK_START.txt"
-Name: "{autodesktop}\SARU Picker crYOLO"; Filename: "{app}\SARU Picker crYOLO.exe"; WorkingDir: "{app}"; IconFilename: "{app}\_internal\assets\app-icon.ico"; AppUserModelID: "SARU.Picker.crYOLO"; Tasks: desktopicon
+Name: "{autodesktop}\SARU Picker 3.0"; Filename: "{app}\SARU Picker crYOLO.exe"; WorkingDir: "{app}"; IconFilename: "{app}\_internal\assets\app-icon.ico"; AppUserModelID: "SARU.Picker.crYOLO"; Tasks: desktopicon
+
+[InstallDelete]
+; Remove only shortcuts created by the prior edition owned by this same AppId.
+Type: files; Name: "{userprograms}\SARU Picker crYOLO\SARU Picker crYOLO.lnk"
+Type: files; Name: "{userprograms}\SARU Picker crYOLO\Install crYOLO runtime.lnk"
+Type: files; Name: "{userprograms}\SARU Picker crYOLO\Quick start.lnk"
+Type: files; Name: "{userdesktop}\SARU Picker crYOLO.lnk"
 
 [Run]
-Filename: "{app}\SARU Picker crYOLO.exe"; Description: "Launch SARU Picker crYOLO"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\SARU Picker crYOLO.exe"; Description: "Launch SARU Picker 3.0"; Flags: nowait postinstall skipifsilent; Check: RuntimeIsReady
+
+[Code]
+var
+  RuntimeReady: Boolean;
+  RuntimeError: String;
+
+function RuntimeIsReady: Boolean;
+begin
+  Result := RuntimeReady;
+end;
+
+function GetCustomSetupExitCode: Integer;
+begin
+  if RuntimeReady then Result := 0 else Result := 1;
+end;
+
+procedure RuntimeSetupFailed(MessageText: String);
+begin
+  RuntimeError := MessageText;
+  Log(RuntimeError);
+  if not WizardSilent then MsgBox(RuntimeError, mbError, MB_OK);
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and not RuntimeReady then
+  begin
+    WizardForm.FinishedHeadingLabel.Caption := 'crYOLO setup needs attention';
+    WizardForm.FinishedLabel.Caption := RuntimeError + #13#10#13#10 +
+      'SARU Picker was copied, but it will not launch automatically. Re-run Setup to finish preparing all four profiles.';
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ExitCode: Integer;
+  ProgramPath, Parameters: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    RuntimeReady := False;
+    WizardForm.StatusLabel.Caption := 'Preparing the crYOLO detection profile...';
+    ProgramPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+    Parameters := '-NoProfile -ExecutionPolicy Bypass -File "' +
+      ExpandConstant('{app}\setup-runtime.ps1') + '"';
+    if not Exec(ProgramPath, Parameters, ExpandConstant('{app}'), SW_SHOWMINIMIZED,
+      ewWaitUntilTerminated, ExitCode) then
+    begin
+      RuntimeSetupFailed('The crYOLO runtime setup could not start. Re-run Setup to repair it.');
+      Exit;
+    end;
+    if ExitCode <> 0 then
+    begin
+      RuntimeSetupFailed('The crYOLO runtime setup failed. Re-run Setup with an internet connection. Details: ' +
+        ExpandConstant('{localappdata}\SARU_Picker_crYOLO\runtime-install-report.json'));
+      Exit;
+    end;
+    RuntimeReady := True;
+  end;
+end;

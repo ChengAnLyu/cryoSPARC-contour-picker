@@ -20,6 +20,8 @@ import tempfile
 import numpy as np
 
 from application_icon import apply_application_icon
+from detector_selection import (DETECTION_PROFILES, canonical_detection_profile, resolve_detection_profile,
+                                profile_from_backend, validate_detector_settings, save_detector_settings)
 from desktop import DesktopAdapter, GlobalHotkeys
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskRunner, play_clicks
 from manual_sampling import legacy_contour_points, mask_contour_points
@@ -34,27 +36,90 @@ SCREEN_LOG = logging.getLogger("saru.screen")
 DEFAULT_CLICK_DELAY = .01
 
 
-def save_cryolo_settings(config, destination) -> None:
-    """Persist only this parallel backend's validated user choices."""
-    if config.backend != "cryolo" or not destination:
-        return
-    path = Path(destination)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {name: getattr(config, name) for name in
-               ("checkpoint", "device", "cryolo_config", "cryolo_python", "cryolo_threshold",
-                "cryolo_timeout", "automatic_profile")}
-    payload["min_capsid_area"] = config.min_capsid_area_px
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                         prefix=".cryolo-settings-", delete=False) as handle:
-            temporary = Path(handle.name)
-            json.dump(payload, handle, indent=2, allow_nan=False)
-            handle.write("\n")
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+def detection_profile_value(owner):
+    variable = getattr(owner, "detection_profile", None)
+    if variable is not None:
+        return canonical_detection_profile(variable.get())
+    args = getattr(owner, "args", None)
+    if getattr(args, "backend", "sam") == "cryolo":
+        return "crYOLO"
+    variable = getattr(owner, "automatic_profile", None)
+    return canonical_detection_profile(variable.get() if variable is not None else
+                                       getattr(args, "automatic_profile", "capsid"))
+
+
+def initialize_detector_fields(owner, tk, args, checkpoint_path):
+    backend = getattr(args, "backend", "sam")
+    selected = getattr(args, "detection_profile", None) or profile_from_backend(
+        backend, getattr(args, "automatic_profile", "capsid-learned" if backend == "cryolo" else "capsid"))
+    directory = Path(checkpoint_path).parent
+    sam_path = getattr(args, "sam_checkpoint", None) or (
+        checkpoint_path if backend == "sam" else directory / "sam_vit_b_01ec64.pth")
+    cryolo_path = getattr(args, "cryolo_checkpoint", None) or (
+        checkpoint_path if backend == "cryolo" else directory / "cryolo-capsids.h5")
+    owner.detection_profile = tk.StringVar(value=selected)
+    owner.automatic_profile = owner.detection_profile  # Existing controller/settings callers.
+    owner.sam_checkpoint = tk.StringVar(value=str(sam_path))
+    owner.cryolo_checkpoint = tk.StringVar(value=str(cryolo_path))
+    owner.checkpoint = owner.sam_checkpoint  # Legacy SAM callers; backend paths never share storage.
+    owner.model_type = tk.StringVar(value=getattr(args, "model_type", "vit_b"))
+    owner.device = tk.StringVar(value=getattr(args, "device", "auto"))
+    owner.min_capsid_area = tk.StringVar(value=str(getattr(args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX)))
+    owner.cryolo_config = tk.StringVar(value=getattr(args, "cryolo_config", None) or str(Path(cryolo_path).with_name("cryolo-config.json")))
+    owner.cryolo_threshold = tk.StringVar(value=str(getattr(args, "cryolo_threshold", .3)))
+    owner.grid_side = tk.IntVar(value=getattr(args, "points_per_side", 8))
+
+
+def detector_config_from_fields(owner):
+    args = getattr(owner, "args", None)
+    backend, profile = resolve_detection_profile(detection_profile_value(owner))
+    path_variable = getattr(owner, "cryolo_checkpoint" if backend == "cryolo" else "sam_checkpoint", owner.checkpoint)
+    minimum = getattr(owner, "min_capsid_area", None)
+    return RecognitionConfig(
+        checkpoint=path_variable.get(), backend=backend, model_type=owner.model_type.get(),
+        device=owner.device.get(), points_per_side=int(owner.grid_side.get()), automatic_profile=profile,
+        min_capsid_area_px=int(minimum.get()) if minimum is not None else getattr(args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX),
+        cryolo_config=(owner.cryolo_config.get().strip() or None) if backend == "cryolo" else None,
+        cryolo_python=getattr(args, "cryolo_python", None) if backend == "cryolo" else None,
+        cryolo_threshold=float(owner.cryolo_threshold.get()) if backend == "cryolo" else .3,
+        cryolo_timeout=getattr(args, "cryolo_timeout", 180.0))
+
+
+def detector_settings_from_fields(owner):
+    args = getattr(owner, "args", None)
+    config = detector_config_from_fields(owner)
+    # Old headless fixtures expose only one checkpoint; real GUI instances always
+    # have independent SAM and crYOLO variables.
+    if not hasattr(owner, "sam_checkpoint"):
+        return {}
+    return validate_detector_settings({
+        "detection_profile": detection_profile_value(owner),
+        "sam_checkpoint": owner.sam_checkpoint.get().strip() or None,
+        "sam_model_type": owner.model_type.get(),
+        "cryolo_checkpoint": owner.cryolo_checkpoint.get().strip() or None,
+        "cryolo_config": owner.cryolo_config.get().strip() or None,
+        "cryolo_threshold": float(owner.cryolo_threshold.get()),
+        "cryolo_timeout": getattr(args, "cryolo_timeout", 180.0),
+        "device": config.device, "points_per_side": config.points_per_side,
+        "min_capsid_area": config.min_capsid_area_px})
+
+
+def persist_detector_fields(owner):
+    payload = detector_settings_from_fields(owner)
+    destination = getattr(getattr(owner, "args", None), "detector_settings_path", None)
+    if destination and payload:
+        save_detector_settings(destination, payload)
+    return payload
+
+
+def apply_detector_args(owner, config):
+    args = getattr(owner, "args", None)
+    if args is not None:
+        args.backend, args.automatic_profile = config.backend, config.automatic_profile
+        args.detection_profile = detection_profile_value(owner)
+    button = getattr(owner, "prompt_button", None)
+    if button is not None:
+        button.configure(text="Select by box" if config.backend == "cryolo" else "Box prompt")
 
 
 def screen_changed_fraction(before, after, tolerance=12):
@@ -288,7 +353,7 @@ class ScreenPickerApp:
     def _build_ui(self, checkpoint_path):
         tk, ttk, root = self.tk, self.ttk, self.root
         is_cryolo = getattr(self.args, "backend", "sam") == "cryolo"
-        root.title("SARU PICKER 3.0.0 crYOLO" if is_cryolo else "SARU PICKER 3.0.0 SAM")
+        root.title("SARU PICKER 3.0.0")
         root.resizable(False, False)
         root.attributes("-topmost", True)
         scale = max(1.0, float(root.tk.call("tk", "scaling")) / (96 / 72))
@@ -333,7 +398,8 @@ class ScreenPickerApp:
         self.region_label = tk.StringVar(value="Select the micrograph area on the screen.")
         ttk.Label(self.model_controls, textvariable=self.region_label, wraplength=wrap).pack(anchor="w", pady=4)
         self.semi_controls = ttk.Frame(self.model_controls)
-        ttk.Button(self.semi_controls, text="Select by box" if is_cryolo else "Box prompt", command=self.box_prompt).pack(side="left")
+        self.prompt_button = ttk.Button(self.semi_controls, text="Select by box" if is_cryolo else "Box prompt", command=self.box_prompt)
+        self.prompt_button.pack(side="left")
         self.next_micrograph_button = ttk.Button(self.semi_controls, text="Next micrograph", command=self.next_micrograph)
         self.next_micrograph_button.pack(side="left", padx=5)
         self.auto_controls = ttk.Frame(self.model_controls)
@@ -345,15 +411,7 @@ class ScreenPickerApp:
         ttk.Button(self.auto_controls, text="Start auto", command=self.start_auto).pack(side="right")
         self.model_note = ttk.Label(self.model_controls, wraplength=wrap)
         self.model_note.pack(anchor="w", pady=5)
-        self.checkpoint = tk.StringVar(value=str(checkpoint_path))
-        self.model_type = tk.StringVar(value=getattr(self.args, "model_type", "vit_b"))
-        self.device = tk.StringVar(value=getattr(self.args, "device", "auto"))
-        self.automatic_profile = tk.StringVar(value=getattr(self.args, "automatic_profile", "capsid"))
-        self.min_capsid_area = tk.StringVar(value=str(getattr(self.args, "min_capsid_area", DEFAULT_MIN_CAPSID_AREA_PX)))
-        self.cryolo_config = tk.StringVar(value=getattr(self.args, "cryolo_config", None) or "")
-        self.cryolo_python = tk.StringVar(value=getattr(self.args, "cryolo_python", None) or "")
-        self.cryolo_threshold = tk.StringVar(value=str(getattr(self.args, "cryolo_threshold", .3)))
-        self.grid_side = tk.IntVar(value=8)
+        initialize_detector_fields(self, tk, self.args, checkpoint_path)
         self.click_delay = tk.DoubleVar(value=DEFAULT_CLICK_DELAY)
         for variable in (self.status, self.region_label):
             identifier = variable.trace_add("write", self._queue_panel_fit)
@@ -486,7 +544,7 @@ class ScreenPickerApp:
     def _idle(self):
         if self.advanced is not None:
             raise RuntimeError("Close settings before starting a screen operation.")
-        if self.runner.busy or self.transition or self.auto_remaining or self.drawing:
+        if self.runner.busy or self.transition or self.auto_remaining or self.drawing or getattr(self, "auto_running", False):
             raise RuntimeError("An operation is active. Press Escape to stop it first.")
         if self.input_surface is not None and self.input_kind != "masks":
             raise RuntimeError("Finish or cancel the screen selection first.")
@@ -737,26 +795,15 @@ class ScreenPickerApp:
         self._schedule(90, complete)
 
     def _model_config(self):
-        args = getattr(self, "args", None)
-        runtime = {"backend": getattr(args, "backend", "sam")}
-        if runtime["backend"] == "cryolo":
-            runtime.update(cryolo_config=self.cryolo_config.get().strip() or None,
-                           cryolo_python=self.cryolo_python.get().strip() or None,
-                           cryolo_threshold=float(self.cryolo_threshold.get()),
-                           cryolo_timeout=getattr(args, "cryolo_timeout", 180.0))
-        return RecognitionConfig(checkpoint=self.checkpoint.get(), model_type=self.model_type.get(),
-                                 device=self.device.get(), points_per_side=int(self.grid_side.get()),
-                                 automatic_profile=self.automatic_profile.get(),
-                                 min_capsid_area_px=int(self.min_capsid_area.get()), **runtime)
+        return detector_config_from_fields(self)
 
     def _apply_model_settings(self, previous_config):
-        """Validate settings and retire contours made with an older detector.
-
-        Keep actual pick history and its scene reference: changing a size limit
-        must not make a repeated detection place duplicate picks on this image.
-        """
+        """Apply one detector choice only while idle, preserving actual pick history."""
+        if self.runner.busy or self.transition or self.auto_remaining or self.drawing or getattr(self, "auto_running", False):
+            raise RuntimeError("Wait for the active operation to stop before applying detection settings.")
         current = self._model_config()
-        save_cryolo_settings(current, getattr(getattr(self, "args", None), "cryolo_settings_path", None))
+        persist_detector_fields(self)
+        apply_detector_args(self, current)
         if current == previous_config:
             return False
         self._close_input()
@@ -815,7 +862,7 @@ class ScreenPickerApp:
     def _present_masks(self):
         self._show_panel()
         self._close_input()
-        if self.mode == "manual" or self.geometry is None or not self.candidates:
+        if self.mode == "manual" or self.geometry is None or not self.candidates or self.advanced is not None:
             if self.overlay is not None:
                 self.overlay.hide()
                 self.overlay.clear()
@@ -834,7 +881,8 @@ class ScreenPickerApp:
 
     def _semi_click(self, x, y):
         try:
-            if self.mode != "semi-auto" or self.disabled.get() or self.runner.busy or self.transition:
+            if (self.mode != "semi-auto" or self.disabled.get() or self.runner.busy or self.transition
+                    or self.advanced is not None):
                 return
             candidate = screen_mask_at(self.candidates, self.geometry, x, y)
             if candidate is not None:
@@ -1346,48 +1394,44 @@ class ScreenPickerApp:
             frame = self.ttk.Frame(window, padding=12)
             frame.pack(fill="both", expand=True)
             settings_wrap = max(410, round(410 * self.root.winfo_fpixels("1i") / 96))
-            is_cryolo = getattr(self.args, "backend", "sam") == "cryolo"
-            self.ttk.Label(frame, text="crYOLO weights" if is_cryolo else "SAM checkpoint").grid(row=0, column=0, sticky="w")
-            self.ttk.Entry(frame, textvariable=self.checkpoint, width=48).grid(row=1, column=0, columnspan=2, sticky="ew")
-            def browse():
-                filetypes = [("crYOLO weights", "*.h5")] if is_cryolo else [("SAM checkpoint", "*.pth")]
-                path = self.filedialog.askopenfilename(parent=window, filetypes=filetypes)
-                if path:
-                    self.checkpoint.set(path)
-                    if not is_cryolo:
-                        for model_type in ("vit_b", "vit_l", "vit_h"):
-                            if model_type in Path(path).name:
-                                self.model_type.set(model_type)
-                                break
-            self.ttk.Button(frame, text="Browse…", command=browse).grid(row=1, column=2, padx=4)
-            combos = [("Device", self.device, ("auto", "cpu", "cuda"))]
-            if not is_cryolo:
-                combos.append(("Model type", self.model_type, ("vit_b", "vit_l", "vit_h")))
-            combos.append(("Detection profile", self.automatic_profile, ("capsid", "capsid-learned", "generic")))
-            index = 2
-            for label, variable, values in combos:
+            self.ttk.Label(frame, text="Detection profile").grid(row=0, column=0, sticky="w", pady=3)
+            self.profile_selector = self.ttk.Combobox(frame, textvariable=self.detection_profile,
+                values=DETECTION_PROFILES, state="readonly", width=20)
+            self.profile_selector.grid(row=0, column=1, sticky="w")
+            def path_row(index, label, variable, filetypes):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
-                self.ttk.Combobox(frame, textvariable=variable, values=values, state="readonly", width=18 if label == "Detection profile" else 10).grid(row=index, column=1)
-                index += 1
-            if is_cryolo:
-                for label, variable in (("crYOLO configuration (.json)", self.cryolo_config),
-                                        ("crYOLO Python executable", self.cryolo_python),
-                                        ("Detection confidence threshold", self.cryolo_threshold)):
-                    self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
-                    self.ttk.Entry(frame, textvariable=variable, width=32).grid(row=index, column=1, columnspan=2, sticky="ew")
-                    index += 1
-            sliders = [("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01),
-                       ("Minimum capsid area (screen px²)", self.min_capsid_area, 0, 1000000, 500)]
-            if not is_cryolo:
-                sliders.insert(0, ("Automatic grid / side", self.grid_side, 4, 32, 1))
-            for label, variable, low, high, step in sliders:
+                self.ttk.Entry(frame, textvariable=variable, width=38).grid(row=index, column=1, sticky="ew")
+                def browse():
+                    path = self.filedialog.askopenfilename(parent=window, filetypes=filetypes)
+                    if path:
+                        variable.set(path)
+                        if variable is self.sam_checkpoint:
+                            for kind in ("vit_b", "vit_l", "vit_h"):
+                                if kind in Path(path).name:
+                                    self.model_type.set(kind)
+                                    break
+                self.ttk.Button(frame, text="Browse…", command=browse).grid(row=index, column=2, padx=4)
+            path_row(1, "SAM checkpoint", self.sam_checkpoint, [("SAM checkpoint", "*.pth *.pt")])
+            path_row(2, "crYOLO weights", self.cryolo_checkpoint, [("crYOLO weights", "*.h5")])
+            path_row(3, "crYOLO configuration", self.cryolo_config, [("crYOLO configuration", "*.json")])
+            for index, (label, variable, choices) in enumerate((
+                ("Device", self.device, ("auto", "cpu", "cuda")),
+                ("SAM model type", self.model_type, ("vit_b", "vit_l", "vit_h"))), 4):
                 self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
-                self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1)
-                index += 1
+                self.ttk.Combobox(frame, textvariable=variable, values=choices, state="readonly", width=12).grid(row=index, column=1, sticky="w")
+            self.ttk.Label(frame, text="crYOLO confidence threshold").grid(row=6, column=0, sticky="w", pady=3)
+            self.ttk.Entry(frame, textvariable=self.cryolo_threshold, width=12).grid(row=6, column=1, sticky="w")
+            for index, (label, variable, low, high, step) in enumerate((
+                ("SAM automatic grid / side", self.grid_side, 4, 32, 1),
+                ("Click delay (all modes; 0 = maximum)", self.click_delay, 0, 2, .01),
+                ("Minimum capsid area (screen px²)", self.min_capsid_area, 0, 1000000, 500)), 7):
+                self.ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
+                self.ttk.Spinbox(frame, textvariable=variable, from_=low, to=high, increment=step, width=10).grid(row=index, column=1, sticky="w")
+            index = 10
             def close_settings():
                 try:
                     self._apply_model_settings(previous_config)
-                except (ValueError, self.tk.TclError) as exc:
+                except (ValueError, RuntimeError, OSError, self.tk.TclError) as exc:
                     self.messagebox.showerror("SARU Picker", str(exc), parent=window)
                     return
                 window.destroy()
@@ -1396,17 +1440,11 @@ class ScreenPickerApp:
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
-            self.ttk.Label(frame, text="capsid-learned requires its installed appearance profile.", wraplength=settings_wrap).grid(
-                row=index, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            size_note = "Minimum area applies to both capsid modes; 0 allows all sizes.\nZoom changes apparent size. Manual and Box prompts are unchanged."
-            if is_cryolo:
-                size_note = ("Minimum area applies to automatic capsid contours; 0 allows all sizes.\n"
-                             "Select by box filters crYOLO detections; it does not prompt a segmentation model.")
-            self.ttk.Label(frame, text=size_note, wraplength=settings_wrap).grid(
-                row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Label(frame, text="Click delay is in seconds. 0 removes the added wait; increase it if cryoSPARC misses picks.",
-                           wraplength=settings_wrap).grid(row=index + 2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=index + 3, column=0, columnspan=3, pady=(10, 0))
+            self.ttk.Label(frame, text="capsid, capsid-learned and generic use SAM. crYOLO uses its trained detector with learned contour refinement.",
+                           wraplength=settings_wrap).grid(row=index, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Minimum area applies to capsid contours; 0 allows all sizes.",
+                           wraplength=settings_wrap).grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)

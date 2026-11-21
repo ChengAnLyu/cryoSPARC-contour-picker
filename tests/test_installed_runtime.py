@@ -696,7 +696,7 @@ class SmokeAndLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "smoke.json"
             with patch.object(app, "setup_logging", return_value=Path(directory) / "app.log"), \
-                 patch.object(app, "run_cryolo_smoke_test", return_value={"status": "error", "error": "missing DLL"}), \
+                 patch.object(app, "run_smoke_test", return_value={"status": "error", "error": "missing DLL"}), \
                  patch.object(app, "show_startup_error") as dialog, \
                  patch.object(sys, "stdout", None), patch.object(sys, "stderr", None):
                 result = app.main(["--smoke-test", "--report", str(report)])
@@ -708,7 +708,7 @@ class SmokeAndLaunchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "smoke.json"
             with patch.object(app, "setup_logging", return_value=Path(directory) / "app.log"), \
-                 patch.object(app, "run_cryolo_smoke_test", side_effect=RuntimeError("loader failed")), \
+                 patch.object(app, "run_smoke_test", side_effect=RuntimeError("loader failed")), \
                  patch.object(app, "show_startup_error") as dialog, \
                  patch.object(sys, "stdout", None), patch.object(sys, "stderr", None), \
                  self.assertLogs("saru_picker", level="ERROR"):

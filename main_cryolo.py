@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compatibility launcher for SARU Picker 3.0.0, whose default is now crYOLO."""
+"""Compatibility entry point for the unified four-profile SARU Picker 3.0.0."""
 from app import main as application_main
 
 
 def main(argv=None):
-    return application_main(argv, default_backend="cryolo")
+    return application_main(argv)
 
 
 if __name__ == "__main__":

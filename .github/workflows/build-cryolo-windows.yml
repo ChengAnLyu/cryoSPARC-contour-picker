@@ -1,4 +1,4 @@
-name: Build SARU Picker crYOLO 3.0.0 for Windows
+name: Build SARU Picker 3.0.0 with four profiles for Windows
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ concurrency:
 jobs:
   gui-installer:
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
@@ -40,13 +40,13 @@ jobs:
           $process = Start-Process -FilePath $download -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$compiler`"" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw 'Compiler setup failed.' }
           "SARU_CRYOLO_ISCC=$(Join-Path $compiler 'ISCC.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build and verify separate GUI and installer
+      - name: Build and verify four-profile app and automatic runtime setup
         shell: pwsh
         run: ./packaging/cryolo/build.ps1 -PythonExe (Get-Command python).Source -IsccPath $env:SARU_CRYOLO_ISCC -TestInstaller
       - name: Upload GUI installer and verification
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: SARU-Picker-crYOLO-Windows-3.0.0-${{ github.run_number }}
+          name: SARU-Picker-Windows-3.0.0-${{ github.run_number }}
           path: artifacts/cryolo/*
           if-no-files-found: error
           compression-level: 0
@@ -55,10 +55,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: SARU-Picker-crYOLO-GUI-diagnostics-3.0.0-${{ github.run_number }}
+          name: SARU-Picker-GUI-diagnostics-3.0.0-${{ github.run_number }}
           path: |
             artifacts/cryolo/**/*.json
             artifacts/cryolo/**/*.png
+            artifacts/cryolo/*.log
+            ~/AppData/Local/SARU_Picker_crYOLO/runtime-install-report.json
             build/cryolo/pyinstaller/**/warn-*.txt
           if-no-files-found: warn
           retention-days: 14
@@ -68,15 +70,11 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
-        with:
-          python-version: '3.7'
-          architecture: 'x64'
-      - name: Install upstream CPU runtime and exercise its CLI
+      - name: Bootstrap private Python and upstream CPU runtime
         shell: pwsh
         run: |
           $runtime = Join-Path $env:RUNNER_TEMP 'saru-cryolo-env'
-          ./packaging/cryolo/setup-runtime.ps1 -Python37 (Get-Command python).Source -RuntimeDirectory $runtime -Report (Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime-install.json')
+          ./packaging/cryolo/setup-runtime.ps1 -ForcePrivatePython -RuntimeDirectory $runtime -Report (Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime-install.json')
       - name: Exercise stock model inference on synthetic data
         shell: pwsh
         run: |
