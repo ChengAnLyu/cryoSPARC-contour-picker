@@ -2,8 +2,9 @@ SARU Picker crYOLO — parallel 2.9.0 edition
 
 This is a separate application. It does not replace the SAM edition.
 
-1. Keep cryolo-capsids.h5, cryolo-config.json, capsid-profile.json and the two
-   app-icon files beside the crYOLO Setup program before running Setup.
+1. Extract the whole delivered release ZIP. Keep cryolo-capsids.h5,
+   cryolo-config.json, capsid-profile.json, app-icon.ico and app-icon.png beside
+   SARU-Picker-crYOLO-Setup-2.9.0-cryolo.1-win64.exe, then run that installer.
 2. Install the separate crYOLO CPU runtime once. Double-click
    Install-crYOLO-Runtime.cmd in the installed application folder, or choose
    "Install crYOLO runtime" from its Start-menu folder.
@@ -34,3 +35,16 @@ Public build checks are not a biological accuracy or trained-model benchmark.
 
 Logs and runtime setup reports:
   %LOCALAPPDATA%\SARU_Picker_crYOLO
+
+Training method
+  The independent training/train_cryolo.py wrapper runs the unchanged stock
+  crYOLO model, loss, augmentation and checkpoint APIs through a separate
+  Python 3.7 process. Monitoring averages all equal-size batches explicitly.
+  Full-fit monitoring uses the same 160 examples and is not held-out validation.
+  See the delivered training provenance for completed epochs and model hashes.
+
+Portable GUI alternative
+  Extract the portable GUI ZIP. Create an _internal/models folder beside
+  SARU Picker crYOLO.exe and copy cryolo-capsids.h5, cryolo-config.json and
+  capsid-profile.json there. Copy app-icon.ico and app-icon.png into
+  _internal/assets. Run Install-crYOLO-Runtime.cmd once, then launch the EXE.

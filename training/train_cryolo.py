@@ -1,4 +1,4 @@
-"""Run the unmodified crYOLO CLI and record the actual training provenance.
+"""Run unchanged crYOLO model APIs and record actual training provenance.
 
 Requires the private export produced by prepare_cryolo_data.py and a separately
 installed crYOLO 1.9.9 Python environment. No crYOLO source or pretrained model
@@ -9,6 +9,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -109,25 +110,29 @@ def record_run(*, config_path, export_audit_path, log_path, output_path,
         'model': config['model'],
         'training': {k:v for k,v in config['train'].items()
                      if not k.endswith('_folder') and k not in ('pretrained_weights', 'saved_weights_name')},
-        'fine_tune_layers': int(command[command.index('-lft') + 1]) if '-lft' in command else None,
+        'fine_tune_layers': int(command[command.index('--fine-tune-layers') + 1]) if '--fine-tune-layers' in command else None,
         'train_case_ids': train_ids, 'monitor_case_ids': monitor_ids,
-        'all_cases_received_gradients_each_completed_epoch': train_ids == expected,
+        'all_cases_processed_for_training_each_completed_epoch': train_ids == expected,
+        'training_exposure_note': 'Every image enters each completed training epoch. Stock random augmentation can clip individual edge targets; not every box necessarily contributes a positive gradient on every pass.',
         'monitor_scope': 'in_sample' if train_ids == monitor_ids else 'separate_cases',
-        'best_checkpoint_selection': 'Minimum stock crYOLO monitor loss; this is in-sample for the full fit.',
+        'best_checkpoint_selection': 'Minimum explicitly averaged loss across every monitoring batch; in-sample for the full fit.',
         'annotation_semantics': audit['background_semantics'],
         'confirmed_large_boxes': audit['confirmed_large_box_count'],
         'confirmed_blank_case_ids': audit['confirmed_blank_case_ids'],
         'unknown_only_case_ids': audit['unknown_only_case_ids'],
         'empty_annotations': audit['empty_annotation_count'],
-        'augmentation': 'Stock crYOLO augmentation enabled unless --skip_augmentation is in command.',
+        'augmentation': 'Stock crYOLO augmentation enabled.',
         'exact_bitwise_reproducibility': False,
-        'reproducibility_note': 'Stock --seed controls its dataset split; TensorFlow/augmentation execution can differ across runs.',
+        'reproducibility_note': 'TensorFlow and stock augmentation execution can differ across runs; source/data/config are recorded.',
         **parsed,
     }
     # Configuration paths are kept in the private run directory, not the portable report.
     report['model'].pop('backend_weights', None)
     if weights.is_file():
         report['weights'] = {'name': weights.name, 'sha256': sha256(weights), 'bytes': weights.stat().st_size}
+    state_path = config_path.parent / 'native-training-state.json'
+    if state_path.is_file():
+        report['native_api_run'] = json.loads(state_path.read_text())
     Path(output_path).write_text(json.dumps(report, indent=2) + '\n')
     return report
 
@@ -143,9 +148,13 @@ def main(argv=None):
     p.add_argument('--input-size', type=int, default=320)
     p.add_argument('--cpu-threads', type=int, default=4)
     p.add_argument('--fine-tune-layers', type=int, default=2)
+    p.add_argument('--object-scale', type=float, default=100.0)
+    p.add_argument('--no-object-scale', type=float, default=1.0)
     a = p.parse_args(argv)
     if min(a.epochs, a.cpu_threads, a.fine_tune_layers) < 1 or a.input_size < 32 or a.input_size % 32:
         p.error('Use positive counts and an input size divisible by 32.')
+    if any(not math.isfinite(v) or v <= 0 for v in (a.object_scale, a.no_object_scale)):
+        p.error('Object and background loss weights must be positive finite numbers.')
     for required in (a.cryolo_python, a.pretrained_weights, a.backend_weights):
         if not required.is_file():
             p.error(f'Required runtime/model file is missing: {required}')
@@ -166,13 +175,14 @@ def main(argv=None):
     config['model']['input_size'] = [a.input_size, a.input_size]
     config['model']['backend_weights'] = str(a.backend_weights.resolve())
     config['train'].update(pretrained_weights=str(a.pretrained_weights.resolve()), nb_epoch=a.epochs,
+                           object_scale=a.object_scale, no_object_scale=a.no_object_scale,
                            saved_weights_name='capsid-cryolo.h5')
     config['other'] = {'log_path':'logs'}
     config_path = a.output / 'config.json'
     config_path.write_text(json.dumps(config, indent=2)+'\n')
-    command = [str(a.cryolo_python.resolve()), '-m', 'cryolo.train', '-c', 'config.json', '-w', '0',
-               '--fine_tune', '-lft', str(a.fine_tune_layers), '-nc', str(a.cpu_threads),
-               '-e', str(a.epochs+1)]
+    command = [str(a.cryolo_python.resolve()), str(Path(__file__).with_name('train_cryolo_native.py').resolve()),
+               '--config', str(config_path), '--cpu-threads', str(a.cpu_threads),
+               '--fine-tune-layers', str(a.fine_tune_layers), '--snapshot-every', '5']
     env = dict(os.environ, CUDA_VISIBLE_DEVICES='-1', TF_CPP_MIN_LOG_LEVEL='2', PYTHONUNBUFFERED='1')
     preflight = native_target_audit(a.cryolo_python, config_path)
     if (preflight['stock_mode'] != 'FIXED_SIZE'

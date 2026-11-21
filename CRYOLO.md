@@ -33,8 +33,9 @@ the separate crYOLO user directory. `main.py` continues to default to SAM;
 
 The Windows release includes a separate GUI installer. Keep its private model,
 config, profile and icon sidecars beside Setup when installing. Run the included
-`setup-runtime.ps1` once to acquire stock crYOLO and its isolated Python 3.7 CPU
-environment, or choose an existing compatible crYOLO interpreter. The modern
+`Install-crYOLO-Runtime.cmd` once (also available from the application's
+Start-menu folder) to acquire stock crYOLO and its isolated Python 3.7 CPU
+environment, or choose an existing compatible crYOLO interpreter in Advanced. The modern
 GUI and legacy model environment run in separate processes. Setup does not
 replace the SAM installation or alter the system Python PATH.
 
@@ -65,10 +66,42 @@ python training/prepare_cryolo_data.py \
   --accept-incomplete-background --input-size 320 --epochs 20
 ```
 
+To run the full fit, use the Python 3.11-or-newer wrapper, supplying the separately
+obtained official initialization files and the Python executable from the
+crYOLO environment:
+
+```sh
+python training/train_cryolo.py \
+  --export-directory /path/to/new-cryolo-export \
+  --cryolo-python /path/to/cryolo-environment/bin/python \
+  --pretrained-weights /path/to/gmodel_phosnet_202005_N63_c17.h5 \
+  --backend-weights /path/to/full_yolo_backend.h5 \
+  --output /path/to/new-training-run \
+  --input-size 320 --epochs 20 --cpu-threads 4 \
+  --fine-tune-layers 2 --object-scale 100 --no-object-scale 1
+```
+
+The wrapper runs `training/train_cryolo_native.py` in the legacy environment.
+That independent driver calls the unchanged crYOLO `YOLO`, `custom_loss`,
+`PatchwiseBatchGenerator` and `ExtendedModelCheckpoint` APIs. It neither
+patches nor vendors the crYOLO package. Images are resized as complete frames
+to an explicit `[320, 320]` input with standard normalization, one patch and no
+added low-pass filter. The default full-fit recipe uses batch size four,
+learning rate `1e-4`, two fine-tuning layers and stock augmentation.
+
+Checkpoint selection uses the arithmetic mean of every equal-size monitoring
+batch's `test_on_batch(..., reset_metrics=True)` loss. This avoids the observed
+legacy Keras validation-reporting problem in which the reported value reflected
+the last monitoring batch. Calling `cryolo_train.py` directly does not reproduce
+this driver's monitoring or checkpoint-selection procedure. The driver records
+its source hash, package versions, input hashes, actual completed epochs and
+selected checkpoint; a requested epoch count is not evidence of completion.
+
 The exporter preserves all ten original grouped folds. Creating fold directories
 does not mean that ten models were trained. The final `full` configuration uses
 all 160 examples for training and those same images for monitoring; its metrics
-are in-sample. Each config uses paths relative to its own directory. See the
+are in-sample. The training wrapper audits the stock generator to verify that
+all 146 exported positive boxes survive target assignment in full-frame mode. Each config uses paths relative to its own directory. See the
 delivered training record for actual commands, initialization hashes, epochs
 and completed evaluation scope.
 
@@ -100,3 +133,22 @@ Diagnostics reports metadata only. The smoke test requires installed weights,
 configuration and a working crYOLO runtime, and performs real inference. Public
 Windows build checks cover packaging and interface behavior; they do not measure
 biological detection accuracy on private examples.
+
+
+## Windows build provenance
+
+[Windows build 3](https://github.com/ChengAnLyu/cryoSPARC-contour-picker/actions/runs/44942803369)
+completed successfully from application commit
+`f7f7f31dae0e2f24d1b370f39cfeb42fe632e04c`. It checks the GUI and installer,
+the actual crYOLO Advanced panel, and a separately installed native Windows
+crYOLO runtime using synthetic input and an untrained detection head. The
+installer's metadata checks intentionally ran without private weights. Those
+checks establish packaging/runtime operation; they do not establish private
+model training completion or capsid accuracy.
+
+The verified installer is
+`SARU-Picker-crYOLO-Setup-2.9.0-cryolo.1-win64.exe`, SHA-256
+`7fc1f634883e163c6cd9cd31185f0e4b6ba9e62c18ad8c5753bc1dd1c8f90b47`.
+See [the packaging notes](packaging/cryolo/README.md) for exact sidecar names,
+portable installation and the separation between application-build provenance
+and the later training-driver/model provenance.

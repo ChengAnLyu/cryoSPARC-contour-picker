@@ -28,7 +28,7 @@ def sha256(path):
 
 
 def evaluate(manifest_path, cbox_directory, weights, config_path, profile, threshold,
-             output, case_ids=None, scope='in-sample final-model diagnostic'):
+             output, case_ids=None, scope='in-sample final-model diagnostic', mask_directory=None):
     manifest_path = Path(manifest_path)
     dataset = json.loads(manifest_path.read_text())
     root = manifest_path.parent
@@ -39,6 +39,9 @@ def evaluate(manifest_path, cbox_directory, weights, config_path, profile, thres
     records = []
     all_regions = []
     selected_ids = set(case_ids) if case_ids is not None else {c['case_id'] for c in dataset['cases']}
+    if mask_directory is not None:
+        mask_directory = Path(mask_directory)
+        mask_directory.mkdir(parents=True, exist_ok=True)
     if not selected_ids or not selected_ids <= {c['case_id'] for c in dataset['cases']}:
         raise ValueError('Case selection must identify existing dataset cases.')
     try:
@@ -56,6 +59,8 @@ def evaluate(manifest_path, cbox_directory, weights, config_path, profile, thres
             union = np.zeros(rgb.shape[:2], dtype=bool)
             for candidate in candidates:
                 union |= candidate.mask
+            if mask_directory is not None:
+                np.savez_compressed(mask_directory / (stem + '.npz'), mask=union)
             valid = np.asarray(Image.open(root / case['valid_image_pixels']['path'])) > 0
             regions = np.asarray(Image.open(root / case['valid_image_pixels']['positive_regions_path']))
             refs = []
@@ -75,6 +80,8 @@ def evaluate(manifest_path, cbox_directory, weights, config_path, profile, thres
                             'refinement_seconds': elapsed, 'cbox_sha256': sha256(cbox_path),
                             'carbon_guard': carbon, 'area_filter': area,
                             'candidate_evidence': evidence})
+            if len(records) % 20 == 0 or len(records) == len(selected_ids):
+                print(f'Evaluated {len(records)}/{len(selected_ids)} examples', flush=True)
     finally:
         recognizer.close()
     blanks = [r for r in records if r['confirmed_blank']]
@@ -109,10 +116,11 @@ def main():
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--threshold', type=float, default=.3)
     parser.add_argument('--case-ids', type=int, nargs='+')
+    parser.add_argument('--mask-directory', type=Path)
     parser.add_argument('--scope', default='in-sample final-model diagnostic')
     args = parser.parse_args()
     result = evaluate(args.manifest, args.cbox_directory, args.weights, args.config,
-                      args.profile, args.threshold, args.output, args.case_ids, args.scope)
+                      args.profile, args.threshold, args.output, args.case_ids, args.scope, args.mask_directory)
     print(json.dumps(result['summary'], indent=2))
 
 
