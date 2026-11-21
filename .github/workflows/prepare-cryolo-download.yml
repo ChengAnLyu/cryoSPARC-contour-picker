@@ -1,0 +1,155 @@
+name: Prepare verified SARU 3.0.0 artifact download parts
+
+on:
+  push:
+    branches:
+      - 'parallel/**'
+    paths:
+      - '.github/workflows/prepare-cryolo-download.yml'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  split-verified-artifact:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download and split the existing successful Windows artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          artifact_id = 14726451597
+          expected_size = 1036605048
+          expected_sha256 = 'd7e27a362a36741ef27507cde1da1ce1da11c025883adad6868827a51e3dc6a0'
+          source_run = 44952352580
+          source_commit = 'add91818501c14b9f66177ad2533210c808ad63e'
+          part_limit = 300 * 1024 * 1024
+          chunk_size = 8 * 1024 * 1024
+          archive = Path(os.environ['RUNNER_TEMP']) / 'SARU-Picker-Windows-3.0.0-run9.zip'
+          parts = Path(os.environ['GITHUB_WORKSPACE']) / 'download-parts'
+          parts.mkdir()
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, message, headers, new_url):
+                  return None
+
+          api = f'https://api.github.com/repos/ChengAnLyu/cryoSPARC-contour-picker/actions/artifacts/{artifact_id}/zip'
+          request = urllib.request.Request(api, headers={
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'SARU-verified-artifact-download',
+          })
+          # Obtain the signed download location without forwarding the GitHub
+          # token to the storage host or writing either credential to logs.
+          try:
+              response = urllib.request.build_opener(NoRedirect).open(request, timeout=90)
+          except urllib.error.HTTPError as error:
+              if error.code not in (301, 302, 303, 307, 308):
+                  raise
+              location = error.headers.get('Location', '')
+              if urllib.parse.urlsplit(location).scheme != 'https':
+                  raise RuntimeError('GitHub did not return an HTTPS artifact location.')
+              response = urllib.request.urlopen(location, timeout=90)
+          digest = hashlib.sha256()
+          received = 0
+          with response, archive.open('wb') as target:
+              while True:
+                  chunk = response.read(chunk_size)
+                  if not chunk:
+                      break
+                  target.write(chunk)
+                  digest.update(chunk)
+                  received += len(chunk)
+          if received != expected_size or digest.hexdigest() != expected_sha256:
+              raise RuntimeError(f'Original artifact integrity check failed: {received} bytes, {digest.hexdigest()}.')
+
+          records = []
+          with archive.open('rb') as source:
+              index = 1
+              while source.tell() < expected_size:
+                  name = f'SARU-Picker-Windows-3.0.0-run9.part{index:02d}'
+                  part_hash = hashlib.sha256()
+                  written = 0
+                  with (parts / name).open('wb') as target:
+                      while written < part_limit:
+                          chunk = source.read(min(chunk_size, part_limit - written))
+                          if not chunk:
+                              break
+                          target.write(chunk)
+                          part_hash.update(chunk)
+                          written += len(chunk)
+                  records.append({'filename': name, 'bytes': written, 'sha256': part_hash.hexdigest()})
+                  index += 1
+          if len(records) != 4 or sum(item['bytes'] for item in records) != expected_size:
+              raise RuntimeError('Unexpected artifact part count or combined size.')
+          manifest = {
+              'format': 'saru-artifact-download-parts-v1',
+              'source_repository': 'ChengAnLyu/cryoSPARC-contour-picker',
+              'source_workflow_run_id': source_run,
+              'source_commit': source_commit,
+              'source_artifact_id': artifact_id,
+              'source_artifact_name': 'SARU-Picker-Windows-3.0.0-9',
+              'reassembled_filename': archive.name,
+              'original_bytes': expected_size,
+              'original_sha256': expected_sha256,
+              'maximum_part_bytes': part_limit,
+              'parts': records,
+              'instructions': 'Extract each downloaded part artifact, concatenate the four part files in the listed order, then verify original_bytes and original_sha256 before opening the resulting ZIP.',
+              'scope': 'Exact bytes from the successful existing Windows build. No rebuild or model changes.',
+          }
+          (parts / 'download-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(manifest, indent=2))
+          PY
+      - name: Upload part 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Windows-3.0.0-run9-part01
+          path: |
+            download-parts/SARU-Picker-Windows-3.0.0-run9.part01
+            download-parts/download-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload part 2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Windows-3.0.0-run9-part02
+          path: |
+            download-parts/SARU-Picker-Windows-3.0.0-run9.part02
+            download-parts/download-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload part 3
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Windows-3.0.0-run9-part03
+          path: |
+            download-parts/SARU-Picker-Windows-3.0.0-run9.part03
+            download-parts/download-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload part 4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Windows-3.0.0-run9-part04
+          path: |
+            download-parts/SARU-Picker-Windows-3.0.0-run9.part04
+            download-parts/download-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
