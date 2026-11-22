@@ -13,25 +13,29 @@ def enforce_offline_verification() -> None:
     """CI guard, inherited by the frozen worker; normal operation is unchanged."""
     if os.environ.get('SARU_VERIFY_OFFLINE') != '1':
         return
-    import socket
-    import subprocess
+    def offline_audit(event, arguments):
+        if event in {'socket.connect', 'socket.getaddrinfo', 'socket.gethostbyname',
+                     'socket.gethostbyaddr', 'socket.sendto'}:
+            raise RuntimeError('Offline verification forbids network access.')
+        if event == 'subprocess.Popen':
+            executable, command, *_ = arguments
+            if isinstance(command, str):
+                # Windows audits the already-quoted command line and can leave
+                # executable=None. Match the exact prefix produced by Popen.
+                import subprocess
+                prefix = subprocess.list2cmdline([sys.executable, '--cryolo-onnx-worker'])
+                own_worker = command == prefix or command.startswith(prefix + ' ')
+            else:
+                own_worker = (isinstance(command, (list, tuple)) and len(command) >= 2
+                              and Path(command[0]).resolve() == Path(sys.executable).resolve()
+                              and command[1] == '--cryolo-onnx-worker')
+            if (not own_worker or (executable is not None
+                    and Path(executable).resolve() != Path(sys.executable).resolve())):
+                raise RuntimeError('Offline verification forbids external runtimes and setup processes.')
 
-    def deny_network(*args, **kwargs):
-        raise RuntimeError('Offline verification forbids network access.')
-
-    socket.socket.connect = deny_network
-    socket.socket.connect_ex = deny_network
-    socket.create_connection = deny_network
-    original_popen = subprocess.Popen
-
-    def local_worker_only(command, *args, **kwargs):
-        if (not isinstance(command, (list, tuple)) or len(command) < 2
-                or Path(command[0]).resolve() != Path(sys.executable).resolve()
-                or command[1] != '--cryolo-onnx-worker'):
-            raise RuntimeError('Offline verification forbids external runtimes and setup processes.')
-        return original_popen(command, *args, **kwargs)
-
-    subprocess.Popen = local_worker_only
+    # Keep subprocess.Popen a class: torch subclasses it while importing.
+    # The native firewall rule independently covers network calls in DLLs.
+    sys.addaudithook(offline_audit)
 
 
 def launch() -> int:
