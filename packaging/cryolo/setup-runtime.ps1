@@ -36,6 +36,10 @@ function Read-Health {
     $Arguments = '"' + (Join-Path $PSScriptRoot "runtime_health.py") + '" --progress-report "' + $ProbeProgress + '"'
     try {
         $Probe = Start-Process -FilePath $RuntimePython -ArgumentList $Arguments -PassThru -NoNewWindow -RedirectStandardOutput $ProbeOutput -RedirectStandardError $ProbeError
+        # Keep the native process handle while it is alive. Windows PowerShell
+        # Start-Process can otherwise lose ExitCode after a short-lived child exits.
+        # Process.ExitCode requires a valid local process handle (Microsoft .NET).
+        $null = $Probe.Handle
         if (-not $Probe.WaitForExit(120000)) {
             $Probe.Kill()
             if (-not $Probe.WaitForExit(5000)) { throw 'The runtime health process did not stop after cancellation.' }
@@ -43,13 +47,17 @@ function Read-Health {
             $script:HealthFailure | ConvertTo-Json | Set-Content -LiteralPath $ProbeOutput -Encoding UTF8
             return $null
         }
-        $Probe.Refresh()
         $ExitCode = $Probe.ExitCode
+        if ($null -eq $ExitCode) { throw 'The runtime health process did not provide an exit code.' }
         $Health = $null
         try { $Health = Get-Content -LiteralPath $ProbeOutput -Raw | ConvertFrom-Json } catch { $Health = $null }
-        if ($ExitCode -eq 0 -and $Health -and $Health.status -eq 'ok') { return $Health }
-        if ($Health) {
-            $script:HealthFailure = @{ status = 'error'; returncode = $ExitCode; error = $Health.error; log = $ProbeError }
+        $HealthStatus = $null
+        $HealthError = $null
+        if ($Health -and $Health.PSObject.Properties['status']) { $HealthStatus = $Health.status }
+        if ($Health -and $Health.PSObject.Properties['error']) { $HealthError = $Health.error }
+        if ($ExitCode -eq 0 -and $HealthStatus -eq 'ok') { return $Health }
+        if ($HealthError) {
+            $script:HealthFailure = @{ status = 'error'; returncode = $ExitCode; error = $HealthError; log = $ProbeError }
         } else {
             $script:HealthFailure = @{ status = 'crashed'; returncode = $ExitCode; error = "The crYOLO runtime check stopped without a report (exit $ExitCode)."; log = $ProbeError }
             $script:HealthFailure | ConvertTo-Json | Set-Content -LiteralPath $ProbeOutput -Encoding UTF8

@@ -151,6 +151,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic runtime inference failed.' }
       - name: Preserve runtime installation evidence
         if: always()
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime'
+          New-Item -ItemType Directory -Force -Path $target | Out-Null
+          foreach ($name in @('runtime-health.json','runtime-health.log','runtime-health-progress.json')) {
+            $source = Join-Path $env:RUNNER_TEMP $name
+            if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $target $name) }
+          }
+      - name: Upload runtime installation evidence
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: SARU-Picker-crYOLO-runtime-check-3.0.0-${{ github.run_number }}
@@ -158,5 +168,7 @@ jobs:
             artifacts/cryolo-runtime-install.json
             artifacts/cryolo-runtime/runtime-inference.json
             artifacts/cryolo-runtime/synthetic-cli.log
+            artifacts/cryolo-runtime/runtime-health*.json
+            artifacts/cryolo-runtime/runtime-health.log
           if-no-files-found: warn
           retention-days: 14
