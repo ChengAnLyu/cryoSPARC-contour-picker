@@ -13,12 +13,15 @@ overlays, sampling, cancellation and navigation.
 
 ## Install the delivered release
 
-Extract the entire release ZIP and run `SARU-Picker-Setup-3.0.0-win64.exe`.
+Extract both delivered installer and models ZIPs into the same destination,
+open their shared `SARU-Picker-3.0.0` folder, and run
+`SARU-Picker-Setup-3.0.0-win64.exe`.
 Leave the supplied model/config/profile and icon sidecars beside Setup.
 Setup copies the sidecars, installs and verifies the private crYOLO runtime
 when needed, then enables launch. First installation requires internet access
 and can take several minutes. There is no separate Python selection or runtime
-installation step. A failure stops launch and explains how to retry Setup.
+installation step. A failure stops automatic launch. Open **SARU Picker 3.0** from Start, then
+**Advanced → Repair crYOLO runtime** to repair an existing unhealthy runtime.
 
 SAM ViT-B and its CPU runtime are bundled. Launch **SARU Picker 3.0**, choose
 one of the four profiles in Advanced and inspect detections in semi-auto mode
@@ -62,6 +65,23 @@ It leaves global Python, PATH and file associations unchanged. The runtime is
 A healthy existing managed runtime can be reused without network access.
 The install report is `runtime-install-report.json` in that parent folder.
 The application can repair a missing managed runtime when detection starts.
+
+### Recognition stall fix (22 November 2026)
+
+This rebuild retains version 3.0.0 and the same four profiles and trained models.
+Recognition now reports runtime checking, prediction and contour refinement,
+with elapsed time. A failed or stalled check of an existing runtime no longer
+silently starts a lengthy reinstall during Detect. Runtime health checks are
+bounded in both the application and the Windows setup helper; prediction is
+cancellable and retains its diagnostic output on failure.
+
+If the existing runtime needs repair, select **Advanced → Repair crYOLO
+runtime**, wait for completion, then retry Detect. Escape cancels the operation.
+An absent runtime is still prepared automatically. Runtime setup requires an
+internet connection; ordinary detection with a healthy runtime does not.
+Prediction subprocesses run without a console window, avoiding interference
+with the selected micrograph. No checkpoint, threshold or contour rule changes
+are part of this fix.
 
 crYOLO software and general pretrained weights are obtained from upstream,
 not redistributed in this bundle. Its

@@ -36,7 +36,7 @@ hiddenimports = collect_submodules("segment_anything") + [
     "torch", "torchvision", "torchvision._C",
 ]
 a = Analysis([str(project / "packaging" / "cryolo" / "launcher.py")],
-             pathex=[str(project)], binaries=[], datas=datas, hiddenimports=hiddenimports,
+             pathex=[str(project), str(project / "packaging" / "cryolo")], binaries=[], datas=datas, hiddenimports=hiddenimports,
              hookspath=[], hooksconfig={}, runtime_hooks=[],
              excludes=["tensorflow", "keras", "cryolo"], noarchive=False, optimize=0)
 pyz = PYZ(a.pure)

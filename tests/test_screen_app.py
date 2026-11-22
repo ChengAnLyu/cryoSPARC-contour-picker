@@ -10,7 +10,7 @@ import numpy as np
 
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskResult
 from manual_sampling import legacy_contour_points, mask_contour_points
-from recognition import make_candidate
+from recognition import RecognitionConfig, make_candidate
 from micrograph_navigation import NoNewMicrographError, MicrographLoadTimeoutError
 from screen_app import (ScreenPickerApp, screen_changed_fraction, screen_mask_at, screen_model_points, screen_model_batches,
                         screen_background_guard, screen_background_changed, screen_region_overlaps_panel,
@@ -432,6 +432,113 @@ class ScreenControllerTests(unittest.TestCase):
         app._hotkey("stop")
         self.assertTrue(app.active_token.cancelled)
         self.assertEqual(app.events.get_nowait(), ("hotkey", "stop"))
+
+    def test_live_detection_passes_progress_only_to_cryolo_without_worker_tk_access(self):
+        for backend in ("sam", "cryolo"):
+            with self.subTest(backend=backend):
+                app = app_state("semi-auto")
+                app._model_config = Mock(return_value=RecognitionConfig(
+                    "model.h5" if backend == "cryolo" else "model.pth", backend=backend))
+                def recognize(rgb, **options):
+                    self.assertEqual("progress" in options, backend == "cryolo")
+                    if backend == "cryolo":
+                        options["progress"]("Refining contours")
+                    self.assertFalse(options["cancel"]())
+                    return []
+                app._get_recognizer = Mock(return_value=SimpleNamespace(automatic=recognize))
+                app.detect()
+                app.root.run_next()
+                with patch.object(app.status, "set", side_effect=AssertionError("Worker touched Tk")):
+                    result = app.runner.finish()
+                self.assertEqual(result["candidates"], [])
+                phases = []
+                while not app.events.empty():
+                    phases.append(app.events.get_nowait()[2])
+                self.assertIn("Checking screen alignment", phases)
+                self.assertIn("Refining contours" if backend == "cryolo" else "Running SAM", phases)
+
+    def test_recognition_phase_keeps_pause_and_stop_messages_authoritative(self):
+        app = app_state("semi-auto")
+        with patch("screen_app.time.perf_counter", return_value=100):
+            app._submit("recognition", lambda token: None)
+        token = app.active_token
+        app.events.put(("recognition_phase", token, "Refining contours"))
+        with patch("screen_app.time.perf_counter", return_value=109):
+            app.poll()
+        self.assertIn("Refining contours\n9s elapsed", app.status.get())
+        app.pause()
+        paused = app.status.get()
+        app.events.put(("recognition_phase", token, "Finishing contours"))
+        with patch("screen_app.time.perf_counter", return_value=110):
+            app.poll()
+        self.assertEqual(app.status.get(), paused)
+        app.stop()
+        stopped = app.status.get()
+        app.events.put(("recognition_phase", token, "Late phase"))
+        app.poll()
+        self.assertEqual(app.status.get(), stopped)
+        self.assertIsNone(app._recognition_progress)
+
+    def test_previous_recognition_phase_cannot_replace_next_auto_job_in_same_generation(self):
+        app = app_state("auto")
+        app._submit("recognition", lambda token: None)
+        previous = app.active_token
+        for _ in range(4000):
+            app.events.put(("mouse", -1, "move", 150, 120))
+        app.events.put(("recognition_phase", previous, "Old job phase"))
+        app.runner.results.append(TaskResult(previous, value={}))
+        app._result = lambda kind, value: app._submit("recognition", lambda token: None)
+        app.poll()
+        self.assertIsNot(previous, app.active_token)
+        self.assertEqual(previous.generation, app.active_token.generation)
+        app.poll()
+        self.assertNotIn("Old job phase", app.status.get())
+        self.assertEqual(app._recognition_progress.phase, "Starting detector")
+
+    def test_failed_recognition_does_not_leave_elapsed_status_running(self):
+        app = app_state("semi-auto")
+        app._submit("recognition", lambda token: None)
+        token = app.active_token
+        app.events.put(("recognition_phase", token, "Loading model"))
+        app.runner.results.append(TaskResult(token, error=RuntimeError("model runtime failed")))
+        with self.assertLogs("saru.screen", level="ERROR"):
+            app.poll()
+        app.events.put(("recognition_phase", token, "Late phase"))
+        app.poll()
+        self.assertEqual(app.status.get(), "model runtime failed")
+        self.assertIsNone(app._recognition_progress)
+
+    def test_explicit_runtime_repair_is_worker_only_and_visible_in_settings(self):
+        app = app_state("semi-auto")
+        app.advanced, app._advanced_message = object(), Mock()
+        def repair(*, cancel, progress):
+            self.assertFalse(cancel())
+            progress("Repairing runtime")
+            return Path("managed-python.exe")
+        with patch("screen_app.repair_cryolo_runtime", side_effect=repair) as helper:
+            app.repair_runtime()
+            helper.assert_not_called()
+            app._advanced_message.configure.assert_called_once_with(textvariable=app.status)
+            self.assertEqual(app.job_kind, "runtime repair")
+            self.assertTrue(app.status.get().startswith("Runtime repair:"))
+            token = app.active_token
+            value = app.runner.finish()
+        app.runner.results.append(TaskResult(token, value=value))
+        app.poll()
+        self.assertIn("runtime repaired", app.status.get())
+        self.assertIsNone(app._recognition_progress)
+
+    def test_repair_cannot_replace_active_work_and_escape_cancels_its_token(self):
+        app = app_state("semi-auto")
+        with patch("screen_app.repair_cryolo_runtime") as helper:
+            app.repair_runtime()
+            token = app.active_token
+            app.repair_runtime()
+            self.assertEqual(len(app.runner.jobs), 1)
+            self.assertFalse(token.cancelled)
+            app.stop()
+            self.assertTrue(token.cancelled)
+            helper.assert_not_called()
 
     def test_disabled_or_panel_press_never_starts_a_capture(self):
         app = app_state()

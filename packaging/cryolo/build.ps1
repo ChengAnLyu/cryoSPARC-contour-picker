@@ -25,10 +25,10 @@ function Assert-Checkpoint {
     }
 }
 function Invoke-Frozen {
-    param([string]$Executable, [string]$Arguments, [string]$Report)
+    param([string]$Executable, [string]$Arguments, [string]$Report, [int]$TimeoutSeconds = 600)
     if (Test-Path -LiteralPath $Report) { Remove-Item -LiteralPath $Report }
     $Process = Start-Process -FilePath $Executable -ArgumentList "$Arguments --report `"$Report`"" -PassThru
-    if (-not $Process.WaitForExit(600000)) {
+    if (-not $Process.WaitForExit($TimeoutSeconds * 1000)) {
         Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
         throw "Frozen application check timed out: $Report"
     }
@@ -145,6 +145,8 @@ try {
     Copy-Item -LiteralPath $PythonPackage -Destination $Distribution -Force
     Invoke-Diagnostics $Executable (Join-Path $ArtifactDirectory 'frozen-diagnostics.json')
     Invoke-SamSmoke $Executable (Join-Path $ArtifactDirectory 'frozen-sam-smoke.json')
+    $Refinement = Invoke-Frozen $Executable '--cryolo-refinement-smoke' (Join-Path $ArtifactDirectory 'frozen-cryolo-refinement.json') 300
+    if (-not $Refinement.frozen -or @($Refinement.checks | Where-Object { $_.status -eq 'ok' }).Count -ne 4) { throw 'Frozen positive/dense refinement checks were incomplete.' }
     Compress-Archive -Path $Distribution -DestinationPath (Join-Path $ArtifactDirectory "SARU-Picker-GUI-$Version-win64.zip") -Force
     if ($IsccPath) {
         Invoke-Checked $IsccPath @("/DAppVersion=$Version", "/DAppSourceDir=$Distribution", "/DAppOutputDir=$ArtifactDirectory", (Join-Path $PSScriptRoot 'installer.iss'))
@@ -180,6 +182,8 @@ try {
             $InstalledExe = Join-Path $InstallDirectory 'SARU Picker crYOLO.exe'
             Invoke-Diagnostics $InstalledExe (Join-Path $ArtifactDirectory 'installed-diagnostics.json')
             Invoke-SamSmoke $InstalledExe (Join-Path $ArtifactDirectory 'installed-sam-smoke.json')
+            $Refinement = Invoke-Frozen $InstalledExe '--cryolo-refinement-smoke' (Join-Path $ArtifactDirectory 'installed-cryolo-refinement.json') 300
+            if (-not $Refinement.frozen -or @($Refinement.checks | Where-Object { $_.status -eq 'ok' }).Count -ne 4) { throw 'Installed positive/dense refinement checks were incomplete.' }
             Invoke-Checked $BuildPython @('packaging\verify_capsid_profile_installation.py', 'verify', '--install-directory', $InstallDirectory, '--fixture-directory', $SidecarStage, '--runtime-report', (Join-Path $ArtifactDirectory 'installed-sam-smoke.json'), '--report', (Join-Path $ArtifactDirectory 'installed-capsid-profile.json'))
             $CopiedSidecars = @()
             foreach ($Sidecar in @('cryolo-capsids.h5','cryolo-config.json','capsid-profile.json','app-icon.ico','app-icon.png')) {
@@ -209,5 +213,6 @@ try {
     @(Get-ChildItem -LiteralPath $ArtifactDirectory -File | Where-Object { $_.Extension -in @('.exe','.zip') } | ForEach-Object {
         "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
     }) | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'SHA256SUMS.txt') -Encoding ASCII
-    @{status='ok'; version=$Version; default_profile='capsid'; profiles=@('capsid','capsid-learned','generic','crYOLO'); sam_runtime_and_vit_b_bundled=$true; private_python_package_bundled=$true; private_python_version='3.7.9'; private_weights_bundled=$false; cryolo_runtime_bundled=$false; cryolo_runtime_automatically_installed=$true; frozen_sam_inference_tested=$true; installed_cryolo_inference_tested=[bool]($TestInstaller -and $IsccPath); model_accuracy_tested=$false; note='Synthetic runtime checks only; installed crYOLO boundary verification requires -TestInstaller. No private trained-model accuracy claim.'} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'build-manifest.json') -Encoding UTF8
+    @{status='ok'; version=$Version; default_profile='capsid'; profiles=@('capsid','capsid-learned','generic','crYOLO'); sam_runtime_and_vit_b_bundled=$true; private_python_package_bundled=$true; private_python_version='3.7.9'; private_weights_bundled=$false; cryolo_runtime_bundled=$false; cryolo_runtime_automatically_installed=$true; frozen_sam_inference_tested=$true; frozen_positive_dense_refinement_tested=$true; installed_positive_dense_refinement_tested=[bool]($TestInstaller -and $IsccPath); installed_cryolo_inference_tested=[bool]($TestInstaller -and $IsccPath); model_accuracy_tested=$false; note='Synthetic runtime checks only; installed crYOLO boundary verification requires -TestInstaller. No private trained-model accuracy claim.'} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'build-manifest.json') -Encoding UTF8
+    Invoke-Checked $BuildPython @('packaging\cryolo\prepare_downloads.py', $ArtifactDirectory, '--version', $Version)
 } finally { $env:SARU_MODEL_FILE = $PreviousModel; Pop-Location }

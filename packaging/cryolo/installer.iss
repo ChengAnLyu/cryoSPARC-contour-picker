@@ -94,7 +94,7 @@ begin
   begin
     WizardForm.FinishedHeadingLabel.Caption := 'crYOLO setup needs attention';
     WizardForm.FinishedLabel.Caption := RuntimeError + #13#10#13#10 +
-      'SARU Picker was copied, but it will not launch automatically. Re-run Setup to finish preparing all four profiles.';
+      'SARU Picker was installed, but it will not launch automatically. Open SARU Picker 3.0 from Start, then Advanced > Repair crYOLO runtime.';
   end;
 end;
 
@@ -113,12 +113,12 @@ begin
     if not Exec(ProgramPath, Parameters, ExpandConstant('{app}'), SW_SHOWMINIMIZED,
       ewWaitUntilTerminated, ExitCode) then
     begin
-      RuntimeSetupFailed('The crYOLO runtime setup could not start. Re-run Setup to repair it.');
+      RuntimeSetupFailed('The crYOLO runtime setup could not start. Open SARU Picker 3.0 from Start, then Advanced > Repair crYOLO runtime.');
       Exit;
     end;
     if ExitCode <> 0 then
     begin
-      RuntimeSetupFailed('The crYOLO runtime setup failed. Re-run Setup with an internet connection. Details: ' +
+      RuntimeSetupFailed('The crYOLO runtime is not ready. Open SARU Picker 3.0 from Start, then Advanced > Repair crYOLO runtime. Details: ' +
         ExpandConstant('{localappdata}\SARU_Picker_crYOLO\runtime-install-report.json'));
       Exit;
     end;

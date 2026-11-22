@@ -1,19 +1,21 @@
 """Headless app integration regressions with no Tk windows or desktop events."""
 
 import csv
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import queue
 import tempfile
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
 
 from app import PickerApp, changed_fraction, export_review, image_digest, selected_grid
-from execution import CancellationToken, CaptureGeometry, TaskResult, WorkerBusyError
-from recognition import make_candidate
+from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskResult, WorkerBusyError
+from recognition import RecognitionConfig, make_candidate
 
 
 class Variable:
@@ -357,6 +359,267 @@ class AppStateTests(unittest.TestCase):
         self.assertEqual(app.batch_remaining, 0)
         self.assertFalse(app.root.hidden)
         self.assertEqual(len(app.errors), 1)
+
+
+class ReviewRecognitionProgressTests(unittest.TestCase):
+    def recognition_app(self, backend="cryolo"):
+        app = headless_app()
+        app.prompt_box = (1, 2, 8, 9)
+        app.prompt_points, app.prompt_labels = [(3, 4)], [1]
+        config = RecognitionConfig(
+            checkpoint="model.h5" if backend == "cryolo" else "model.pth",
+            backend=backend,
+            automatic_profile="capsid-learned" if backend == "cryolo" else "capsid",
+        )
+        app._model_config = Mock(return_value=config)
+        recognizer = Mock()
+        recognizer.prompt.return_value = []
+        recognizer.automatic.return_value = []
+        app._get_recognizer = Mock(return_value=recognizer)
+        return app, recognizer
+
+    def start_detection(self, app, operation):
+        with patch("app.time.perf_counter", return_value=100.0):
+            if operation == "prompt":
+                app.segment_prompt()
+            else:
+                app._start_auto_detection(batch=operation == "batch")
+        self.assertEqual(app.errors, [])
+        return app.runner.submissions[-1][:2]
+
+    def poll_at(self, app, now):
+        with patch("app.time.perf_counter", return_value=now):
+            app.poll()
+
+    def test_cryolo_prompt_and_automatic_receive_cancellable_progress_callback(self):
+        for operation in ("prompt", "automatic", "batch"):
+            with self.subTest(operation=operation):
+                app, recognizer = self.recognition_app()
+                work, token = self.start_detection(app, operation)
+                self.assertEqual(work(token), [])
+                method = recognizer.prompt if operation == "prompt" else recognizer.automatic
+                options = method.call_args.kwargs
+                self.assertTrue(callable(options["progress"]))
+                self.assertFalse(options["cancel"]())
+
+                before = app.status.get()
+                with ThreadPoolExecutor(max_workers=1) as worker:
+                    worker.submit(options["progress"], "Refining contours").result(timeout=2)
+                self.assertEqual(app.status.get(), before)
+                self.poll_at(app, 103.0)
+                self.assertEqual(
+                    app.status.get(),
+                    "Recognition: Refining contours\n3s elapsed. Escape stops.",
+                )
+                token.cancel()
+                self.assertTrue(options["cancel"]())
+
+    def test_sam_prompt_and_automatic_keep_existing_method_signatures(self):
+        def sam_prompt(rgb, *, box, points, labels, cancel):
+            return []
+
+        def sam_automatic(rgb, *, cancel):
+            return []
+
+        for operation in ("prompt", "automatic", "batch"):
+            with self.subTest(operation=operation):
+                app, recognizer = self.recognition_app(backend="sam")
+                recognizer.prompt.side_effect = sam_prompt
+                recognizer.automatic.side_effect = sam_automatic
+                work, token = self.start_detection(app, operation)
+                self.assertEqual(work(token), [])
+                method = recognizer.prompt if operation == "prompt" else recognizer.automatic
+                self.assertNotIn("progress", method.call_args.kwargs)
+                self.poll_at(app, 102.0)
+                self.assertEqual(
+                    app.status.get(),
+                    "Recognition: Running SAM\n2s elapsed. Escape stops.",
+                )
+
+    def test_poll_updates_queued_stage_and_elapsed_while_worker_is_busy(self):
+        app, recognizer = self.recognition_app()
+        work, token = self.start_detection(app, "automatic")
+        work(token)
+        recognizer.automatic.call_args.kwargs["progress"]("Reading detections")
+        self.poll_at(app, 103.0)
+        self.assertIn("Reading detections\n3s elapsed", app.status.get())
+        self.poll_at(app, 104.0)
+        self.assertIn("Reading detections\n4s elapsed", app.status.get())
+        self.assertTrue(app.runner.busy)
+        self.assertIs(app.active_token, token)
+
+    def test_poll_keeps_paused_status_then_resumes_latest_stage(self):
+        app, recognizer = self.recognition_app()
+        work, token = self.start_detection(app, "automatic")
+        work(token)
+        app.pause()
+        paused_status = app.status.get()
+        recognizer.automatic.call_args.kwargs["progress"]("Refining contours")
+        self.poll_at(app, 104.0)
+        self.assertEqual(app.status.get(), paused_status)
+        self.assertTrue(token.paused)
+
+        app.pause()
+        self.poll_at(app, 105.0)
+        self.assertFalse(token.paused)
+        self.assertIn("Refining contours\n5s elapsed", app.status.get())
+
+    def test_stop_clears_progress_and_late_callback_cannot_restore_it(self):
+        app, recognizer = self.recognition_app()
+        work, token = self.start_detection(app, "prompt")
+        work(token)
+        callback = recognizer.prompt.call_args.kwargs["progress"]
+        app.stop()
+        stopped_status = app.status.get()
+        callback("Late detector phase")
+        self.poll_at(app, 110.0)
+
+        self.assertTrue(token.cancelled)
+        self.assertIsNone(app.active_token)
+        self.assertIsNone(app._recognition_progress)
+        self.assertEqual(app.status.get(), stopped_status)
+
+    def test_success_clears_progress_before_later_stage_events(self):
+        for operation in ("prompt", "automatic"):
+            with self.subTest(operation=operation):
+                app, recognizer = self.recognition_app()
+                work, token = self.start_detection(app, operation)
+                value = work(token)
+                method = recognizer.prompt if operation == "prompt" else recognizer.automatic
+                app.runner.results = [TaskResult(token, value=value)]
+                self.poll_at(app, 104.0)
+                finished_status = app.status.get()
+                self.assertIsNone(app._recognition_progress)
+                self.assertIsNone(app.active_token)
+                self.assertNotIn("elapsed. Escape stops.", finished_status)
+
+                method.call_args.kwargs["progress"]("Late detector output")
+                self.poll_at(app, 110.0)
+                self.assertEqual(app.status.get(), finished_status)
+
+    def test_error_and_cancellation_clear_progress(self):
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                app, recognizer = self.recognition_app()
+                work, token = self.start_detection(app, "automatic")
+                work(token)
+                failure = None if cancelled else RuntimeError("Detector runtime failed")
+                app.runner.results = [TaskResult(token, error=failure, cancelled=cancelled)]
+                self.poll_at(app, 104.0)
+                expected = "Cancelled." if cancelled else "Detector runtime failed"
+                self.assertEqual(app.status.get(), expected)
+                self.assertIsNone(app._recognition_progress)
+                self.assertIsNone(app.active_token)
+                self.assertEqual(app.errors, [] if cancelled else [failure])
+
+                recognizer.automatic.call_args.kwargs["progress"]("Late detector output")
+                self.poll_at(app, 110.0)
+                self.assertEqual(app.status.get(), expected)
+
+    def test_completion_can_start_new_job_without_accepting_old_same_generation_phase(self):
+        app, _ = self.recognition_app()
+        _, previous = self.start_detection(app, "automatic")
+        app.runner.results = [TaskResult(previous, value=[])]
+
+        def start_next_job(kind, value, elapsed):
+            self.assertIsNone(app._recognition_progress)
+            self.assertIsNone(app.active_token)
+            app._submit("prompt", lambda token: [])
+
+        app._handle_result = start_next_job
+        self.poll_at(app, 105.0)
+        current = app.active_token
+        self.assertIsNot(current, previous)
+        self.assertEqual(current.generation, previous.generation)
+        app.events.put(("recognition_phase", current, "Current detector phase"))
+        app.events.put(("recognition_phase", previous, "Stale detector phase"))
+        self.poll_at(app, 106.0)
+
+        self.assertIs(app._recognition_progress.token, current)
+        self.assertEqual(
+            app.status.get(),
+            "Recognition: Current detector phase\n1s elapsed. Escape stops.",
+        )
+
+    def test_runtime_repair_runs_in_worker_reports_progress_and_completes(self):
+        app = headless_app()
+        ui_thread = threading.get_ident()
+        repaired_path = Path("private-runtime/python.exe")
+
+        def repair(*, cancel, progress):
+            self.assertNotEqual(threading.get_ident(), ui_thread)
+            self.assertFalse(cancel())
+            progress("Checking runtime installation")
+            return repaired_path
+
+        with patch("app.repair_cryolo_runtime", side_effect=repair) as repair_call:
+            with patch("app.time.perf_counter", return_value=100.0):
+                app.repair_runtime()
+            repair_call.assert_not_called()
+            self.assertEqual(app.job_kind, "runtime repair")
+            work, token, _ = app.runner.submissions[0]
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                value = worker.submit(work, token).result(timeout=2)
+
+        self.assertEqual(value, repaired_path)
+        self.poll_at(app, 103.0)
+        self.assertEqual(
+            app.status.get(),
+            "Runtime repair: Checking runtime installation\n3s elapsed. Escape stops.",
+        )
+        app.runner.results = [TaskResult(token, value=value)]
+        self.poll_at(app, 104.0)
+        self.assertIn("crYOLO runtime repaired", app.status.get())
+        self.assertIsNone(app._recognition_progress)
+        self.assertIsNone(app.active_token)
+        self.assertEqual(len(app.runner.submissions), 1)
+        self.assertEqual(app.errors, [])
+
+    def test_stop_cancels_active_runtime_repair_and_ignores_late_progress(self):
+        app = headless_app()
+        entered, release = threading.Event(), threading.Event()
+
+        def repair(*, cancel, progress):
+            progress("Repairing runtime")
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("Test did not release repair worker")
+            self.assertTrue(cancel())
+            progress("Late cancelled repair phase")
+            raise CancelledOperation("Runtime repair cancelled")
+
+        with patch("app.repair_cryolo_runtime", side_effect=repair):
+            app.repair_runtime()
+            work, token, _ = app.runner.submissions[0]
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                pending = worker.submit(work, token)
+                try:
+                    self.assertTrue(entered.wait(2))
+                    app.stop()
+                    stopped_status = app.status.get()
+                finally:
+                    release.set()
+                with self.assertRaises(CancelledOperation):
+                    pending.result(timeout=2)
+
+        self.poll_at(app, 110.0)
+        self.assertTrue(token.cancelled)
+        self.assertIsNone(app._recognition_progress)
+        self.assertEqual(app.status.get(), stopped_status)
+        self.assertEqual(app.errors, [])
+
+    def test_busy_runtime_repair_does_not_start_another_worker(self):
+        app = headless_app()
+        app._submit("automatic proposals", lambda token: [])
+        previous = app.active_token
+        with patch("app.repair_cryolo_runtime") as repair:
+            app.repair_runtime()
+        repair.assert_not_called()
+        self.assertEqual(len(app.runner.submissions), 1)
+        self.assertIs(app.active_token, previous)
+        self.assertFalse(previous.cancelled)
+        self.assertEqual(len(app.errors), 1)
+        self.assertIn("operation is active", str(app.errors[0]))
 
 
 if __name__ == "__main__":

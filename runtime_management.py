@@ -17,6 +17,10 @@ class RuntimeSetupError(RuntimeError):
     """The managed runtime could not be prepared."""
 
 
+class RuntimeSetupTimeout(RuntimeSetupError):
+    """A bounded runtime check or installation exceeded its deadline."""
+
+
 class RuntimeSetupCancelled(RuntimeSetupError):
     """The user cancelled runtime preparation."""
 
@@ -24,6 +28,8 @@ class RuntimeSetupCancelled(RuntimeSetupError):
 _DLL_LOCK = threading.RLock()
 _SETUP_LOCK = threading.Lock()
 _HEALTHY: set[tuple] = set()
+_HEALTH_TIMEOUT = 120
+_SETUP_TIMEOUT = 2700
 
 
 def default_runtime_python() -> Path:
@@ -122,7 +128,16 @@ def _stop(process):
         process.wait(timeout=10)
 
 
-def _run(command, *, cancel=None, timeout=120, log_path=None):
+def _read_report(path):
+    try:
+        report = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        return report if isinstance(report, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _run(command, *, cancel=None, timeout=120, log_path=None, progress=None,
+         description='Preparing crYOLO', status_path=None):
     """Capture without pipes, so verbose pip output cannot block cancellation."""
     if _cancelled(cancel):
         raise RuntimeSetupCancelled('crYOLO setup was cancelled.')
@@ -132,12 +147,18 @@ def _run(command, *, cancel=None, timeout=120, log_path=None):
                 stdout=output, stderr=errors, env=env,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if sys.platform == 'win32' else 0)
         started = time.monotonic()
+        last_progress = started - 5
         try:
             while process.poll() is None:
                 if _cancelled(cancel):
                     raise RuntimeSetupCancelled('crYOLO setup was cancelled. It will resume automatically next time.')
                 if time.monotonic() - started > timeout:
-                    raise RuntimeSetupError('crYOLO setup timed out. Check the internet connection and retry.')
+                    raise RuntimeSetupTimeout(f'{description} exceeded {timeout:g} seconds.')
+                if progress and time.monotonic() - last_progress >= 5:
+                    last_progress = time.monotonic()
+                    stage = _read_report(status_path).get('stage') if status_path else None
+                    detail = f' — {stage}' if stage else ''
+                    progress(f'{description}{detail} ({last_progress - started:.0f}s)…')
                 time.sleep(0.1)
         except BaseException:
             _stop(process)
@@ -160,25 +181,63 @@ def _health_key(python, probe):
                  if path.exists() else (str(path), None, None) for path in paths)
 
 
-def _probe(python, *, cancel=None):
+def _diagnostic_directory(python):
+    # Managed interpreters have <app>/cryolo-env/Scripts/python.exe. The fallback
+    # keeps probes of test/nonstandard interpreters beside that interpreter.
+    return python.parent.parent.parent if python.parent.name == 'Scripts' else python.parent
+
+
+def _probe(python, *, cancel=None, progress=None):
     if not python.is_file():
         return {'status': 'missing', 'python': str(python)}
     probe = _resource('runtime_health.py')
     key = _health_key(python, probe)
     if key in _HEALTHY:
         return {'status': 'ok', 'python': str(python), 'cached': True}
+    directory = _diagnostic_directory(python)
+    directory.mkdir(parents=True, exist_ok=True)
+    log_path = directory / 'runtime-probe.log'
+    report_path = directory / 'runtime-probe.json'
+    status_path = directory / 'runtime-probe-progress.json'
+    status_path.write_text(json.dumps({'stage': 'starting runtime check'}), encoding='utf-8')
+    started = time.monotonic()
+    report = {'status': 'error', 'python': str(python), 'log': str(log_path)}
     try:
-        result = _run([python, probe], cancel=cancel, timeout=120)
-        report = json.loads(result.stdout)
-        if result.returncode == 0 and report.get('status') == 'ok':
+        result = _run([python, probe, '--progress-report', status_path], cancel=cancel,
+                      timeout=_HEALTH_TIMEOUT, log_path=log_path, progress=progress,
+                      description='Checking crYOLO runtime', status_path=status_path)
+        report['returncode'] = result.returncode
+        if sys.platform == 'win32' and result.returncode:
+            report['native_exit_code'] = f'0x{result.returncode & 0xffffffff:08X}'
+        try:
+            native_report = json.loads(result.stdout)
+            if not isinstance(native_report, dict):
+                raise ValueError('The runtime check returned an invalid report.')
+        except (ValueError, TypeError):
+            native_report = {}
+        if result.returncode == 0 and native_report.get('status') == 'ok':
+            report.update(native_report)
             _HEALTHY.add(key)
-            return report
-        return {'status': 'error', 'python': str(python),
-                'error': report.get('error', 'The runtime health check failed.')}
+        else:
+            report['status'] = 'error'
+            code = report.get('native_exit_code', str(result.returncode))
+            report['error'] = native_report.get('error') or f'The runtime check stopped without a valid report (exit {code}).'
+            if native_report.get('error_type'):
+                report['error_type'] = native_report['error_type']
+            if result.stderr.strip():
+                report['stderr_tail'] = result.stderr[-4000:]
     except RuntimeSetupCancelled:
+        report.update(status='cancelled', error='Runtime check cancelled.')
         raise
+    except RuntimeSetupTimeout as exc:
+        report.update(status='timeout', error=str(exc))
     except (OSError, ValueError, RuntimeSetupError) as exc:
-        return {'status': 'error', 'python': str(python), 'error': str(exc)}
+        report.update(status='error', error=str(exc))
+    finally:
+        report['stage'] = _read_report(status_path).get('stage', 'runtime check')
+        report['elapsed_seconds'] = round(time.monotonic() - started, 3)
+        report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
+    return report
 
 
 def runtime_status() -> dict:
@@ -189,8 +248,7 @@ def runtime_status() -> dict:
         return {'status': 'unavailable', 'error': str(exc)}
 
 
-def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) -> Path:
-    """Prepare the managed runtime in a worker; return only after verified ready."""
+def _prepare_cryolo_runtime(*, cancel=None, progress=None, force_private=False, repair=False) -> Path:
     if sys.platform != 'win32':
         raise RuntimeSetupError('Automatic crYOLO setup is available on Windows. Configure a crYOLO runtime for this platform.')
     python = default_runtime_python()
@@ -199,9 +257,18 @@ def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) ->
             raise RuntimeSetupCancelled('crYOLO setup was cancelled.')
     try:
         if progress:
-            progress('Checking the crYOLO runtime…')
-        if _probe(python, cancel=cancel).get('status') == 'ok':
+            progress('Preparing crYOLO runtime repair…' if repair else 'Checking the crYOLO runtime…')
+        if repair:
+            _HEALTHY.clear()
+        health = {'status': 'missing'} if repair else _probe(python, cancel=cancel, progress=progress)
+        if health.get('status') == 'ok':
             return python
+        if health.get('status') != 'missing':
+            detail = health.get('error', 'The runtime health check failed.')
+            stage = health.get('stage', 'runtime check')
+            log = health.get('log', str(_diagnostic_directory(python) / 'runtime-probe.log'))
+            raise RuntimeSetupError(f'crYOLO runtime check failed during {stage}: {detail} '
+                f'Open Advanced and choose Repair crYOLO runtime. Diagnostic log: {log}')
         setup = _resource('setup-runtime.ps1')
         parent = python.parent.parent.parent
         parent.mkdir(parents=True, exist_ok=True)
@@ -215,7 +282,12 @@ def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) ->
                    '-RuntimeDirectory', python.parent.parent, '-Report', report_path]
         if force_private:
             command.append('-ForcePrivatePython')
-        result = _run(command, cancel=cancel, timeout=2700, log_path=log_path)
+        if repair:
+            command.append('-Repair')
+        report_path.write_text(json.dumps({'status': 'running', 'stage': 'starting repair' if repair else 'starting setup'}), encoding='utf-8')
+        result = _run(command, cancel=cancel, timeout=_SETUP_TIMEOUT, log_path=log_path,
+                      progress=progress, description='Repairing crYOLO runtime' if repair else 'Setting up crYOLO runtime',
+                      status_path=report_path)
         if result.returncode:
             error = 'Automatic setup could not finish.'
             try:
@@ -224,10 +296,29 @@ def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) ->
             except (OSError, ValueError):
                 pass
             raise RuntimeSetupError(f'{error} Retry crYOLO detection after correcting the problem. Setup log: {log_path}')
-        if _probe(python, cancel=cancel).get('status') != 'ok':
+        if _probe(python, cancel=cancel, progress=progress).get('status') != 'ok':
             raise RuntimeSetupError(f'crYOLO setup finished but verification failed. Setup log: {log_path}')
         if progress:
             progress('crYOLO is ready.')
         return python
     finally:
         _SETUP_LOCK.release()
+
+
+def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) -> Path:
+    """Verify a managed runtime, or install one when absent.
+
+    Existing interpreters that time out, crash or fail their health check are
+    reported without silently starting a package reinstall during recognition.
+    """
+    return _prepare_cryolo_runtime(cancel=cancel, progress=progress, force_private=force_private)
+
+
+def repair_cryolo_runtime(*, cancel=None, progress=None) -> Path:
+    """Explicitly rebuild the application-owned private runtime in a worker.
+
+    Used by Advanced > Repair crYOLO runtime. Package reinstall is forced, the
+    health cache is cleared, and cancellation/progress are shared with setup.
+    Ownership checks in the setup script protect unrelated installations.
+    """
+    return _prepare_cryolo_runtime(cancel=cancel, progress=progress, force_private=True, repair=True)

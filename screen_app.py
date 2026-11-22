@@ -28,12 +28,74 @@ from manual_sampling import legacy_contour_points, mask_contour_points
 from micrograph_navigation import NoNewMicrographError, wait_for_next_micrograph
 from recognition import (Cancelled, RecognitionConfig, SamRecognizer, create_recognizer, union_masks,
                          DEFAULT_MIN_CAPSID_AREA_PX)
+from runtime_management import repair_cryolo_runtime
 from screen_overlay import (ScreenOverlay, InputSurface, ManualMouseObserver,
                             keep_control_panel_above, control_panel_bounds)
 
 
 SCREEN_LOG = logging.getLogger("saru.screen")
 DEFAULT_CLICK_DELAY = .01
+
+
+@dataclass
+class RecognitionProgress:
+    token: CancellationToken
+    started: float
+    label: str = "Recognition"
+    phase: str = "Starting detector"
+    displayed: tuple | None = None
+
+
+def begin_recognition_progress(owner, token, started=None, label="Recognition"):
+    owner._recognition_progress = RecognitionProgress(
+        token, time.perf_counter() if started is None else started, label)
+
+
+def queue_recognition_progress(owner, token, phase):
+    """Worker callback: queue plain data; never read or update Tk here."""
+    owner.events.put(("recognition_phase", token, str(phase)))
+
+
+def clear_recognition_progress(owner, token=None):
+    current = getattr(owner, "_recognition_progress", None)
+    if token is None or (current is not None and current.token is token):
+        owner._recognition_progress = None
+
+
+def _current_recognition_progress(owner, token=None):
+    current = getattr(owner, "_recognition_progress", None)
+    if (current is None or (token is not None and current.token is not token)
+            or current.token is not owner.active_token
+            or current.token.generation != owner.runner.generation or current.token.cancelled
+            or getattr(owner, "closed", False)):
+        return None
+    return current
+
+
+def accept_recognition_progress(owner, token, phase):
+    current = _current_recognition_progress(owner, token)
+    if current is None:
+        return
+    full_phase = " ".join(str(phase).split())
+    if not full_phase:
+        return
+    # Preserve the compact panel's established three-line status layout. Full
+    # runtime/setup details remain in the log rather than expanding over the ROI.
+    phase = full_phase if len(full_phase) <= 56 else full_phase[:55].rstrip() + "…"
+    if phase != current.phase:
+        SCREEN_LOG.info("Recognition phase at %.1fs: %s", time.perf_counter() - current.started, full_phase)
+        current.phase = phase
+
+
+def refresh_recognition_progress(owner, paused=False):
+    current = _current_recognition_progress(owner)
+    if current is None or paused or not owner.runner.busy:
+        return
+    elapsed = max(0, int(time.perf_counter() - current.started))
+    display = (current.phase, elapsed)
+    if display != current.displayed:
+        owner.status.set(f"{current.label}: {current.phase}\n{elapsed}s elapsed. Escape stops.")
+        current.displayed = display
 
 
 def detection_profile_value(owner):
@@ -308,6 +370,7 @@ class ScreenPickerApp:
         self._fitting = False
         self.job_kind = None
         self.active_token = None
+        self._recognition_progress = None
         self.paused = False
         self.manual_window = None
         self.trace = []
@@ -841,6 +904,8 @@ class ScreenPickerApp:
         def begin():
             self.transition = False
             def work(token):
+                progress = lambda phase: queue_recognition_progress(self, token, phase)
+                progress("Capturing screen")
                 self.desktop.focus_target(target)
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
@@ -849,8 +914,14 @@ class ScreenPickerApp:
                 if expected is not None and screen_changed_fraction(expected, rgb) > .01:
                     raise RuntimeError("The micrograph changed after navigation. Detect again before picking.")
                 model = self._get_recognizer(config)
-                candidates = (model.prompt(rgb, box=box, cancel=lambda: token.cancelled) if box is not None
-                              else model.automatic(rgb, cancel=lambda: token.cancelled))
+                options = {"cancel": lambda: token.cancelled}
+                if config.backend == "cryolo":
+                    options["progress"] = progress
+                else:
+                    progress("Running SAM")
+                candidates = (model.prompt(rgb, box=box, **options) if box is not None
+                              else model.automatic(rgb, **options))
+                progress("Checking screen alignment")
                 token.wait_until_ready()
                 self.desktop.ensure_target(target)
                 if screen_changed_fraction(rgb, self._capture_region(geometry)) > .03:
@@ -1124,20 +1195,29 @@ class ScreenPickerApp:
         token = CancellationToken(self.runner.generation)
         if self.paused:
             token.pause()
-        self.active_token = token
+        previous_token, self.active_token = self.active_token, token
         if self._emergency_stop.is_set():
             token.cancel()
+            self.active_token = previous_token
             raise CancelledOperation("Stop requested.")
         try:
             self.runner.submit(function, token=token)
         except Exception:
-            self.active_token = None
+            self.active_token = previous_token
             raise
-        self.job_kind = kind
+        self.job_kind, self.job_started = kind, time.perf_counter()
+        if kind in {"recognition", "runtime repair"}:
+            begin_recognition_progress(self, token, self.job_started,
+                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        else:
+            clear_recognition_progress(self)
         self.status.set(f"{kind.capitalize()}… Escape stops.")
+        refresh_recognition_progress(self, self.paused)
 
     def _result(self, kind, value):
-        if kind == "manual picks":
+        if kind == "runtime repair":
+            self.status.set("crYOLO runtime repaired. Close settings, then choose Detect.")
+        elif kind == "manual picks":
             if self.overlay is not None:
                 self.overlay.clear()
                 self.overlay.hide()
@@ -1245,6 +1325,8 @@ class ScreenPickerApp:
     def stop(self, *, message=None):
         self._gate_manual()
         self.runner.invalidate()
+        clear_recognition_progress(self)
+        self.active_token = None
         for identifier in tuple(self.scheduled):
             self.root.after_cancel(identifier)
         self.scheduled.clear()
@@ -1303,6 +1385,8 @@ class ScreenPickerApp:
                         self.pause()
                 elif item[0] == "progress" and item[1] == self.runner.generation:
                     self.status.set(f"Picking: {item[2]} / {item[3]}. Escape stops.")
+                elif item[0] == "recognition_phase":
+                    accept_recognition_progress(self, item[1], item[2])
                 elif item[0] == "picked":
                     if item[2] == self.frame_id:
                         self.picked_points.add(item[3])
@@ -1326,7 +1410,11 @@ class ScreenPickerApp:
             if result.token.generation != self.runner.generation:
                 continue
             kind = self.job_kind
+            clear_recognition_progress(self, result.token)
             self.active_token = None
+            if hasattr(self, "job_started"):
+                SCREEN_LOG.info("%s finished in %.3fs; error=%r cancelled=%s", kind,
+                                time.perf_counter() - self.job_started, result.error, result.cancelled)
             if result.error is not None or result.cancelled:
                 if result.traceback_text:
                     SCREEN_LOG.error("%s", result.traceback_text)
@@ -1337,6 +1425,7 @@ class ScreenPickerApp:
             except Exception as exc:
                 SCREEN_LOG.exception("Screen result handling failed")
                 self._error(exc)
+        refresh_recognition_progress(self, self.paused)
         if self.drawing and self.trace_dirty:
             try:
                 self.ensure_overlay().draw_trace(self.trace)
@@ -1358,6 +1447,23 @@ class ScreenPickerApp:
         except RuntimeError:
             return False
         return True
+
+    def repair_runtime(self):
+        """Explicit maintenance action; never run an installer on the Tk thread."""
+        try:
+            if self.runner.busy or self.transition or self.auto_remaining or self.drawing:
+                self.status.set("Stop the active operation before repairing the crYOLO runtime.")
+                return
+            message = getattr(self, "_advanced_message", None)
+            if self.advanced is not None and message is not None:
+                # Reuse the help row so progress remains visible in the focused
+                # settings window without adding height at high DPI.
+                message.configure(textvariable=self.status)
+            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
+                cancel=lambda: token.cancelled,
+                progress=lambda phase: queue_recognition_progress(self, token, phase)))
+        except Exception as exc:
+            self._error(exc)
 
     def _open_picking_speed(self, event=None):
         if self._settings_available():
@@ -1391,6 +1497,7 @@ class ScreenPickerApp:
             window.title("SARU Picker — settings")
             window.attributes("-topmost", True)
             window.resizable(False, False)
+            window.bind("<Escape>", lambda event: self.stop())
             frame = self.ttk.Frame(window, padding=12)
             frame.pack(fill="both", expand=True)
             settings_wrap = max(410, round(410 * self.root.winfo_fpixels("1i") / 96))
@@ -1438,15 +1545,20 @@ class ScreenPickerApp:
                     return
                 window.destroy()
                 self.advanced = None
+                self._advanced_message = None
                 self._gate_manual()
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
             self.ttk.Label(frame, text="capsid, capsid-learned and generic use SAM. crYOLO uses its trained detector with learned contour refinement.",
                            wraplength=settings_wrap).grid(row=index, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
-                           wraplength=settings_wrap).grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
+            self._advanced_message = self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
+                                                  wraplength=settings_wrap)
+            self._advanced_message.grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            actions = self.ttk.Frame(frame)
+            actions.grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
+            self.ttk.Button(actions, text="Done", command=close_settings).pack(side="left", padx=4)
+            self.ttk.Button(actions, text="Repair crYOLO runtime", command=self.repair_runtime).pack(side="left", padx=4)
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)
@@ -1455,6 +1567,7 @@ class ScreenPickerApp:
         if self.closed:
             return
         self.closed = True
+        clear_recognition_progress(self)
         # Variable traces own Tcl commands separately from root.bind/after.
         # root.destroy alone does not delete those commands, which otherwise
         # keep bound controller callbacks and the interpreter graph alive.

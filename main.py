@@ -2454,6 +2454,10 @@ class RuntimeSetupError(RuntimeError):
     """The managed runtime could not be prepared."""
 
 
+class RuntimeSetupTimeout(RuntimeSetupError):
+    """A bounded runtime check or installation exceeded its deadline."""
+
+
 class RuntimeSetupCancelled(RuntimeSetupError):
     """The user cancelled runtime preparation."""
 
@@ -2461,6 +2465,8 @@ class RuntimeSetupCancelled(RuntimeSetupError):
 _DLL_LOCK = threading.RLock()
 _SETUP_LOCK = threading.Lock()
 _HEALTHY: set[tuple] = set()
+_HEALTH_TIMEOUT = 120
+_SETUP_TIMEOUT = 2700
 
 
 def default_runtime_python() -> Path:
@@ -2559,7 +2565,16 @@ def _stop(process):
         process.wait(timeout=10)
 
 
-def _run(command, *, cancel=None, timeout=120, log_path=None):
+def _read_report(path):
+    try:
+        report = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        return report if isinstance(report, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _run(command, *, cancel=None, timeout=120, log_path=None, progress=None,
+         description='Preparing crYOLO', status_path=None):
     """Capture without pipes, so verbose pip output cannot block cancellation."""
     if _cancelled(cancel):
         raise RuntimeSetupCancelled('crYOLO setup was cancelled.')
@@ -2569,12 +2584,18 @@ def _run(command, *, cancel=None, timeout=120, log_path=None):
                 stdout=output, stderr=errors, env=env,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if sys.platform == 'win32' else 0)
         started = time.monotonic()
+        last_progress = started - 5
         try:
             while process.poll() is None:
                 if _cancelled(cancel):
                     raise RuntimeSetupCancelled('crYOLO setup was cancelled. It will resume automatically next time.')
                 if time.monotonic() - started > timeout:
-                    raise RuntimeSetupError('crYOLO setup timed out. Check the internet connection and retry.')
+                    raise RuntimeSetupTimeout(f'{description} exceeded {timeout:g} seconds.')
+                if progress and time.monotonic() - last_progress >= 5:
+                    last_progress = time.monotonic()
+                    stage = _read_report(status_path).get('stage') if status_path else None
+                    detail = f' — {stage}' if stage else ''
+                    progress(f'{description}{detail} ({last_progress - started:.0f}s)…')
                 time.sleep(0.1)
         except BaseException:
             _stop(process)
@@ -2597,25 +2618,63 @@ def _health_key(python, probe):
                  if path.exists() else (str(path), None, None) for path in paths)
 
 
-def _probe(python, *, cancel=None):
+def _diagnostic_directory(python):
+    # Managed interpreters have <app>/cryolo-env/Scripts/python.exe. The fallback
+    # keeps probes of test/nonstandard interpreters beside that interpreter.
+    return python.parent.parent.parent if python.parent.name == 'Scripts' else python.parent
+
+
+def _probe(python, *, cancel=None, progress=None):
     if not python.is_file():
         return {'status': 'missing', 'python': str(python)}
     probe = _resource('runtime_health.py')
     key = _health_key(python, probe)
     if key in _HEALTHY:
         return {'status': 'ok', 'python': str(python), 'cached': True}
+    directory = _diagnostic_directory(python)
+    directory.mkdir(parents=True, exist_ok=True)
+    log_path = directory / 'runtime-probe.log'
+    report_path = directory / 'runtime-probe.json'
+    status_path = directory / 'runtime-probe-progress.json'
+    status_path.write_text(json.dumps({'stage': 'starting runtime check'}), encoding='utf-8')
+    started = time.monotonic()
+    report = {'status': 'error', 'python': str(python), 'log': str(log_path)}
     try:
-        result = _run([python, probe], cancel=cancel, timeout=120)
-        report = json.loads(result.stdout)
-        if result.returncode == 0 and report.get('status') == 'ok':
+        result = _run([python, probe, '--progress-report', status_path], cancel=cancel,
+                      timeout=_HEALTH_TIMEOUT, log_path=log_path, progress=progress,
+                      description='Checking crYOLO runtime', status_path=status_path)
+        report['returncode'] = result.returncode
+        if sys.platform == 'win32' and result.returncode:
+            report['native_exit_code'] = f'0x{result.returncode & 0xffffffff:08X}'
+        try:
+            native_report = json.loads(result.stdout)
+            if not isinstance(native_report, dict):
+                raise ValueError('The runtime check returned an invalid report.')
+        except (ValueError, TypeError):
+            native_report = {}
+        if result.returncode == 0 and native_report.get('status') == 'ok':
+            report.update(native_report)
             _HEALTHY.add(key)
-            return report
-        return {'status': 'error', 'python': str(python),
-                'error': report.get('error', 'The runtime health check failed.')}
+        else:
+            report['status'] = 'error'
+            code = report.get('native_exit_code', str(result.returncode))
+            report['error'] = native_report.get('error') or f'The runtime check stopped without a valid report (exit {code}).'
+            if native_report.get('error_type'):
+                report['error_type'] = native_report['error_type']
+            if result.stderr.strip():
+                report['stderr_tail'] = result.stderr[-4000:]
     except RuntimeSetupCancelled:
+        report.update(status='cancelled', error='Runtime check cancelled.')
         raise
+    except RuntimeSetupTimeout as exc:
+        report.update(status='timeout', error=str(exc))
     except (OSError, ValueError, RuntimeSetupError) as exc:
-        return {'status': 'error', 'python': str(python), 'error': str(exc)}
+        report.update(status='error', error=str(exc))
+    finally:
+        report['stage'] = _read_report(status_path).get('stage', 'runtime check')
+        report['elapsed_seconds'] = round(time.monotonic() - started, 3)
+        report_path.write_text(json.dumps(report, indent=2), encoding='utf-8')
+    return report
 
 
 def runtime_status() -> dict:
@@ -2626,8 +2685,7 @@ def runtime_status() -> dict:
         return {'status': 'unavailable', 'error': str(exc)}
 
 
-def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) -> Path:
-    """Prepare the managed runtime in a worker; return only after verified ready."""
+def _prepare_cryolo_runtime(*, cancel=None, progress=None, force_private=False, repair=False) -> Path:
     if sys.platform != 'win32':
         raise RuntimeSetupError('Automatic crYOLO setup is available on Windows. Configure a crYOLO runtime for this platform.')
     python = default_runtime_python()
@@ -2636,9 +2694,18 @@ def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) ->
             raise RuntimeSetupCancelled('crYOLO setup was cancelled.')
     try:
         if progress:
-            progress('Checking the crYOLO runtime…')
-        if _probe(python, cancel=cancel).get('status') == 'ok':
+            progress('Preparing crYOLO runtime repair…' if repair else 'Checking the crYOLO runtime…')
+        if repair:
+            _HEALTHY.clear()
+        health = {'status': 'missing'} if repair else _probe(python, cancel=cancel, progress=progress)
+        if health.get('status') == 'ok':
             return python
+        if health.get('status') != 'missing':
+            detail = health.get('error', 'The runtime health check failed.')
+            stage = health.get('stage', 'runtime check')
+            log = health.get('log', str(_diagnostic_directory(python) / 'runtime-probe.log'))
+            raise RuntimeSetupError(f'crYOLO runtime check failed during {stage}: {detail} '
+                f'Open Advanced and choose Repair crYOLO runtime. Diagnostic log: {log}')
         setup = _resource('setup-runtime.ps1')
         parent = python.parent.parent.parent
         parent.mkdir(parents=True, exist_ok=True)
@@ -2652,7 +2719,12 @@ def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) ->
                    '-RuntimeDirectory', python.parent.parent, '-Report', report_path]
         if force_private:
             command.append('-ForcePrivatePython')
-        result = _run(command, cancel=cancel, timeout=2700, log_path=log_path)
+        if repair:
+            command.append('-Repair')
+        report_path.write_text(json.dumps({'status': 'running', 'stage': 'starting repair' if repair else 'starting setup'}), encoding='utf-8')
+        result = _run(command, cancel=cancel, timeout=_SETUP_TIMEOUT, log_path=log_path,
+                      progress=progress, description='Repairing crYOLO runtime' if repair else 'Setting up crYOLO runtime',
+                      status_path=report_path)
         if result.returncode:
             error = 'Automatic setup could not finish.'
             try:
@@ -2661,7 +2733,7 @@ def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) ->
             except (OSError, ValueError):
                 pass
             raise RuntimeSetupError(f'{error} Retry crYOLO detection after correcting the problem. Setup log: {log_path}')
-        if _probe(python, cancel=cancel).get('status') != 'ok':
+        if _probe(python, cancel=cancel, progress=progress).get('status') != 'ok':
             raise RuntimeSetupError(f'crYOLO setup finished but verification failed. Setup log: {log_path}')
         if progress:
             progress('crYOLO is ready.')
@@ -2670,11 +2742,31 @@ def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) ->
         _SETUP_LOCK.release()
 
 
+def ensure_cryolo_runtime(*, cancel=None, progress=None, force_private=False) -> Path:
+    """Verify a managed runtime, or install one when absent.
+
+    Existing interpreters that time out, crash or fail their health check are
+    reported without silently starting a package reinstall during recognition.
+    """
+    return _prepare_cryolo_runtime(cancel=cancel, progress=progress, force_private=force_private)
+
+
+def repair_cryolo_runtime(*, cancel=None, progress=None) -> Path:
+    """Explicitly rebuild the application-owned private runtime in a worker.
+
+    Used by Advanced > Repair crYOLO runtime. Package reinstall is forced, the
+    health cache is cleared, and cancellation/progress are shared with setup.
+    Ownership checks in the setup script protect unrelated installations.
+    """
+    return _prepare_cryolo_runtime(cancel=cancel, progress=progress, force_private=True, repair=True)
+
+
 # ---------------- cryolo_recognition.py ----------------
 
 from dataclasses import dataclass
 import copy
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -2689,6 +2781,67 @@ from typing import Sequence
 import numpy as np
 from PIL import Image
 
+
+
+CRYOLO_LOG = logging.getLogger("saru.cryolo")
+
+
+def _report_progress(progress, message):
+    """Report from the worker; GUI callers enqueue this instead of touching Tk."""
+    CRYOLO_LOG.info(message)
+    if progress is not None:
+        progress(message)
+
+
+def _child_process_options():
+    # A windowed frozen parent otherwise gives python.exe a visible console,
+    # which can cover the micrograph or steal focus during live recognition.
+    return ({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt"
+            else {"start_new_session": True})
+
+
+def _prediction_log_tail(path):
+    try:
+        with path.open("rb") as log:
+            log.seek(max(0, path.stat().st_size - 8000))
+            return log.read(8000).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return "Prediction log was unavailable."
+
+
+def _prediction_log_directory():
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        return (Path(base) if base else Path.home() / "AppData" / "Local") / "SARU_Picker"
+    return Path.home() / ".saru_picker"
+
+
+def _retain_prediction_log(path):
+    """Replace one bounded diagnostic log; never keep screenshots or weights."""
+    temporary = None
+    try:
+        if not path.is_file():
+            return None
+        directory = _prediction_log_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / "cryolo-prediction.log"
+        with path.open("rb") as source:
+            source.seek(max(0, path.stat().st_size - 256 * 1024))
+            tail = source.read(256 * 1024)
+        with tempfile.NamedTemporaryFile("wb", dir=directory, prefix=".cryolo-log-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(tail)
+        os.replace(temporary, destination)
+        return destination
+    except OSError:
+        CRYOLO_LOG.warning("Could not retain the crYOLO prediction log", exc_info=True)
+        return None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                CRYOLO_LOG.warning("Could not remove an incomplete crYOLO diagnostic log")
 
 
 @dataclass(frozen=True)
@@ -2814,9 +2967,11 @@ def _stop_process(process):
         # Python preprocessing pools can outlive their parent on Windows.
         # taskkill is restricted to this freshly created request's PID tree.
         try:
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=2, check=False)
+            with external_process_environment() as child_env:
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=2, check=False,
+                               env=child_env, **_child_process_options())
         except (OSError, subprocess.TimeoutExpired):
             process.terminate()
     try:
@@ -2847,8 +3002,10 @@ class CryoloRecognizer:
         self._automatic_report = None
         self._profile = None
         self._process = None
+        self.last_prediction_log = None
 
-    def _paths(self, cancel=None):
+    def _paths(self, cancel=None, progress=None):
+        _report_progress(progress, "Checking crYOLO model files")
         weights = Path(self.config.checkpoint).expanduser().resolve()
         config_value = getattr(self.config, "cryolo_config", None)
         config_path = (Path(config_value).expanduser().resolve() if config_value
@@ -2866,7 +3023,8 @@ class CryoloRecognizer:
         python_value = getattr(self.config, "cryolo_python", None) or os.environ.get("SARU_CRYOLO_PYTHON")
         if not python_value:
             try:
-                python_value = str(ensure_cryolo_runtime(cancel=cancel))
+                python_value = str(ensure_cryolo_runtime(
+                    cancel=cancel, progress=lambda message: _report_progress(progress, message)))
             except RuntimeSetupCancelled as exc:
                 raise Cancelled(str(exc)) from exc
             except (RuntimeSetupError, OSError) as exc:
@@ -2882,13 +3040,14 @@ class CryoloRecognizer:
         executable = os.path.abspath(executable)
         return executable, weights, config_path
 
-    def _predict(self, rgb, cancel):
+    def _predict(self, rgb, cancel, progress=None):
         _check_cancel(cancel)
-        executable, weights, config_path = self._paths(cancel)
+        executable, weights, config_path = self._paths(cancel, progress)
         signature = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns)
                           for p in (weights, config_path))
         key = _image_key(rgb)
         if key == self._key and signature == self._artifact_signature and self._boxes is not None:
+            _report_progress(progress, "Using cached crYOLO detections")
             return list(self._boxes), True
         self._automatic_key = None
         self._automatic_result = None
@@ -2924,37 +3083,54 @@ class CryoloRecognizer:
                 command.extend(["-g", "0"])
             log_path = folder / "predict.log"
             started = time.monotonic()
+            _report_progress(progress, "Loading crYOLO model and predicting")
             try:
                 with log_path.open("wb") as log:
                     with external_process_environment(env) as child_env:
                         self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                                          stdout=log, stderr=subprocess.STDOUT,
                                                          cwd=folder, env=child_env,
-                                                         start_new_session=os.name != "nt")
+                                                         **_child_process_options())
                     while self._process.poll() is None:
                         _check_cancel(cancel)
                         if time.monotonic() - started > getattr(self.config, "cryolo_timeout", 180):
-                            raise RecognitionError("crYOLO detection timed out. Check its runtime/model or increase the timeout.")
+                            tail = _prediction_log_tail(log_path)
+                            raise RecognitionError(
+                                f"crYOLO prediction timed out after {time.monotonic() - started:.1f}s. "
+                                f"The prediction process was stopped. Last runtime output:\n{tail}")
                         time.sleep(.05)
                     code = self._process.returncode
                 _check_cancel(cancel)
                 if code:
-                    with log_path.open("rb") as log:
-                        log.seek(max(0, log_path.stat().st_size - 8000))
-                        tail = log.read().decode("utf-8", errors="replace")
+                    tail = _prediction_log_tail(log_path)
                     raise RecognitionError(f"crYOLO prediction failed (exit {code}).\n{tail}")
-                boxes = read_cbox(output / "CBOX" / "screen.cbox", rgb.shape[:2], threshold)
+                _report_progress(progress, "Reading crYOLO detections")
+                try:
+                    boxes = read_cbox(output / "CBOX" / "screen.cbox", rgb.shape[:2], threshold)
+                except RecognitionError as exc:
+                    raise RecognitionError(f"{exc}\nLast runtime output:\n{_prediction_log_tail(log_path)}") from exc
+                CRYOLO_LOG.info("crYOLO prediction completed in %.2fs: %d detections", time.monotonic()-started, len(boxes))
+            except Cancelled:
+                CRYOLO_LOG.info("crYOLO prediction cancelled")
+                raise
+            except RecognitionError as exc:
+                retained = _retain_prediction_log(log_path)
+                CRYOLO_LOG.exception("crYOLO prediction did not complete")
+                if retained is not None:
+                    raise RecognitionError(f"{exc}\nPrediction log: {retained}") from exc
+                raise
             except OSError as exc:
                 raise RecognitionError(f"Could not start the crYOLO Python runtime: {exc}") from exc
             finally:
                 if self._process is not None:
                     _stop_process(self._process)
                     self._process = None
+                self.last_prediction_log = _retain_prediction_log(log_path)
         _check_cancel(cancel)
         self._key, self._artifact_signature, self._boxes = key, signature, list(boxes)
         return boxes, False
 
-    def _refine(self, rgb, boxes, cancel, *, prompt=False):
+    def _refine(self, rgb, boxes, cancel, *, prompt=False, progress=None):
         check = lambda: _check_cancel(cancel)
         raw = []
         for box in boxes[:128]:
@@ -2982,19 +3158,24 @@ class CryoloRecognizer:
         if not raw:
             return [], {}, {"enabled": False}, {"enabled": False}, appearance
         if profile is not None:
+            _report_progress(progress, "Scoring capsid appearance")
             scores = score_image(rgb, profile, check)
+            _report_progress(progress, "Refining contours")
             raw = filter_capsid_with_profile(rgb, raw, scores, check_cancel=check,
                                              min_area_ratio=0 if prompt else self.config.min_area_ratio,
                                              max_area_ratio=1 if prompt else min(self.config.max_area_ratio, .4),
                                              min_capsid_area_px=minimum)
         else:
+            _report_progress(progress, "Refining contours")
             raw = filter_capsid_proposals(rgb, raw, check_cancel=check,
                                          min_area_ratio=0 if prompt else self.config.min_area_ratio,
                                          max_area_ratio=1 if prompt else min(self.config.max_area_ratio, .4))
+        _report_progress(progress, "Checking carbon support")
         context = detect_carbon_edges(rgb, check_cancel=check)
         raw, carbon = guard_proposals(context, raw, check_cancel=check)
         carbon["enabled"] = True
         raw, area = _filter_capsid_area(raw, minimum, cancel)
+        _report_progress(progress, "Finishing contours")
         candidates, evidence = [], {}
         key = _image_key(rgb)
         for record in raw:
@@ -3021,16 +3202,16 @@ class CryoloRecognizer:
             candidates = filter_candidates(candidates, self.config, cancel, suppress_duplicates=False)
         return candidates, {c.id: evidence[c.id] for c in candidates}, carbon, area, appearance
 
-    def automatic(self, rgb, cancel=None):
+    def automatic(self, rgb, cancel=None, progress=None):
         rgb = validate_rgb(rgb)
         started = time.perf_counter()
-        boxes, cached = self._predict(rgb, cancel)
+        boxes, cached = self._predict(rgb, cancel, progress)
         key = _image_key(rgb)
         if cached and self._automatic_key == key and self._automatic_result is not None:
             self.last_detection = copy.deepcopy(self._automatic_report)
             self.last_detection["detections_cached"] = True
             return list(self._automatic_result)
-        candidates = self.refine_detections(rgb, boxes, cancel=cancel)
+        candidates = self.refine_detections(rgb, boxes, cancel=cancel, progress=progress)
         self.last_detection["detections_cached"] = cached
         self.last_detection["detections_supplied"] = False
         self.last_detection["timing_seconds"]["total_including_initial_model_load"] = time.perf_counter() - started
@@ -3038,7 +3219,7 @@ class CryoloRecognizer:
         self._automatic_report = copy.deepcopy(self.last_detection)
         return candidates
 
-    def refine_detections(self, rgb, boxes, cancel=None, *, prompt=False):
+    def refine_detections(self, rgb, boxes, cancel=None, *, prompt=False, progress=None):
         """Run the exact production contour tail on parsed batch CBOX detections.
 
         This supports evaluation with one crYOLO process for a whole dataset.
@@ -3049,7 +3230,7 @@ class CryoloRecognizer:
         if any(not isinstance(box, CryoloBox) for box in boxes):
             raise ValueError("Detections must be CryoloBox instances from read_cbox.")
         started = time.perf_counter()
-        candidates, evidence, carbon, area, appearance = self._refine(rgb, boxes, cancel, prompt=prompt)
+        candidates, evidence, carbon, area, appearance = self._refine(rgb, boxes, cancel, prompt=prompt, progress=progress)
         _check_cancel(cancel)
         self.last_detection = {"backend": "cryolo", "profile": self.config.automatic_profile,
                                "cryolo_detections": len(boxes), "selected_contours": len(candidates),
@@ -3063,7 +3244,7 @@ class CryoloRecognizer:
 
     def prompt(self, rgb, box: Sequence[float] | None = None,
                points: Sequence[Sequence[float]] | None = None,
-               labels: Sequence[int] | None = None, cancel=None):
+               labels: Sequence[int] | None = None, cancel=None, progress=None):
         """Select crYOLO detections by prompts; prompts do not retrain the detector."""
         rgb = validate_rgb(rgb)
         height, width = rgb.shape[:2]
@@ -3087,7 +3268,7 @@ class CryoloRecognizer:
             raise ValueError("Point labels were supplied without points.")
         if box_array is None and (label_array is None or not label_array.any()):
             raise ValueError("Supply a box or at least one positive point.")
-        boxes, cached = self._predict(rgb, cancel)
+        boxes, cached = self._predict(rgb, cancel, progress)
         selected = []
         for detection in boxes:
             cx, cy = (detection.x0+detection.x1)/2, (detection.y0+detection.y1)/2
@@ -3099,7 +3280,7 @@ class CryoloRecognizer:
                 if np.any(inside & (label_array == 0)) or (np.any(label_array == 1) and not np.any(inside & (label_array == 1))):
                     continue
             selected.append(detection)
-        candidates, evidence, carbon, area, appearance = self._refine(rgb, selected, cancel, prompt=True)
+        candidates, evidence, carbon, area, appearance = self._refine(rgb, selected, cancel, prompt=True, progress=progress)
         self.last_detection = {"backend": "cryolo", "mode": "prompt_selection",
                                "cryolo_detections": len(boxes), "selected_detection_boxes": len(selected),
                                "selected_contours": len(candidates), "detections_cached": cached,
@@ -5489,6 +5670,67 @@ SCREEN_LOG = logging.getLogger("saru.screen")
 DEFAULT_CLICK_DELAY = .01
 
 
+@dataclass
+class RecognitionProgress:
+    token: CancellationToken
+    started: float
+    label: str = "Recognition"
+    phase: str = "Starting detector"
+    displayed: tuple | None = None
+
+
+def begin_recognition_progress(owner, token, started=None, label="Recognition"):
+    owner._recognition_progress = RecognitionProgress(
+        token, time.perf_counter() if started is None else started, label)
+
+
+def queue_recognition_progress(owner, token, phase):
+    """Worker callback: queue plain data; never read or update Tk here."""
+    owner.events.put(("recognition_phase", token, str(phase)))
+
+
+def clear_recognition_progress(owner, token=None):
+    current = getattr(owner, "_recognition_progress", None)
+    if token is None or (current is not None and current.token is token):
+        owner._recognition_progress = None
+
+
+def _current_recognition_progress(owner, token=None):
+    current = getattr(owner, "_recognition_progress", None)
+    if (current is None or (token is not None and current.token is not token)
+            or current.token is not owner.active_token
+            or current.token.generation != owner.runner.generation or current.token.cancelled
+            or getattr(owner, "closed", False)):
+        return None
+    return current
+
+
+def accept_recognition_progress(owner, token, phase):
+    current = _current_recognition_progress(owner, token)
+    if current is None:
+        return
+    full_phase = " ".join(str(phase).split())
+    if not full_phase:
+        return
+    # Preserve the compact panel's established three-line status layout. Full
+    # runtime/setup details remain in the log rather than expanding over the ROI.
+    phase = full_phase if len(full_phase) <= 56 else full_phase[:55].rstrip() + "…"
+    if phase != current.phase:
+        SCREEN_LOG.info("Recognition phase at %.1fs: %s", time.perf_counter() - current.started, full_phase)
+        current.phase = phase
+
+
+def refresh_recognition_progress(owner, paused=False):
+    current = _current_recognition_progress(owner)
+    if current is None or paused or not owner.runner.busy:
+        return
+    elapsed = max(0, int(time.perf_counter() - current.started))
+    display = (current.phase, elapsed)
+    if display != current.displayed:
+        owner.status.set(f"{current.label}: {current.phase}\n{elapsed}s elapsed. Escape stops.")
+        current.displayed = display
+
+
 def detection_profile_value(owner):
     variable = getattr(owner, "detection_profile", None)
     if variable is not None:
@@ -5761,6 +6003,7 @@ class ScreenPickerApp:
         self._fitting = False
         self.job_kind = None
         self.active_token = None
+        self._recognition_progress = None
         self.paused = False
         self.manual_window = None
         self.trace = []
@@ -6294,6 +6537,8 @@ class ScreenPickerApp:
         def begin():
             self.transition = False
             def work(token):
+                progress = lambda phase: queue_recognition_progress(self, token, phase)
+                progress("Capturing screen")
                 self.desktop.focus_target(target)
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
@@ -6302,8 +6547,14 @@ class ScreenPickerApp:
                 if expected is not None and screen_changed_fraction(expected, rgb) > .01:
                     raise RuntimeError("The micrograph changed after navigation. Detect again before picking.")
                 model = self._get_recognizer(config)
-                candidates = (model.prompt(rgb, box=box, cancel=lambda: token.cancelled) if box is not None
-                              else model.automatic(rgb, cancel=lambda: token.cancelled))
+                options = {"cancel": lambda: token.cancelled}
+                if config.backend == "cryolo":
+                    options["progress"] = progress
+                else:
+                    progress("Running SAM")
+                candidates = (model.prompt(rgb, box=box, **options) if box is not None
+                              else model.automatic(rgb, **options))
+                progress("Checking screen alignment")
                 token.wait_until_ready()
                 self.desktop.ensure_target(target)
                 if screen_changed_fraction(rgb, self._capture_region(geometry)) > .03:
@@ -6577,20 +6828,29 @@ class ScreenPickerApp:
         token = CancellationToken(self.runner.generation)
         if self.paused:
             token.pause()
-        self.active_token = token
+        previous_token, self.active_token = self.active_token, token
         if self._emergency_stop.is_set():
             token.cancel()
+            self.active_token = previous_token
             raise CancelledOperation("Stop requested.")
         try:
             self.runner.submit(function, token=token)
         except Exception:
-            self.active_token = None
+            self.active_token = previous_token
             raise
-        self.job_kind = kind
+        self.job_kind, self.job_started = kind, time.perf_counter()
+        if kind in {"recognition", "runtime repair"}:
+            begin_recognition_progress(self, token, self.job_started,
+                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        else:
+            clear_recognition_progress(self)
         self.status.set(f"{kind.capitalize()}… Escape stops.")
+        refresh_recognition_progress(self, self.paused)
 
     def _result(self, kind, value):
-        if kind == "manual picks":
+        if kind == "runtime repair":
+            self.status.set("crYOLO runtime repaired. Close settings, then choose Detect.")
+        elif kind == "manual picks":
             if self.overlay is not None:
                 self.overlay.clear()
                 self.overlay.hide()
@@ -6698,6 +6958,8 @@ class ScreenPickerApp:
     def stop(self, *, message=None):
         self._gate_manual()
         self.runner.invalidate()
+        clear_recognition_progress(self)
+        self.active_token = None
         for identifier in tuple(self.scheduled):
             self.root.after_cancel(identifier)
         self.scheduled.clear()
@@ -6756,6 +7018,8 @@ class ScreenPickerApp:
                         self.pause()
                 elif item[0] == "progress" and item[1] == self.runner.generation:
                     self.status.set(f"Picking: {item[2]} / {item[3]}. Escape stops.")
+                elif item[0] == "recognition_phase":
+                    accept_recognition_progress(self, item[1], item[2])
                 elif item[0] == "picked":
                     if item[2] == self.frame_id:
                         self.picked_points.add(item[3])
@@ -6779,7 +7043,11 @@ class ScreenPickerApp:
             if result.token.generation != self.runner.generation:
                 continue
             kind = self.job_kind
+            clear_recognition_progress(self, result.token)
             self.active_token = None
+            if hasattr(self, "job_started"):
+                SCREEN_LOG.info("%s finished in %.3fs; error=%r cancelled=%s", kind,
+                                time.perf_counter() - self.job_started, result.error, result.cancelled)
             if result.error is not None or result.cancelled:
                 if result.traceback_text:
                     SCREEN_LOG.error("%s", result.traceback_text)
@@ -6790,6 +7058,7 @@ class ScreenPickerApp:
             except Exception as exc:
                 SCREEN_LOG.exception("Screen result handling failed")
                 self._error(exc)
+        refresh_recognition_progress(self, self.paused)
         if self.drawing and self.trace_dirty:
             try:
                 self.ensure_overlay().draw_trace(self.trace)
@@ -6811,6 +7080,23 @@ class ScreenPickerApp:
         except RuntimeError:
             return False
         return True
+
+    def repair_runtime(self):
+        """Explicit maintenance action; never run an installer on the Tk thread."""
+        try:
+            if self.runner.busy or self.transition or self.auto_remaining or self.drawing:
+                self.status.set("Stop the active operation before repairing the crYOLO runtime.")
+                return
+            message = getattr(self, "_advanced_message", None)
+            if self.advanced is not None and message is not None:
+                # Reuse the help row so progress remains visible in the focused
+                # settings window without adding height at high DPI.
+                message.configure(textvariable=self.status)
+            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
+                cancel=lambda: token.cancelled,
+                progress=lambda phase: queue_recognition_progress(self, token, phase)))
+        except Exception as exc:
+            self._error(exc)
 
     def _open_picking_speed(self, event=None):
         if self._settings_available():
@@ -6844,6 +7130,7 @@ class ScreenPickerApp:
             window.title("SARU Picker — settings")
             window.attributes("-topmost", True)
             window.resizable(False, False)
+            window.bind("<Escape>", lambda event: self.stop())
             frame = self.ttk.Frame(window, padding=12)
             frame.pack(fill="both", expand=True)
             settings_wrap = max(410, round(410 * self.root.winfo_fpixels("1i") / 96))
@@ -6891,15 +7178,20 @@ class ScreenPickerApp:
                     return
                 window.destroy()
                 self.advanced = None
+                self._advanced_message = None
                 self._gate_manual()
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
             self.ttk.Label(frame, text="capsid, capsid-learned and generic use SAM. crYOLO uses its trained detector with learned contour refinement.",
                            wraplength=settings_wrap).grid(row=index, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
-                           wraplength=settings_wrap).grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
+            self._advanced_message = self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
+                                                  wraplength=settings_wrap)
+            self._advanced_message.grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            actions = self.ttk.Frame(frame)
+            actions.grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
+            self.ttk.Button(actions, text="Done", command=close_settings).pack(side="left", padx=4)
+            self.ttk.Button(actions, text="Repair crYOLO runtime", command=self.repair_runtime).pack(side="left", padx=4)
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)
@@ -6908,6 +7200,7 @@ class ScreenPickerApp:
         if self.closed:
             return
         self.closed = True
+        clear_recognition_progress(self)
         # Variable traces own Tcl commands separately from root.bind/after.
         # root.destroy alone does not delete those commands, which otherwise
         # keep bound controller callbacks and the interpreter graph alive.
@@ -8576,6 +8869,7 @@ class PickerApp:
         self.desktop = DesktopAdapter()
         self.hotkeys = None
         self.active_token = None
+        self._recognition_progress = None
         self.recognizer = None
         self.recognizer_config = None
         self.closed = False
@@ -8694,6 +8988,7 @@ class PickerApp:
             ttk.Entry(row, textvariable=variable, width=9).pack(side="right")
         self._applied_model_config = detector_config_from_fields(self)
         ttk.Button(model, text="Apply detection settings", command=self._apply_model_settings).pack(fill="x", pady=5)
+        ttk.Button(model, text="Repair crYOLO runtime", command=self.repair_runtime).pack(fill="x")
         self.tool = tk.StringVar(value="box")
         tools_frame = ttk.LabelFrame(controls, text="3. Draw on preview", padding=7)
         tools_frame.pack(fill="x", pady=4)
@@ -9091,7 +9386,22 @@ class PickerApp:
         submitted = self.runner.submit(guarded, token=token)
         self.job_kind, self.job_started = kind, time.perf_counter()
         self.active_token = submitted
+        if kind in {"prompt", "automatic proposals", "batch recognition", "runtime repair"}:
+            begin_recognition_progress(self, submitted, self.job_started,
+                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        else:
+            clear_recognition_progress(self)
         self.status.set(f"{kind}: running. Esc cancels; an active model forward pass may need to finish.")
+        refresh_recognition_progress(self, self.batch_paused)
+
+    def repair_runtime(self):
+        try:
+            self._ensure_idle(allow_model_changes=True)
+            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
+                cancel=lambda: token.cancelled,
+                progress=lambda phase: queue_recognition_progress(self, token, phase)))
+        except Exception as exc:
+            self._error(exc)
 
     def segment_prompt(self):
         try:
@@ -9101,9 +9411,15 @@ class PickerApp:
             config, rgb = self._model_config(), self.rgb
             box = self.prompt_box
             points, labels = tuple(self.prompt_points), tuple(self.prompt_labels)
-            self._submit("prompt", lambda token: self._get_recognizer(config).prompt(
-                rgb, box=box, points=points or None, labels=labels or None,
-                cancel=lambda: token.cancelled))
+            def work(token):
+                options = {"cancel": lambda: token.cancelled}
+                if config.backend == "cryolo":
+                    options["progress"] = lambda phase: queue_recognition_progress(self, token, phase)
+                else:
+                    queue_recognition_progress(self, token, "Running SAM")
+                return self._get_recognizer(config).prompt(
+                    rgb, box=box, points=points or None, labels=labels or None, **options)
+            self._submit("prompt", work)
         except Exception as exc:
             self._error(exc)
 
@@ -9130,8 +9446,14 @@ class PickerApp:
             raise ValueError("Capture or open an image first.")
         self.alternatives.clear()
         config, rgb = self._model_config(), self.rgb
-        self._submit("batch recognition" if batch else "automatic proposals",
-                     lambda token: self._get_recognizer(config).automatic(rgb, cancel=lambda: token.cancelled))
+        def work(token):
+            options = {"cancel": lambda: token.cancelled}
+            if config.backend == "cryolo":
+                options["progress"] = lambda phase: queue_recognition_progress(self, token, phase)
+            else:
+                queue_recognition_progress(self, token, "Running SAM")
+            return self._get_recognizer(config).automatic(rgb, **options)
+        self._submit("batch recognition" if batch else "automatic proposals", work)
 
     def _add_candidate(self, candidate, select=False):
         if candidate.id not in {c.id for c in self.candidates}:
@@ -9349,6 +9671,8 @@ class PickerApp:
 
     def stop(self):
         self.runner.invalidate()
+        clear_recognition_progress(self)
+        self.active_token = None
         self._cancel_timers()
         self.batch_remaining = 0
         self.batch_paused = False
@@ -9369,6 +9693,8 @@ class PickerApp:
                 event = self.events.get_nowait()
                 if event[0] == "hotkey":
                     self.stop() if event[1] == "stop" else self.pause()
+                elif event[0] == "recognition_phase":
+                    accept_recognition_progress(self, event[1], event[2])
                 elif event[0] == "clicked":
                     # Points belong to the unchanged capture while playback is active;
                     # stop invalidation must not forget clicks already delivered.
@@ -9382,6 +9708,7 @@ class PickerApp:
         for result in self.runner.poll_results():
             kind = self.job_kind
             elapsed = time.perf_counter() - self.job_started
+            clear_recognition_progress(self, result.token)
             self.active_token = None
             APP_LOG.info("%s finished in %.3fs; error=%r cancelled=%s", kind, elapsed, result.error, result.cancelled)
             if result.error is not None or result.cancelled:
@@ -9402,10 +9729,13 @@ class PickerApp:
                 self.playback_active = False
                 self.root.deiconify()
                 self._error(exc)
+        refresh_recognition_progress(self, self.batch_paused)
         self.root.after(40, self.poll)
 
     def _handle_result(self, kind, value, elapsed):
-        if kind == "prompt":
+        if kind == "runtime repair":
+            self.status.set("crYOLO runtime repaired. Choose Generate automatic proposals to retry.")
+        elif kind == "prompt":
             self.alternatives, self.alternative_index = value, 0
             self.render()
             self.status.set(f"Prompt finished in {elapsed:.2f}s. Review alternatives, then accept the intended inner region.")
@@ -9472,6 +9802,7 @@ class PickerApp:
 
     def close(self):
         self.closed = True
+        clear_recognition_progress(self)
         self.runner.shutdown(wait=False)
         self._cancel_timers()
         if self.hotkeys is not None:

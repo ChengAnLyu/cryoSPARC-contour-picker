@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import copy
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -32,6 +33,67 @@ from capsid_prior import load_profile, resolve_profile_path, score_image
 from carbon_support import detect_carbon_edges, guard_proposals
 from runtime_management import (ensure_cryolo_runtime, RuntimeSetupError, RuntimeSetupCancelled,
                                 external_process_environment)
+
+
+CRYOLO_LOG = logging.getLogger("saru.cryolo")
+
+
+def _report_progress(progress, message):
+    """Report from the worker; GUI callers enqueue this instead of touching Tk."""
+    CRYOLO_LOG.info(message)
+    if progress is not None:
+        progress(message)
+
+
+def _child_process_options():
+    # A windowed frozen parent otherwise gives python.exe a visible console,
+    # which can cover the micrograph or steal focus during live recognition.
+    return ({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt"
+            else {"start_new_session": True})
+
+
+def _prediction_log_tail(path):
+    try:
+        with path.open("rb") as log:
+            log.seek(max(0, path.stat().st_size - 8000))
+            return log.read(8000).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return "Prediction log was unavailable."
+
+
+def _prediction_log_directory():
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        return (Path(base) if base else Path.home() / "AppData" / "Local") / "SARU_Picker"
+    return Path.home() / ".saru_picker"
+
+
+def _retain_prediction_log(path):
+    """Replace one bounded diagnostic log; never keep screenshots or weights."""
+    temporary = None
+    try:
+        if not path.is_file():
+            return None
+        directory = _prediction_log_directory()
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / "cryolo-prediction.log"
+        with path.open("rb") as source:
+            source.seek(max(0, path.stat().st_size - 256 * 1024))
+            tail = source.read(256 * 1024)
+        with tempfile.NamedTemporaryFile("wb", dir=directory, prefix=".cryolo-log-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(tail)
+        os.replace(temporary, destination)
+        return destination
+    except OSError:
+        CRYOLO_LOG.warning("Could not retain the crYOLO prediction log", exc_info=True)
+        return None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                CRYOLO_LOG.warning("Could not remove an incomplete crYOLO diagnostic log")
 
 
 @dataclass(frozen=True)
@@ -157,9 +219,11 @@ def _stop_process(process):
         # Python preprocessing pools can outlive their parent on Windows.
         # taskkill is restricted to this freshly created request's PID tree.
         try:
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=2, check=False)
+            with external_process_environment() as child_env:
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=2, check=False,
+                               env=child_env, **_child_process_options())
         except (OSError, subprocess.TimeoutExpired):
             process.terminate()
     try:
@@ -190,8 +254,10 @@ class CryoloRecognizer:
         self._automatic_report = None
         self._profile = None
         self._process = None
+        self.last_prediction_log = None
 
-    def _paths(self, cancel=None):
+    def _paths(self, cancel=None, progress=None):
+        _report_progress(progress, "Checking crYOLO model files")
         weights = Path(self.config.checkpoint).expanduser().resolve()
         config_value = getattr(self.config, "cryolo_config", None)
         config_path = (Path(config_value).expanduser().resolve() if config_value
@@ -209,7 +275,8 @@ class CryoloRecognizer:
         python_value = getattr(self.config, "cryolo_python", None) or os.environ.get("SARU_CRYOLO_PYTHON")
         if not python_value:
             try:
-                python_value = str(ensure_cryolo_runtime(cancel=cancel))
+                python_value = str(ensure_cryolo_runtime(
+                    cancel=cancel, progress=lambda message: _report_progress(progress, message)))
             except RuntimeSetupCancelled as exc:
                 raise Cancelled(str(exc)) from exc
             except (RuntimeSetupError, OSError) as exc:
@@ -225,13 +292,14 @@ class CryoloRecognizer:
         executable = os.path.abspath(executable)
         return executable, weights, config_path
 
-    def _predict(self, rgb, cancel):
+    def _predict(self, rgb, cancel, progress=None):
         _check_cancel(cancel)
-        executable, weights, config_path = self._paths(cancel)
+        executable, weights, config_path = self._paths(cancel, progress)
         signature = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns)
                           for p in (weights, config_path))
         key = _image_key(rgb)
         if key == self._key and signature == self._artifact_signature and self._boxes is not None:
+            _report_progress(progress, "Using cached crYOLO detections")
             return list(self._boxes), True
         self._automatic_key = None
         self._automatic_result = None
@@ -267,37 +335,54 @@ class CryoloRecognizer:
                 command.extend(["-g", "0"])
             log_path = folder / "predict.log"
             started = time.monotonic()
+            _report_progress(progress, "Loading crYOLO model and predicting")
             try:
                 with log_path.open("wb") as log:
                     with external_process_environment(env) as child_env:
                         self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                                          stdout=log, stderr=subprocess.STDOUT,
                                                          cwd=folder, env=child_env,
-                                                         start_new_session=os.name != "nt")
+                                                         **_child_process_options())
                     while self._process.poll() is None:
                         _check_cancel(cancel)
                         if time.monotonic() - started > getattr(self.config, "cryolo_timeout", 180):
-                            raise RecognitionError("crYOLO detection timed out. Check its runtime/model or increase the timeout.")
+                            tail = _prediction_log_tail(log_path)
+                            raise RecognitionError(
+                                f"crYOLO prediction timed out after {time.monotonic() - started:.1f}s. "
+                                f"The prediction process was stopped. Last runtime output:\n{tail}")
                         time.sleep(.05)
                     code = self._process.returncode
                 _check_cancel(cancel)
                 if code:
-                    with log_path.open("rb") as log:
-                        log.seek(max(0, log_path.stat().st_size - 8000))
-                        tail = log.read().decode("utf-8", errors="replace")
+                    tail = _prediction_log_tail(log_path)
                     raise RecognitionError(f"crYOLO prediction failed (exit {code}).\n{tail}")
-                boxes = read_cbox(output / "CBOX" / "screen.cbox", rgb.shape[:2], threshold)
+                _report_progress(progress, "Reading crYOLO detections")
+                try:
+                    boxes = read_cbox(output / "CBOX" / "screen.cbox", rgb.shape[:2], threshold)
+                except RecognitionError as exc:
+                    raise RecognitionError(f"{exc}\nLast runtime output:\n{_prediction_log_tail(log_path)}") from exc
+                CRYOLO_LOG.info("crYOLO prediction completed in %.2fs: %d detections", time.monotonic()-started, len(boxes))
+            except Cancelled:
+                CRYOLO_LOG.info("crYOLO prediction cancelled")
+                raise
+            except RecognitionError as exc:
+                retained = _retain_prediction_log(log_path)
+                CRYOLO_LOG.exception("crYOLO prediction did not complete")
+                if retained is not None:
+                    raise RecognitionError(f"{exc}\nPrediction log: {retained}") from exc
+                raise
             except OSError as exc:
                 raise RecognitionError(f"Could not start the crYOLO Python runtime: {exc}") from exc
             finally:
                 if self._process is not None:
                     _stop_process(self._process)
                     self._process = None
+                self.last_prediction_log = _retain_prediction_log(log_path)
         _check_cancel(cancel)
         self._key, self._artifact_signature, self._boxes = key, signature, list(boxes)
         return boxes, False
 
-    def _refine(self, rgb, boxes, cancel, *, prompt=False):
+    def _refine(self, rgb, boxes, cancel, *, prompt=False, progress=None):
         check = lambda: _check_cancel(cancel)
         raw = []
         for box in boxes[:128]:
@@ -325,19 +410,24 @@ class CryoloRecognizer:
         if not raw:
             return [], {}, {"enabled": False}, {"enabled": False}, appearance
         if profile is not None:
+            _report_progress(progress, "Scoring capsid appearance")
             scores = score_image(rgb, profile, check)
+            _report_progress(progress, "Refining contours")
             raw = filter_capsid_with_profile(rgb, raw, scores, check_cancel=check,
                                              min_area_ratio=0 if prompt else self.config.min_area_ratio,
                                              max_area_ratio=1 if prompt else min(self.config.max_area_ratio, .4),
                                              min_capsid_area_px=minimum)
         else:
+            _report_progress(progress, "Refining contours")
             raw = filter_capsid_proposals(rgb, raw, check_cancel=check,
                                          min_area_ratio=0 if prompt else self.config.min_area_ratio,
                                          max_area_ratio=1 if prompt else min(self.config.max_area_ratio, .4))
+        _report_progress(progress, "Checking carbon support")
         context = detect_carbon_edges(rgb, check_cancel=check)
         raw, carbon = guard_proposals(context, raw, check_cancel=check)
         carbon["enabled"] = True
         raw, area = _filter_capsid_area(raw, minimum, cancel)
+        _report_progress(progress, "Finishing contours")
         candidates, evidence = [], {}
         key = _image_key(rgb)
         for record in raw:
@@ -364,16 +454,16 @@ class CryoloRecognizer:
             candidates = filter_candidates(candidates, self.config, cancel, suppress_duplicates=False)
         return candidates, {c.id: evidence[c.id] for c in candidates}, carbon, area, appearance
 
-    def automatic(self, rgb, cancel=None):
+    def automatic(self, rgb, cancel=None, progress=None):
         rgb = validate_rgb(rgb)
         started = time.perf_counter()
-        boxes, cached = self._predict(rgb, cancel)
+        boxes, cached = self._predict(rgb, cancel, progress)
         key = _image_key(rgb)
         if cached and self._automatic_key == key and self._automatic_result is not None:
             self.last_detection = copy.deepcopy(self._automatic_report)
             self.last_detection["detections_cached"] = True
             return list(self._automatic_result)
-        candidates = self.refine_detections(rgb, boxes, cancel=cancel)
+        candidates = self.refine_detections(rgb, boxes, cancel=cancel, progress=progress)
         self.last_detection["detections_cached"] = cached
         self.last_detection["detections_supplied"] = False
         self.last_detection["timing_seconds"]["total_including_initial_model_load"] = time.perf_counter() - started
@@ -381,7 +471,7 @@ class CryoloRecognizer:
         self._automatic_report = copy.deepcopy(self.last_detection)
         return candidates
 
-    def refine_detections(self, rgb, boxes, cancel=None, *, prompt=False):
+    def refine_detections(self, rgb, boxes, cancel=None, *, prompt=False, progress=None):
         """Run the exact production contour tail on parsed batch CBOX detections.
 
         This supports evaluation with one crYOLO process for a whole dataset.
@@ -392,7 +482,7 @@ class CryoloRecognizer:
         if any(not isinstance(box, CryoloBox) for box in boxes):
             raise ValueError("Detections must be CryoloBox instances from read_cbox.")
         started = time.perf_counter()
-        candidates, evidence, carbon, area, appearance = self._refine(rgb, boxes, cancel, prompt=prompt)
+        candidates, evidence, carbon, area, appearance = self._refine(rgb, boxes, cancel, prompt=prompt, progress=progress)
         _check_cancel(cancel)
         self.last_detection = {"backend": "cryolo", "profile": self.config.automatic_profile,
                                "cryolo_detections": len(boxes), "selected_contours": len(candidates),
@@ -406,7 +496,7 @@ class CryoloRecognizer:
 
     def prompt(self, rgb, box: Sequence[float] | None = None,
                points: Sequence[Sequence[float]] | None = None,
-               labels: Sequence[int] | None = None, cancel=None):
+               labels: Sequence[int] | None = None, cancel=None, progress=None):
         """Select crYOLO detections by prompts; prompts do not retrain the detector."""
         rgb = validate_rgb(rgb)
         height, width = rgb.shape[:2]
@@ -430,7 +520,7 @@ class CryoloRecognizer:
             raise ValueError("Point labels were supplied without points.")
         if box_array is None and (label_array is None or not label_array.any()):
             raise ValueError("Supply a box or at least one positive point.")
-        boxes, cached = self._predict(rgb, cancel)
+        boxes, cached = self._predict(rgb, cancel, progress)
         selected = []
         for detection in boxes:
             cx, cy = (detection.x0+detection.x1)/2, (detection.y0+detection.y1)/2
@@ -442,7 +532,7 @@ class CryoloRecognizer:
                 if np.any(inside & (label_array == 0)) or (np.any(label_array == 1) and not np.any(inside & (label_array == 1))):
                     continue
             selected.append(detection)
-        candidates, evidence, carbon, area, appearance = self._refine(rgb, selected, cancel, prompt=True)
+        candidates, evidence, carbon, area, appearance = self._refine(rgb, selected, cancel, prompt=True, progress=progress)
         self.last_detection = {"backend": "cryolo", "mode": "prompt_selection",
                                "cryolo_detections": len(boxes), "selected_detection_boxes": len(selected),
                                "selected_contours": len(candidates), "detections_cached": cached,

@@ -18,12 +18,15 @@ def launch() -> int:
             if getattr(sys, name) is None:
                 setattr(sys, name, (directory / "startup.log").open("a", encoding="utf-8", buffering=1))
         faulthandler.enable(file=fault_stream, all_threads=True)
+        if '--cryolo-refinement-smoke' in sys.argv[1:]:
+            from verify_refinement import main as verify_refinement
+            return verify_refinement([arg for arg in sys.argv[1:] if arg != '--cryolo-refinement-smoke'])
         import app
         return int(app.main() or 0)
     except Exception as exc:
         detail = traceback.format_exc()
         (directory / "startup-error.txt").write_text(detail, encoding="utf-8")
-        headless = any(arg.split("=", 1)[0] in {"--diagnostics", "--smoke-test", "--segment-image"}
+        headless = any(arg.split("=", 1)[0] in {"--diagnostics", "--smoke-test", "--segment-image", "--cryolo-refinement-smoke"}
                        for arg in sys.argv[1:])
         if not headless and sys.platform == "win32":
             import ctypes

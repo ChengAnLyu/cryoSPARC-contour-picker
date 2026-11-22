@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 from unittest.mock import patch
 
@@ -14,7 +15,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from recognition import RecognitionConfig, RecognitionError, Cancelled
-from cryolo_recognition import CryoloBox, CryoloRecognizer, read_cbox
+from cryolo_recognition import (CryoloBox, CryoloRecognizer, read_cbox,
+                                _child_process_options, _retain_prediction_log)
 from runtime_management import RuntimeSetupError, RuntimeSetupCancelled
 
 
@@ -112,12 +114,13 @@ def runtime(tmp_path, monkeypatch):
     config = tmp_path / 'config.json'
     config.write_text(json.dumps({'model': {'architecture': 'PhosaurusNet'}}))
     monkeypatch.setenv('PYTHONPATH', str(tmp_path))
+    monkeypatch.setattr('cryolo_recognition._prediction_log_directory', lambda: tmp_path / 'diagnostics')
     # The synthetic module lives only on this test's PYTHONPATH. Production
     # sanitization is tested independently; this seam proves the adapter uses
     # the external-process context and keeps subprocess execution real.
     @contextmanager
-    def synthetic_external_environment(env):
-        child = dict(env)
+    def synthetic_external_environment(env=None):
+        child = dict(os.environ if env is None else env)
         child['SARU_TEST_EXTERNAL_CONTEXT'] = '1'
         yield child
     monkeypatch.setattr('cryolo_recognition.external_process_environment', synthetic_external_environment)
@@ -185,13 +188,16 @@ def test_nonzero_child_exit_preserves_actionable_error(runtime):
 
 def test_timeout_reaps_child_and_does_not_cache(runtime):
     _, script, config = runtime
-    script.write_text('import time\ntime.sleep(20)')
-    model = CryoloRecognizer(replace(config, cryolo_timeout=.15))
+    script.write_text('import time\nprint("Loading selected checkpoint", flush=True)\ntime.sleep(20)')
+    model = CryoloRecognizer(replace(config, cryolo_timeout=.3))
     started = time.monotonic()
-    with pytest.raises(RecognitionError, match='timed out'):
+    with pytest.raises(RecognitionError, match='timed out') as error:
         model.automatic(np.zeros((80, 120, 3), np.uint8))
     assert time.monotonic() - started < 5
     assert model._process is None and model._boxes is None
+    assert 'Loading selected checkpoint' in str(error.value)
+    assert str(model.last_prediction_log) in str(error.value)
+    assert 'Loading selected checkpoint' in model.last_prediction_log.read_text()
 
 
 def test_cancellation_reaps_child_and_does_not_cache(runtime):
@@ -294,9 +300,16 @@ def test_implicit_runtime_is_prepared_automatically(runtime, monkeypatch):
     monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
     model = CryoloRecognizer(replace(config, cryolo_python=None))
     cancel = lambda: False
-    with patch('cryolo_recognition.ensure_cryolo_runtime', return_value=Path(sys.executable)) as setup:
-        executable, _, _ = model._paths(cancel)
-    setup.assert_called_once_with(cancel=cancel)
+    phases = []
+    def prepare(*, cancel, progress):
+        assert cancel() is False
+        progress('Checking crYOLO runtime')
+        return Path(sys.executable)
+    with patch('cryolo_recognition.ensure_cryolo_runtime', side_effect=prepare) as setup:
+        executable, _, _ = model._paths(cancel, progress=phases.append)
+    setup.assert_called_once()
+    assert setup.call_args.kwargs['cancel'] is cancel
+    assert phases == ['Checking crYOLO model files', 'Checking crYOLO runtime']
     assert executable == os.path.abspath(sys.executable)
 
 
@@ -329,3 +342,74 @@ def test_missing_model_does_not_start_runtime_installation(runtime, monkeypatch)
     with patch('cryolo_recognition.ensure_cryolo_runtime', side_effect=AssertionError('Unnecessary install')):
         with pytest.raises(RecognitionError, match='weights not found'):
             model._paths()
+
+
+def positive_program():
+    return ('import sys\nfrom pathlib import Path\nargs=sys.argv[1:]\n'
+            'output=Path(args[args.index("-o")+1])/"CBOX"\noutput.mkdir(parents=True)\n'
+            '(output/"screen.cbox").write_text(' + repr(HEADER +
+             '38 53 <NA> 89 86 <NA> 89 86 .9 <NA>\n') + ')\n'
+            'print("Prediction complete",flush=True)\n')
+
+
+def test_positive_child_runs_real_learned_refinement_and_reports_phases(runtime):
+    # Deterministic synthetic detector output, then the actual learned-profile,
+    # texture, shape, carbon and area code. No positive contour tail is mocked.
+    from test_capsid import synthetic_core
+    from test_capsid_prior import fixture
+    tmp_path, script, config = runtime
+    script.write_text(positive_program())
+    (tmp_path / 'capsid-profile.json').write_text(json.dumps(fixture()))
+    rgb, _, _ = synthetic_core()
+    model = CryoloRecognizer(replace(config, automatic_profile='capsid-learned', min_capsid_area_px=3500))
+    phases = []
+    started = time.monotonic()
+    candidates = model.automatic(rgb, progress=phases.append)
+    assert time.monotonic() - started < 10
+    assert len(candidates) == 1 and candidates[0].mask.shape == rgb.shape[:2]
+    assert candidates[0].predicted_iou is None
+    assert model.last_detection['capsid_evidence'][candidates[0].id]['cryolo_confidence'] == .9
+    assert phases == ['Checking crYOLO model files', 'Loading crYOLO model and predicting',
+                      'Reading crYOLO detections', 'Scoring capsid appearance',
+                      'Refining contours', 'Checking carbon support', 'Finishing contours']
+    assert model._process is None
+    assert model.last_prediction_log.read_text().strip() == 'Prediction complete'
+
+
+def test_positive_refinement_can_be_cancelled_after_prediction(runtime):
+    from test_capsid import synthetic_core
+    from test_capsid_prior import fixture
+    tmp_path, script, config = runtime
+    script.write_text(positive_program())
+    (tmp_path / 'capsid-profile.json').write_text(json.dumps(fixture()))
+    rgb, _, _ = synthetic_core()
+    model = CryoloRecognizer(replace(config, automatic_profile='capsid-learned'))
+    cancelled = threading.Event()
+    def progress(phase):
+        if phase == 'Refining contours':
+            cancelled.set()
+    started = time.monotonic()
+    with pytest.raises(Cancelled):
+        model.automatic(rgb, cancel=cancelled.is_set, progress=progress)
+    assert time.monotonic() - started < 10
+    assert model._process is None and model._automatic_result is None
+
+
+def test_retained_prediction_log_is_bounded_and_replaced(runtime):
+    tmp_path, _, _ = runtime
+    log = tmp_path / 'predict.log'
+    log.write_bytes(b'first bytes' + b'x' * (300 * 1024) + b'last bytes')
+    retained = _retain_prediction_log(log)
+    assert retained.stat().st_size == 256 * 1024
+    assert retained.read_bytes().endswith(b'last bytes')
+    assert not retained.read_bytes().startswith(b'first bytes')
+    log.write_text('next prediction')
+    assert _retain_prediction_log(log) == retained
+    assert retained.read_text() == 'next prediction'
+    assert list(retained.parent.iterdir()) == [retained]
+
+
+def test_windows_prediction_process_has_no_console():
+    with patch('cryolo_recognition.os.name', 'nt'), \
+         patch('cryolo_recognition.subprocess.CREATE_NO_WINDOW', 0x08000000, create=True):
+        assert _child_process_options() == {'creationflags': 0x08000000}

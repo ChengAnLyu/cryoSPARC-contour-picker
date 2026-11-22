@@ -43,9 +43,12 @@ from execution import (
     WorkerBusyError, play_clicks,
 )
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
+from runtime_management import repair_cryolo_runtime
 from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fraction,
                         screen_region_overlaps_panel, initialize_detector_fields, detector_config_from_fields,
-                        detection_profile_value, persist_detector_fields, apply_detector_args)
+                        detection_profile_value, persist_detector_fields, apply_detector_args,
+                        begin_recognition_progress, queue_recognition_progress, accept_recognition_progress,
+                        clear_recognition_progress, refresh_recognition_progress)
 from detector_selection import (DETECTION_PROFILES, canonical_detection_profile, resolve_detection_profile,
                                 load_detector_settings)
 from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_overlay
@@ -1646,6 +1649,7 @@ class PickerApp:
         self.desktop = DesktopAdapter()
         self.hotkeys = None
         self.active_token = None
+        self._recognition_progress = None
         self.recognizer = None
         self.recognizer_config = None
         self.closed = False
@@ -1764,6 +1768,7 @@ class PickerApp:
             ttk.Entry(row, textvariable=variable, width=9).pack(side="right")
         self._applied_model_config = detector_config_from_fields(self)
         ttk.Button(model, text="Apply detection settings", command=self._apply_model_settings).pack(fill="x", pady=5)
+        ttk.Button(model, text="Repair crYOLO runtime", command=self.repair_runtime).pack(fill="x")
         self.tool = tk.StringVar(value="box")
         tools_frame = ttk.LabelFrame(controls, text="3. Draw on preview", padding=7)
         tools_frame.pack(fill="x", pady=4)
@@ -2161,7 +2166,22 @@ class PickerApp:
         submitted = self.runner.submit(guarded, token=token)
         self.job_kind, self.job_started = kind, time.perf_counter()
         self.active_token = submitted
+        if kind in {"prompt", "automatic proposals", "batch recognition", "runtime repair"}:
+            begin_recognition_progress(self, submitted, self.job_started,
+                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        else:
+            clear_recognition_progress(self)
         self.status.set(f"{kind}: running. Esc cancels; an active model forward pass may need to finish.")
+        refresh_recognition_progress(self, self.batch_paused)
+
+    def repair_runtime(self):
+        try:
+            self._ensure_idle(allow_model_changes=True)
+            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
+                cancel=lambda: token.cancelled,
+                progress=lambda phase: queue_recognition_progress(self, token, phase)))
+        except Exception as exc:
+            self._error(exc)
 
     def segment_prompt(self):
         try:
@@ -2171,9 +2191,15 @@ class PickerApp:
             config, rgb = self._model_config(), self.rgb
             box = self.prompt_box
             points, labels = tuple(self.prompt_points), tuple(self.prompt_labels)
-            self._submit("prompt", lambda token: self._get_recognizer(config).prompt(
-                rgb, box=box, points=points or None, labels=labels or None,
-                cancel=lambda: token.cancelled))
+            def work(token):
+                options = {"cancel": lambda: token.cancelled}
+                if config.backend == "cryolo":
+                    options["progress"] = lambda phase: queue_recognition_progress(self, token, phase)
+                else:
+                    queue_recognition_progress(self, token, "Running SAM")
+                return self._get_recognizer(config).prompt(
+                    rgb, box=box, points=points or None, labels=labels or None, **options)
+            self._submit("prompt", work)
         except Exception as exc:
             self._error(exc)
 
@@ -2200,8 +2226,14 @@ class PickerApp:
             raise ValueError("Capture or open an image first.")
         self.alternatives.clear()
         config, rgb = self._model_config(), self.rgb
-        self._submit("batch recognition" if batch else "automatic proposals",
-                     lambda token: self._get_recognizer(config).automatic(rgb, cancel=lambda: token.cancelled))
+        def work(token):
+            options = {"cancel": lambda: token.cancelled}
+            if config.backend == "cryolo":
+                options["progress"] = lambda phase: queue_recognition_progress(self, token, phase)
+            else:
+                queue_recognition_progress(self, token, "Running SAM")
+            return self._get_recognizer(config).automatic(rgb, **options)
+        self._submit("batch recognition" if batch else "automatic proposals", work)
 
     def _add_candidate(self, candidate, select=False):
         if candidate.id not in {c.id for c in self.candidates}:
@@ -2419,6 +2451,8 @@ class PickerApp:
 
     def stop(self):
         self.runner.invalidate()
+        clear_recognition_progress(self)
+        self.active_token = None
         self._cancel_timers()
         self.batch_remaining = 0
         self.batch_paused = False
@@ -2439,6 +2473,8 @@ class PickerApp:
                 event = self.events.get_nowait()
                 if event[0] == "hotkey":
                     self.stop() if event[1] == "stop" else self.pause()
+                elif event[0] == "recognition_phase":
+                    accept_recognition_progress(self, event[1], event[2])
                 elif event[0] == "clicked":
                     # Points belong to the unchanged capture while playback is active;
                     # stop invalidation must not forget clicks already delivered.
@@ -2452,6 +2488,7 @@ class PickerApp:
         for result in self.runner.poll_results():
             kind = self.job_kind
             elapsed = time.perf_counter() - self.job_started
+            clear_recognition_progress(self, result.token)
             self.active_token = None
             APP_LOG.info("%s finished in %.3fs; error=%r cancelled=%s", kind, elapsed, result.error, result.cancelled)
             if result.error is not None or result.cancelled:
@@ -2472,10 +2509,13 @@ class PickerApp:
                 self.playback_active = False
                 self.root.deiconify()
                 self._error(exc)
+        refresh_recognition_progress(self, self.batch_paused)
         self.root.after(40, self.poll)
 
     def _handle_result(self, kind, value, elapsed):
-        if kind == "prompt":
+        if kind == "runtime repair":
+            self.status.set("crYOLO runtime repaired. Choose Generate automatic proposals to retry.")
+        elif kind == "prompt":
             self.alternatives, self.alternative_index = value, 0
             self.render()
             self.status.set(f"Prompt finished in {elapsed:.2f}s. Review alternatives, then accept the intended inner region.")
@@ -2542,6 +2582,7 @@ class PickerApp:
 
     def close(self):
         self.closed = True
+        clear_recognition_progress(self)
         self.runner.shutdown(wait=False)
         self._cancel_timers()
         if self.hotkeys is not None:

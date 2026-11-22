@@ -43,11 +43,58 @@ jobs:
       - name: Build and verify four-profile app and automatic runtime setup
         shell: pwsh
         run: ./packaging/cryolo/build.ps1 -PythonExe (Get-Command python).Source -IsccPath $env:SARU_CRYOLO_ISCC -TestInstaller
-      - name: Upload GUI installer and verification
+      - name: Upload downloadable installer
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: SARU-Picker-Windows-3.0.0-${{ github.run_number }}
-          path: artifacts/cryolo/*
+          name: SARU-Picker-Installer-3.0.0-${{ github.run_number }}
+          path: |
+            artifacts/cryolo/SARU-Picker-Setup-3.0.0-win64.exe
+            artifacts/cryolo/download-manifest.json
+            artifacts/cryolo/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload optional portable part 1
+        if: ${{ hashFiles('artifacts/cryolo/portable-parts/portable.part01') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Portable-3.0.0-${{ github.run_number }}-part01
+          path: |
+            artifacts/cryolo/portable-parts/portable.part01
+            artifacts/cryolo/download-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload optional portable part 2
+        if: ${{ hashFiles('artifacts/cryolo/portable-parts/portable.part02') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Portable-3.0.0-${{ github.run_number }}-part02
+          path: |
+            artifacts/cryolo/portable-parts/portable.part02
+            artifacts/cryolo/download-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload optional portable part 3
+        if: ${{ hashFiles('artifacts/cryolo/portable-parts/portable.part03') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Portable-3.0.0-${{ github.run_number }}-part03
+          path: |
+            artifacts/cryolo/portable-parts/portable.part03
+            artifacts/cryolo/download-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Upload optional portable part 4
+        if: ${{ hashFiles('artifacts/cryolo/portable-parts/portable.part04') != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: SARU-Picker-Portable-3.0.0-${{ github.run_number }}-part04
+          path: |
+            artifacts/cryolo/portable-parts/portable.part04
+            artifacts/cryolo/download-manifest.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -71,6 +118,7 @@ jobs:
             artifacts/cryolo/**/*.json
             artifacts/cryolo/**/*.png
             artifacts/cryolo/*.log
+            artifacts/cryolo/SHA256SUMS.txt
             build/cryolo/pyinstaller/**/warn-*.txt
           if-no-files-found: warn
           retention-days: 14

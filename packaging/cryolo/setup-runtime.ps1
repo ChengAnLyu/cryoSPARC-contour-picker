@@ -13,7 +13,8 @@ param(
     [string]$RuntimeDirectory = "",
     [string]$Report = "",
     [switch]$ForcePrivatePython,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$Repair
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -27,18 +28,35 @@ function Invoke-Checked {
     if ($LASTEXITCODE -ne 0) { throw "Command failed with exit code ${LASTEXITCODE}: $Program" }
 }
 function Read-Health {
+    $script:HealthFailure = $null
     if (-not (Test-Path -LiteralPath $RuntimePython -PathType Leaf)) { return $null }
     $ProbeOutput = Join-Path $ParentDirectory "runtime-health.json"
     $ProbeError = Join-Path $ParentDirectory "runtime-health.log"
-    $Arguments = '"' + (Join-Path $PSScriptRoot "runtime_health.py") + '"'
+    $ProbeProgress = Join-Path $ParentDirectory "runtime-health-progress.json"
+    $Arguments = '"' + (Join-Path $PSScriptRoot "runtime_health.py") + '" --progress-report "' + $ProbeProgress + '"'
     try {
-        $Probe = Start-Process -FilePath $RuntimePython -ArgumentList $Arguments -PassThru -Wait -NoNewWindow -RedirectStandardOutput $ProbeOutput -RedirectStandardError $ProbeError
-        if ($Probe.ExitCode -ne 0) { return $null }
-    } catch { return $null }
-    try {
-        $Health = Get-Content -LiteralPath $ProbeOutput -Raw | ConvertFrom-Json
-        if ($Health.status -eq "ok") { return $Health }
-    } catch { return $null }
+        $Probe = Start-Process -FilePath $RuntimePython -ArgumentList $Arguments -PassThru -NoNewWindow -RedirectStandardOutput $ProbeOutput -RedirectStandardError $ProbeError
+        if (-not $Probe.WaitForExit(120000)) {
+            $Probe.Kill()
+            if (-not $Probe.WaitForExit(5000)) { throw 'The runtime health process did not stop after cancellation.' }
+            $script:HealthFailure = @{ status = 'timeout'; error = 'The crYOLO runtime health check exceeded 120 seconds.'; log = $ProbeError }
+            $script:HealthFailure | ConvertTo-Json | Set-Content -LiteralPath $ProbeOutput -Encoding UTF8
+            return $null
+        }
+        $Probe.Refresh()
+        $ExitCode = $Probe.ExitCode
+        $Health = $null
+        try { $Health = Get-Content -LiteralPath $ProbeOutput -Raw | ConvertFrom-Json } catch { $Health = $null }
+        if ($ExitCode -eq 0 -and $Health -and $Health.status -eq 'ok') { return $Health }
+        if ($Health) {
+            $script:HealthFailure = @{ status = 'error'; returncode = $ExitCode; error = $Health.error; log = $ProbeError }
+        } else {
+            $script:HealthFailure = @{ status = 'crashed'; returncode = $ExitCode; error = "The crYOLO runtime check stopped without a report (exit $ExitCode)."; log = $ProbeError }
+            $script:HealthFailure | ConvertTo-Json | Set-Content -LiteralPath $ProbeOutput -Encoding UTF8
+        }
+    } catch {
+        $script:HealthFailure = @{ status = 'error'; error = $_.Exception.Message; log = $ProbeError }
+    }
     return $null
 }
 function Assert-NoReparsePoint {
@@ -128,7 +146,7 @@ try {
     New-Item -ItemType Directory -Force -Path $ParentDirectory | Out-Null
     New-Item -ItemType Directory -Force -Path (Split-Path $Report -Parent) | Out-Null
     $InstallReport = @{ status = "running"; stage = "health-check"; started_utc = $Started;
-        python = $RuntimePython; reused = $false; vc_runtime_files = @(); private_python_requested = [bool]$ForcePrivatePython;
+        python = $RuntimePython; reused = $false; repair_requested = [bool]$Repair; vc_runtime_files = @(); private_python_requested = [bool]$ForcePrivatePython;
         cryolo_version = "1.9.9"; tensorflow_version = "1.15.4";
         scope = "private CPU runtime and upstream initialization weights; no trained capsid model" }
     $InstallReport.powershell_version = $PSVersionTable.PSVersion.ToString()
@@ -149,7 +167,14 @@ try {
     Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
     Remove-Item Env:PYTHONHOME -ErrorAction SilentlyContinue
     $env:PIP_CONFIG_FILE = "NUL"
-    $Health = Read-Health
+    $Health = $null
+    if (-not $Repair) {
+        $Health = Read-Health
+        if ($script:HealthFailure -and $script:HealthFailure.status -in @('timeout', 'crashed')) {
+            $InstallReport.health = $script:HealthFailure
+            throw "$($script:HealthFailure.error) Open Advanced and choose Repair crYOLO runtime. Diagnostic log: $($script:HealthFailure.log)"
+        }
+    }
     if ($Health) {
         $InstallReport.status = "ok"
         $InstallReport.stage = "ready"
@@ -243,7 +268,10 @@ try {
     $InstallReport.stage = "verification"
     Save-Report
     $Health = Read-Health
-    if (-not $Health) { throw "The crYOLO health check failed. See $(Join-Path $ParentDirectory 'runtime-health.log') and runtime-health.json." }
+    if (-not $Health) {
+        $InstallReport.health = $script:HealthFailure
+        throw "The crYOLO health check failed: $($script:HealthFailure.error) See $(Join-Path $ParentDirectory 'runtime-health.log') and runtime-health.json."
+    }
     $InstallReport.status = "ok"
     $InstallReport.stage = "ready"
     $InstallReport.health = $Health

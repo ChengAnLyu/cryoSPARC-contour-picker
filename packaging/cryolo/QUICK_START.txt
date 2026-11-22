@@ -1,12 +1,14 @@
 SARU Picker 3.0.0 — four detection profiles
 
-1. Extract the whole delivered release ZIP. Keep cryolo-capsids.h5,
+1. Extract BOTH delivered installer and models ZIPs into the same destination.
+   Open their shared SARU-Picker-3.0.0 folder. Keep cryolo-capsids.h5,
    cryolo-config.json, capsid-profile.json, app-icon.ico and app-icon.png beside
    SARU-Picker-Setup-3.0.0-win64.exe, then run Setup.
 2. Wait for Setup to prepare the crYOLO runtime automatically. The first
    installation requires internet access and can take several minutes.
    Python selection and a separate runtime-install step are not required.
-   If setup fails, restore the internet connection and run Setup again.
+   If setup fails, open SARU Picker 3.0 from Start, then choose
+   Advanced > Repair crYOLO runtime. The diagnostic report explains the failure.
 3. Launch SARU Picker 3.0. Choose a Detection profile in Advanced:
 
    capsid          SAM with the existing capsid filtering (default).
@@ -42,6 +44,14 @@ Runtime setup and diagnostic report:
   %LOCALAPPDATA%\SARU_Picker_crYOLO\runtime-install-report.json
 Detector settings:
   %LOCALAPPDATA%\SARU_Picker\detector-settings.json
+
+Recognition stall fix (22 November 2026; version remains 3.0.0)
+  Recognition displays its current stage and elapsed time. An existing runtime
+  that fails its health check no longer silently starts a lengthy reinstall.
+  If a runtime error is shown, choose Advanced > Repair crYOLO runtime, wait
+  for completion, then retry Detect. Repair needs internet access. Escape
+  cancels recognition or repair. The trained models and picking rules are
+  unchanged. Re-run this updated Setup to upgrade the previous 3.0.0 build.
 
 Training provenance
   The independent training/train_cryolo.py wrapper runs stock crYOLO model,
