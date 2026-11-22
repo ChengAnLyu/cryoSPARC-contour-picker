@@ -13,12 +13,12 @@ from pathlib import Path
 def build(destination: Path | None = None) -> Path:
     directory = Path(__file__).resolve().parent
     destination = destination or directory / "main.py"
-    names = ("application_icon", "capsid_prior", "carbon_support", "capsid", "recognition", "runtime_management", "cryolo_recognition", "detector_selection", "execution", "desktop", "manual_sampling", "micrograph_navigation", "screen_overlay", "screen_app", "app")
+    names = ("cryolo_onnx", "application_icon", "capsid_prior", "carbon_support", "capsid", "recognition", "runtime_management", "cryolo_recognition", "detector_selection", "execution", "desktop", "manual_sampling", "micrograph_navigation", "screen_overlay", "screen_app", "app")
     sections = [
         '#!/usr/bin/env python3\n',
         '"""SARU Picker 3.0.0: direct screen contours and four detection profiles.\n',
         'Generated from the companion tested modules. Run python main.py --help.\n',
-        '"""\nfrom __future__ import annotations\n\n',
+        '"""\nfrom __future__ import annotations\n\n_SARU_STANDALONE = True\n\n',
     ]
     for name in names:
         path = directory / f"{name}.py"
@@ -29,11 +29,17 @@ def build(destination: Path | None = None) -> Path:
             skip = isinstance(node, ast.ImportFrom) and (node.module in names or node.module == "__future__")
             skip = skip or (node is tree.body[0] and isinstance(node, ast.Expr)
                             and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))
+            skip = skip or (name == "cryolo_onnx" and node in tree.body and isinstance(node, ast.If)
+                            and isinstance(node.test, ast.Compare) and isinstance(node.test.left, ast.Name)
+                            and node.test.left.id == "__name__")
             if skip:
                 removed.update(range(node.lineno, node.end_lineno + 1))
         body = "".join(line for number, line in enumerate(source.splitlines(keepends=True), 1)
                        if number not in removed)
         sections.extend([f"\n# ---------------- {name}.py ----------------\n", body, "\n"])
+        if name == "cryolo_onnx":
+            sections.append('if __name__ == "__main__" and sys.argv[1:2] == ["--cryolo-onnx-worker"]:\n'
+                            '    raise SystemExit(onnx_worker_main(sys.argv[2:]))\n')
     text = "".join(sections)
     compile(text, str(destination), "exec")
     destination.write_text(text, encoding="utf-8", newline="\n")

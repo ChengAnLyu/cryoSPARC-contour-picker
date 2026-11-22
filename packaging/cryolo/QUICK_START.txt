@@ -1,73 +1,58 @@
-SARU Picker 3.0.0 — four detection profiles
+SARU Picker 3.0.0 — four profiles, offline inference
 
-1. Extract BOTH delivered installer and models ZIPs into the same destination.
-   Open their shared SARU-Picker-3.0.0 folder. Keep cryolo-capsids.h5,
-   cryolo-config.json, capsid-profile.json, app-icon.ico and app-icon.png beside
+1. Extract the delivered installer and model files into the same folder.
+   If supplied as two ZIPs, extract both into the same destination and open
+   their shared SARU-Picker-3.0.0 folder. Keep cryolo-capsids.onnx,
+   cryolo-config.json, capsid-profile.json and the icons beside
    SARU-Picker-Setup-3.0.0-win64.exe, then run Setup.
-2. Wait for Setup to prepare the crYOLO runtime automatically. The first
-   installation requires internet access and can take several minutes.
-   Python selection and a separate runtime-install step are not required.
-   If setup fails, open SARU Picker 3.0 from Start, then choose
-   Advanced > Repair crYOLO runtime. The diagnostic report explains the failure.
-3. Launch SARU Picker 3.0. Choose a Detection profile in Advanced:
+2. Launch SARU Picker 3.0. No internet connection, Python selection, runtime
+   installation or repair step is needed.
+3. Choose a Detection profile in Advanced:
 
-   capsid          SAM with the existing capsid filtering (default).
+   capsid          SAM with existing capsid filtering (default).
    capsid-learned  SAM with the supplied learned appearance profile.
    generic         SAM without capsid-specific automatic filtering.
-   crYOLO          crYOLO detections refined into contours with the supplied
-                   learned appearance profile.
+   crYOLO          The exported trained crYOLO detector, evaluated by bundled
+                   ONNX Runtime CPU, then refined into learned contours.
 
-The SAM ViT-B model, its CPU runtime and the private Python executable package
-used by crYOLO are included. Each detector keeps its
-own model path when changing profiles. No Python executable needs to be chosen.
+SAM ViT-B, the CPU engines and the application executable are included. Each
+profile keeps the appropriate model path. The ONNX model contains its own
+preprocessing and detector metadata. Inspect detections at normal screen zoom.
 Manual, semi-auto and auto controls, screen selection, sampling spacing, click
-delay, cancellation and Next micrograph remain available as before. Inspect
-results at the normal screen zoom. The default minimum capsid contour area is
-3,500 screen pixels; SAM generic and explicit SAM prompts keep their prior rules.
+delay, cancellation and Next micrograph remain available. The default minimum
+capsid contour area is 3,500 screen pixels; generic and explicit SAM prompts
+retain their prior rules.
 
-crYOLO predicts boxes. SARU's image-based processing refines those regions into
-contours; these are not guaranteed biological boundaries. crYOLO box/point
-prompts select detections. SAM profiles retain SAM interactive segmentation.
+crYOLO predicts boxes. Image-based processing refines them into contours;
+these are not guaranteed biological boundaries. crYOLO box/point prompts
+select detections. SAM profiles retain SAM interactive segmentation.
 
-This installer upgrades the previous crYOLO 3.0 edition in place while retaining
-its owned install/runtime folders. The separate legacy SAM 2.9 installation is
-not replaced. The internal EXE retains its old name for this upgrade:
-  SARU Picker crYOLO.exe
-The visible application and shortcuts are SARU Picker 3.0.
+This offline update retains version 3.0.0 and upgrades the previous 3.0 edition
+in place. Setup no longer prepares a separate crYOLO runtime. It removes old
+owned runtime installer helpers; the old private Python environment is left
+untouched and is no longer needed for normal detection. Global Python, PATH
+and the separate legacy SAM 2.9 installation remain unchanged. The internal
+EXE keeps its upgrade-compatible name: SARU Picker crYOLO.exe.
 
-crYOLO is downloaded from its upstream distribution into a private environment.
-It is provided for non-commercial academic/research use under its own license:
-  https://cryolo-doc.readthedocs.io/en/stable/other/license.html
-No system PATH, file associations or global Python installation are changed.
+Known default H5 selections move to the verified matching ONNX export. A custom
+H5 model needs a matching export; it does not start a runtime installation.
+The Repair crYOLO runtime control has been removed.
 
-Runtime setup and diagnostic report:
-  %LOCALAPPDATA%\SARU_Picker_crYOLO\runtime-install-report.json
 Detector settings:
   %LOCALAPPDATA%\SARU_Picker\detector-settings.json
-
-Recognition stall fix (22 November 2026; version remains 3.0.0)
-  Recognition displays its current stage and elapsed time. An existing runtime
-  that fails its health check no longer silently starts a lengthy reinstall.
-  If a runtime error is shown, choose Advanced > Repair crYOLO runtime, wait
-  for completion, then retry Detect. Repair needs internet access. Escape
-  cancels recognition or repair. The trained models and picking rules are
-  unchanged. Re-run this updated Setup to upgrade the previous 3.0.0 build.
-
-Training provenance
-  The independent training/train_cryolo.py wrapper runs stock crYOLO model,
-  loss, augmentation and checkpoint APIs in a separate Python 3.7 process.
-  Monitoring explicitly averages every equal-size batch. Full-fit monitoring
-  uses the same 160 examples and is not held-out validation. Consult the
-  supplied model record for completed epochs and hashes. Changing the app to
-  3.0.0 or adding profile selection does not itself retrain either model.
+Prediction failure details:
+  %LOCALAPPDATA%\SARU_Picker\cryolo-prediction.log
 
 Portable alternative
-  Extract the entire GUI ZIP. Place the three private model/config/profile
-  sidecars in SARU_Picker_crYOLO/_internal/models and the supplied icons in
-  _internal/assets. Launch SARU Picker crYOLO.exe. The crYOLO profile prepares
-  its private runtime automatically when first needed, with internet access.
-  The EXE and its _internal folder must remain together; do not run inside ZIP.
+  Extract the entire GUI ZIP. Put the model/config/profile in
+  SARU_Picker_crYOLO/_internal/models and icons in _internal/assets.
+  Launch SARU Picker crYOLO.exe. Keep the EXE and _internal folder together;
+  do not run inside the ZIP. This also works offline.
 
-Build checks execute real SAM and stock crYOLO inference on synthetic data,
-including the frozen application's external-process boundary. Those checks
-validate packaging and runtime operation, not trained-model biological accuracy.
+Model provenance
+  This application update exports existing trained weights; it does not claim
+  a new training run. The supplied model record identifies training and export
+  hashes and numerical checks. Public Windows checks use synthetic models to
+  exercise real inference and positive contours, not assess capsid accuracy.
+  Stock crYOLO software and general pretrained weights are not redistributed.
+  Third-party license notices are included under _internal/licenses.

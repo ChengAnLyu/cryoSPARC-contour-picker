@@ -1,125 +1,120 @@
-# SARU Picker 3.0.0 for Windows
+# SARU Picker 3.0.0 for Windows — offline inference
 
 One application provides four detection profiles. The default remains SAM
-`capsid`, preserving the previous picker's screen capture, manual contours,
-overlays, sampling, cancellation and navigation.
+`capsid`. Screen capture, manual contours, overlays, sampling, cancellation and
+navigation remain available.
 
-| Detection profile | Backend | Automatic contour processing |
+| Detection profile | Inference engine | Automatic contour processing |
 | --- | --- | --- |
-| `capsid` | SAM ViT-B | Existing capsid filtering |
-| `capsid-learned` | SAM ViT-B | Supplied learned appearance profile |
-| `generic` | SAM ViT-B | Generic SAM masks |
-| `crYOLO` | Stock crYOLO 1.9.9 | Supplied learned appearance profile within detected regions |
+| `capsid` | Bundled SAM ViT-B | Existing capsid filtering |
+| `capsid-learned` | Bundled SAM ViT-B | Supplied learned appearance profile |
+| `generic` | Bundled SAM ViT-B | Generic SAM masks |
+| `crYOLO` | Bundled ONNX Runtime CPU, evaluating the exported trained detector | Supplied learned appearance profile within detected regions |
 
 ## Install the delivered release
 
-Extract both delivered installer and models ZIPs into the same destination,
-open their shared `SARU-Picker-3.0.0` folder, and run
-`SARU-Picker-Setup-3.0.0-win64.exe`.
-Leave the supplied model/config/profile and icon sidecars beside Setup.
-Setup copies the sidecars, installs and verifies the private crYOLO runtime
-when needed, then enables launch. First installation requires internet access
-and can take several minutes. There is no separate Python selection or runtime
-installation step. A failure stops automatic launch. Open **SARU Picker 3.0** from Start, then
-**Advanced → Repair crYOLO runtime** to repair an existing unhealthy runtime.
+Extract the delivered installer and model files into the same folder. Keep
+`cryolo-capsids.onnx`, `cryolo-config.json`, `capsid-profile.json` and the supplied
+icons beside `SARU-Picker-Setup-3.0.0-win64.exe`, then run Setup. If the delivery
+uses two ZIPs, extract both into the same destination and open their shared
+`SARU-Picker-3.0.0` folder.
 
-SAM ViT-B and its CPU runtime are bundled. Launch **SARU Picker 3.0**, choose
-one of the four profiles in Advanced and inspect detections in semi-auto mode
-at normal screen zoom. SAM and crYOLO retain separate model paths.
+Setup copies the application and private sidecars. Installation and recognition
+require no network access, runtime download, Python selection or repair step.
+Launch **SARU Picker 3.0**, choose a profile in Advanced, and inspect detections
+in semi-auto mode at normal screen zoom. Each detector keeps its own model path.
 
 | Private sidecar beside Setup | Installed location under the app folder |
 | --- | --- |
-| `cryolo-capsids.h5` | `_internal/models/cryolo-capsids.h5` |
+| `cryolo-capsids.onnx` | `_internal/models/cryolo-capsids.onnx` |
 | `cryolo-config.json` | `_internal/models/cryolo-config.json` |
 | `capsid-profile.json` | `_internal/models/capsid-profile.json` |
 | `app-icon.ico` | `_internal/assets/app-icon.ico` |
 | `app-icon.png` | `_internal/assets/app-icon.png` |
 
-The public generic installer omits the private H5 and appearance profile.
-The delivered private release supplies these sidecars. `capsid-learned` and
-`crYOLO` require the matching appearance profile; crYOLO additionally requires
-its H5 and JSON config. Public CI fixtures are never delivered as trained models.
+The ONNX model embeds its tensor layout, preprocessing, learned anchors and
+source checkpoint hash. The unchanged training JSON accompanies it for
+provenance; inference reads the embedded metadata. The public generic installer
+omits private models and the learned appearance profile. The private delivery
+supplies them. Public CI fixtures are never delivered as trained models.
 
 For the portable ZIP, extract the complete `SARU_Picker_crYOLO` folder, place
-sidecars at the table's relative paths and run `SARU Picker crYOLO.exe`.
-The crYOLO profile prepares its runtime automatically when first needed. The
-EXE and `_internal` directory must stay together.
+sidecars at the paths above and run `SARU Picker crYOLO.exe`. The EXE and
+`_internal` directory must remain together. This also works offline.
 
-## Upgrade identity and runtime
+## Upgrade and inference behavior
 
-The existing crYOLO application GUID, internal executable name and
-`%LOCALAPPDATA%\Programs\SARU Picker crYOLO` folder are retained so this
-installer upgrades the previous 3.0 edition. Display names are neutral
-**SARU Picker 3.0**. Only that edition's obsolete shortcuts are replaced;
-the separate legacy SAM 2.9 installation remains independent.
-Detector preferences live at `%LOCALAPPDATA%\SARU_Picker\detector-settings.json`.
+Version remains **3.0.0**. The existing application GUID, internal executable
+name and `%LOCALAPPDATA%\Programs\SARU Picker crYOLO` folder are retained so
+Setup upgrades the previous 3.0 edition. The visible name is **SARU Picker 3.0**.
+Setup removes only this edition's obsolete bootstrap helper files and shortcuts.
+It leaves the old private Python environment, global Python, PATH and the
+separate legacy SAM 2.9 installation untouched. Detector preferences remain at
+`%LOCALAPPDATA%\SARU_Picker\detector-settings.json`.
 
-The official Python Software Foundation Python 3.7.9 package is bundled,
-verified by size and SHA-256, with its license in `Python37-LICENSE.txt`.
-Setup extracts that private interpreter without invoking a global Python
-installer, then obtains unmodified crYOLO 1.9.9, TensorFlow 1.15.4, Keras 2.3.1
-and compatible command-line dependencies. Source installs can download the
-same verified Python package automatically when it is not bundled.
-It leaves global Python, PATH and file associations unchanged. The runtime is
-`%LOCALAPPDATA%\SARU_Picker_crYOLO\cryolo-env\Scripts\python.exe`.
-A healthy existing managed runtime can be reused without network access.
-The install report is `runtime-install-report.json` in that parent folder.
-The application can repair a missing managed runtime when detection starts.
+The crYOLO profile now evaluates an export of the trained network with bundled
+ONNX Runtime 1.23.2 on CPU. A short-lived worker uses the same bundled EXE and
+supports cancellation; no external interpreter, TensorFlow or stock crYOLO
+installation is required. The model export does not retrain or change the
+learned weights. Release-specific numerical comparison and contour results
+belong in the supplied model record.
 
-### Recognition stall fix (22 November 2026)
+Known default H5 model selections migrate to the verified matching ONNX export.
+Custom H5 files require a matching exported model; they do not trigger a runtime
+installation. The previous **Repair crYOLO runtime** control is removed.
+Prediction errors retain diagnostics at
+`%LOCALAPPDATA%\SARU_Picker\cryolo-prediction.log`.
 
-This rebuild retains version 3.0.0 and the same four profiles and trained models.
-Recognition now reports runtime checking, prediction and contour refinement,
-with elapsed time. A failed or stalled check of an existing runtime no longer
-silently starts a lengthy reinstall during Detect. Runtime health checks are
-bounded in both the application and the Windows setup helper; prediction is
-cancellable and retains its diagnostic output on failure.
-
-If the existing runtime needs repair, select **Advanced → Repair crYOLO
-runtime**, wait for completion, then retry Detect. Escape cancels the operation.
-An absent runtime is still prepared automatically. Runtime setup requires an
-internet connection; ordinary detection with a healthy runtime does not.
-Prediction subprocesses run without a console window, avoiding interference
-with the selected micrograph. No checkpoint, threshold or contour rule changes
-are part of this fix.
-
-crYOLO software and general pretrained weights are obtained from upstream,
-not redistributed in this bundle. Its
-[research license](https://cryolo-doc.readthedocs.io/en/stable/other/license.html)
-applies. Optional upstream desktop GUI dependencies are omitted because SARU
-uses the command-line interface.
+ONNX Runtime and its third-party notices are bundled under their respective
+licenses. Stock crYOLO software and its general pretrained weights are not
+redistributed. Training dependencies retain their upstream licenses; this
+runtime change makes no claim to broaden those permissions.
 
 ## Build and verification
 
-Run `packaging/cryolo/build.ps1` on Windows with Python 3.12 x64 and Git. The
-build downloads the official SAM ViT-B checkpoint and verifies its pinned size
-and SHA-256 before including it. `packaging/cryolo/windows-version.txt` supplies
-fixed Windows version `3.0.0.0` and display version `3.0.0`; the installer also
-declares 3.0.0. The older files under `packaging/` are historical SAM build
-scaffolding; this release uses `packaging/cryolo/`.
+Run `packaging/cryolo/build.ps1` on Windows with Python 3.12 x64 and Git. Build
+preparation downloads pinned dependencies and verifies the official SAM ViT-B
+checkpoint's size and SHA-256. Network access is needed to prepare a build,
+not to install or use the completed application. `-TestInstaller` requires a
+disposable Windows host with permission to configure temporary firewall rules.
 
-The [Windows workflow](../../.github/workflows/build-cryolo-windows.yml) checks:
+`packaging/cryolo/windows-version.txt` sets Windows version `3.0.0.0` and display
+version `3.0.0`; Setup also declares 3.0.0. Older files directly under
+`packaging/` are historical SAM build scaffolding. This release uses
+`packaging/cryolo/`. Legacy runtime setup scripts remain source-only developer
+utilities and are excluded from the distribution.
 
-- Regression tests and actual Windows shared controls, including all four
-  selector values, backend routing and independent checkpoint paths.
-- Frozen and installed version metadata, default SAM profile, native libraries
-  and genuine SAM CPU inference.
-- Automatic private-runtime setup during installation, exact private-sidecar
-  copying and numerical inference using a synthetic appearance-model fixture.
-- Actual frozen EXE → isolated crYOLO process inference, catching Windows DLL
-  search-path conflicts between the bundled torch runtime and TensorFlow.
-- A separate clean private Python bootstrap with no supplied Python interpreter,
-  followed by stock PhosaurusNet and CLI inference on synthetic data.
+The [Windows workflow](../../.github/workflows/build-cryolo-windows.yml) requires:
 
-Generated synthetic H5 weights remain in temporary directories and are removed.
-These checks establish runtime operation, not capsid accuracy. No private
-training examples or trained weights are committed or uploaded by public CI.
+- Regression tests and real Windows controls, including all four selector
+  values, backend routing, independent model paths and DPI/work-area checks.
+- Frozen and installed version metadata, native libraries, and real SAM CPU
+  inference.
+- A generated tiny ONNX Conv graph that produces a positive detection through
+  the production worker and decoder, followed by learned contour refinement.
+  Source, frozen and installed execution must all succeed.
+- Separate positive/dense refinement, blank-image and cancellation checks.
+- An installation with outbound firewall rules for the installer and app,
+  followed by actual inference with sockets and external-runtime launches
+  forbidden by a verification guard. No legacy environment or setup report
+  may be created. Installation is limited to five minutes.
+- Exact private-sidecar copying, appearance-profile inference and removal of
+  obsolete owned runtime helpers during upgrade.
 
-Artifacts are `SARU-Picker-Setup-3.0.0-win64.exe`,
-`SARU-Picker-GUI-3.0.0-win64.zip`, `SHA256SUMS.txt`, `build-manifest.json`
-and source/frozen/installed verification reports. The delivered release record
-must identify the actual completed workflow run, commit and hashes; a previous
-crYOLO-only 3.0 binary is not evidence for this four-profile build.
+Synthetic models and images remain temporary and are removed. These checks
+establish packaging operation, not biological accuracy. Private training images,
+H5 checkpoints and exported models are never committed or uploaded by public CI.
+
+The installer artifact is separate from diagnostics and optional portable ZIP
+parts so each download stays within the connector size limit. Outputs include
+`SARU-Picker-Setup-3.0.0-win64.exe`, `SARU-Picker-GUI-3.0.0-win64.zip`,
+`SHA256SUMS.txt`, `download-manifest.json` and `build-manifest.json`.
+`source-onnx-smoke.json`, `frozen-onnx-smoke.json`,
+`installed-frozen-onnx-smoke.json` and `installed-offline-setup.json` record the
+new runtime checks; existing SAM, GUI, refinement, sidecar and PE version reports
+remain required. The release record must identify the completed workflow run,
+commit and hashes. An earlier external-runtime build is not evidence for this
+update.
 
 ## Model training provenance
 

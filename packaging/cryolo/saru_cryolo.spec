@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""SARU 3.0: bundled SAM runtime and a separately installed stock crYOLO runtime."""
+"""SARU 3.0: bundled SAM and offline ONNX CPU inference."""
 from pathlib import Path
 import hashlib
 import json
@@ -25,10 +25,10 @@ datas = [(str(icon), "assets"),
          (str(sam_model), "models"), (str(manifest_path), "models"),
          (str(notices), "licenses"),
          (str(project / "packaging" / "cryolo" / "QUICK_START.txt"), ".")]
-for name in ("numpy", "Pillow", "scipy", "PyAutoGUI", "pynput", "torch", "torchvision", "segment-anything"):
+for name in ("numpy", "Pillow", "scipy", "PyAutoGUI", "pynput", "torch", "torchvision", "segment-anything", "onnxruntime"):
     datas += copy_metadata(name)
 hiddenimports = collect_submodules("segment_anything") + [
-    "cryolo_recognition", "runtime_management", "pyautogui", "pyautogui._pyautogui_win", "pyscreeze", "pygetwindow",
+    "cryolo_recognition", "cryolo_onnx", "onnxruntime", "runtime_management", "pyautogui", "pyautogui._pyautogui_win", "pyscreeze", "pygetwindow",
     "pymsgbox", "pytweening", "mouseinfo", "pyperclip", "pyrect",
     "pynput", "pynput.keyboard", "pynput.mouse", "pynput.keyboard._win32", "pynput.mouse._win32", "pynput._util.win32",
     "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox", "tkinter.font",
@@ -38,7 +38,7 @@ hiddenimports = collect_submodules("segment_anything") + [
 a = Analysis([str(project / "packaging" / "cryolo" / "launcher.py")],
              pathex=[str(project), str(project / "packaging" / "cryolo")], binaries=[], datas=datas, hiddenimports=hiddenimports,
              hookspath=[], hooksconfig={}, runtime_hooks=[],
-             excludes=["tensorflow", "keras", "cryolo"], noarchive=False, optimize=0)
+             excludes=["tensorflow", "keras", "cryolo", "onnx"], noarchive=False, optimize=0)
 pyz = PYZ(a.pure)
 # Retain the owned filename so this installer upgrades the previous 3.0 edition.
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="SARU Picker crYOLO",

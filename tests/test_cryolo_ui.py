@@ -30,7 +30,7 @@ def model_fields(owner, choice="capsid"):
                                  cryolo_python=None, detector_settings_path=None)
     owner.tk = SimpleNamespace(TclError=RuntimeError)
     for name, value in {"detection_profile": choice, "sam_checkpoint": "sam.pth",
-                        "cryolo_checkpoint": "cryolo.h5", "cryolo_config": "cryolo.json",
+                        "cryolo_checkpoint": "cryolo.onnx", "cryolo_config": "cryolo.json",
                         "cryolo_threshold": ".3", "model_type": "vit_b", "device": "cpu",
                         "grid_side": 8, "min_capsid_area": "3500"}.items():
         setattr(owner, name, Variable(value))
@@ -95,7 +95,7 @@ def test_four_profiles_route_identically_in_cli_live_and_review(choice, backend,
     config = live._model_config()
     assert (args.backend, args.automatic_profile) == (backend, profile)
     assert (config.backend, config.automatic_profile) == (backend, profile)
-    assert config.checkpoint == ("cryolo.h5" if backend == "cryolo" else "sam.pth")
+    assert config.checkpoint == ("cryolo.onnx" if backend == "cryolo" else "sam.pth")
     review = review_fixture()
     review.detection_profile.set(choice)
     review._apply_model_settings()
@@ -146,6 +146,65 @@ def test_old_cryolo_interpreter_setting_is_not_restored():
         assert run.call_args.args[0].detection_profile == "capsid"
 
 
+def test_default_cryolo_model_uses_onnx_and_sam_profile_remains_default(tmp_path):
+    models = tmp_path / "models"
+    models.mkdir()
+    onnx = models / "cryolo-capsids.onnx"
+    onnx.write_bytes(b"model is validated in the worker")
+    with patch.object(app, "__file__", str(tmp_path / "app.py")), \
+         patch.object(sys, "frozen", False, create=True):
+        assert app.resolve_checkpoint(backend="cryolo") == onnx
+    args = app.build_parser().parse_args([])
+    owner = SimpleNamespace()
+    screen_app.initialize_detector_fields(owner, SimpleNamespace(StringVar=Variable, IntVar=Variable),
+                                          args, models / "sam_vit_b_01ec64.pth")
+    assert owner.detection_profile.get() == "capsid"
+    assert owner.cryolo_checkpoint.get() == str(onnx)
+    assert owner.sam_checkpoint.get().endswith("sam_vit_b_01ec64.pth")
+
+
+def test_saved_onnx_and_stale_legacy_json_are_preserved_without_loading_model(tmp_path):
+    save_detector_settings(tmp_path / "detector-settings.json", {
+        "detection_profile": "crYOLO", "cryolo_checkpoint": "chosen-model.onnx",
+        "cryolo_config": "old-install-missing-config.json"})
+    with patch.object(app, "user_state_directory", return_value=tmp_path), \
+         patch.object(app, "_run_application", return_value=0) as run:
+        assert app.main([]) == 0
+    args = run.call_args.args[0]
+    assert args.cryolo_checkpoint == "chosen-model.onnx"
+    assert args.cryolo_config == "old-install-missing-config.json"
+    assert args.detection_profile == "crYOLO"
+
+
+def test_onnx_diagnostics_identify_embedded_metadata_without_legacy_setup(tmp_path):
+    weights = tmp_path / "cryolo-capsids.h5"
+    onnx = weights.with_suffix(".onnx")
+    onnx.write_bytes(b"metadata validation belongs to inference")
+    config = RecognitionConfig(str(weights), backend="cryolo", cryolo_config="missing-old-config.json")
+    report = app.cryolo_diagnostic_report(tmp_path / "test.log", config)
+    assert report["inference_runtime"] == "onnxruntime"
+    assert Path(report["effective_checkpoint"]) == onnx
+    assert report["cryolo_config_required"] is False
+    assert "offline" in report["note"]
+    assert report["mode"] == "diagnostics"
+
+
+@pytest.mark.parametrize("override", ["argument", "environment"])
+@pytest.mark.parametrize("suffix", [".h5", ".onnx"])
+def test_diagnostics_match_explicit_legacy_override_without_loading_model(tmp_path, override, suffix):
+    onnx = tmp_path / "cryolo-capsids.onnx"
+    onnx.write_bytes(b"metadata validation belongs to inference")
+    weights = onnx.with_suffix(suffix)
+    config = RecognitionConfig(str(weights), backend="cryolo",
+                               cryolo_python="explicit-python" if override == "argument" else None)
+    environment = {"SARU_CRYOLO_PYTHON": "environment-python" if override == "environment" else ""}
+    with patch.dict(app.os.environ, environment):
+        report = app.cryolo_diagnostic_report(tmp_path / "test.log", config)
+    assert report["inference_runtime"] == ("legacy H5" if suffix == ".h5" else "onnxruntime")
+    assert report["cryolo_config_required"] is (suffix == ".h5")
+    assert Path(report["effective_checkpoint"]) == weights
+
+
 def test_invalid_unified_settings_fall_back_to_original_capsid():
     with tempfile.TemporaryDirectory() as directory, \
          patch.object(app, "user_state_directory", return_value=Path(directory)), \
@@ -163,10 +222,10 @@ def test_live_apply_retires_proposals_preserves_picks_and_separate_model_paths()
     assert picker.candidates == picker.alternatives == []
     assert picker.picked_points == {(11, 12), (21, 22)}
     assert picker.sam_checkpoint.get() == "sam.pth"
-    assert picker._model_config().checkpoint == "cryolo.h5"
+    assert picker._model_config().checkpoint == "cryolo.onnx"
     assert picker.args.backend == "cryolo"
     picker.detection_profile.set("generic")
-    picker._apply_model_settings(picker._model_config().__class__("cryolo.h5", backend="cryolo", automatic_profile="capsid-learned"))
+    picker._apply_model_settings(picker._model_config().__class__("cryolo.onnx", backend="cryolo", automatic_profile="capsid-learned"))
     assert picker._model_config().checkpoint == "sam.pth"
     assert picker._model_config().automatic_profile == "generic"
 
@@ -257,7 +316,7 @@ def test_live_settings_blocks_queued_clicks_on_previous_proposals():
 
 
 def test_cryolo_smoke_failure_is_error_and_never_falls_back_to_sam():
-    config = RecognitionConfig("model.h5", backend="cryolo")
+    config = RecognitionConfig("model.onnx", backend="cryolo")
     detector = Mock()
     detector.automatic.side_effect = RuntimeError("crYOLO runtime is missing")
     with patch.object(app, "create_recognizer", return_value=detector), \

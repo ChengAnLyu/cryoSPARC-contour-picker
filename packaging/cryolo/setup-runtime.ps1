@@ -14,7 +14,10 @@ param(
     [string]$Report = "",
     [switch]$ForcePrivatePython,
     [switch]$CheckOnly,
-    [switch]$Repair
+    [switch]$Repair,
+    [ValidateRange(1, 3600)][int]$LockTimeoutSeconds = 10,
+    [ValidateRange(1, 3600)][int]$CommandTimeoutSeconds = 480,
+    [ValidateRange(1, 7200)][int]$SetupTimeoutSeconds = 900
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -22,10 +25,103 @@ $ProgressPreference = "SilentlyContinue"
 if ($env:OS -ne "Windows_NT") { throw "This setup is for Windows x64." }
 if ($ForcePrivatePython -and $Python37) { throw "ForcePrivatePython cannot be combined with Python37." }
 
+function Assert-SetupTime {
+    if ([DateTime]::UtcNow -ge $script:SetupDeadline) {
+        throw "crYOLO setup exceeded its $SetupTimeoutSeconds-second limit during $($InstallReport.stage). See $ParentDirectory for command logs."
+    }
+}
+function Stop-SetupChild {
+    param([Diagnostics.Process]$Process)
+    if (-not $Process -or $Process.HasExited) { return }
+    # Only the child tree created by this setup is eligible for termination.
+    $TaskKill = if ($env:SystemRoot) { Join-Path $env:SystemRoot 'System32\taskkill.exe' } else { '' }
+    if ($TaskKill -and (Test-Path -LiteralPath $TaskKill)) {
+        $Killer = $null
+        try {
+            $Killer = Start-Process -FilePath $TaskKill -ArgumentList @('/PID', $Process.Id, '/T', '/F') -PassThru -NoNewWindow
+            if (-not $Killer.WaitForExit(5000)) { $Killer.Kill() }
+        } catch {
+            Write-Warning 'Process-tree termination failed; stopping the direct setup child.'
+        } finally {
+            if ($Killer) { $Killer.Dispose() }
+        }
+    }
+    if (-not $Process.HasExited) { $Process.Kill() }
+    if (-not $Process.WaitForExit(5000)) { throw 'The setup child process could not be stopped.' }
+}
+function ConvertTo-NativeArgument {
+    param([string]$Value)
+    # Windows CRT quoting: double backslashes before quotes and before the close.
+    $Escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $Escaped = [regex]::Replace($Escaped, '(\\+)$', '$1$1')
+    return '"' + $Escaped + '"'
+}
 function Invoke-Checked {
-    param([string]$Program, [string[]]$Arguments)
-    & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "Command failed with exit code ${LASTEXITCODE}: $Program" }
+    param([string]$Program, [string[]]$Arguments, [int]$TimeoutSeconds = $CommandTimeoutSeconds)
+    Assert-SetupTime
+    $script:CommandSequence++
+    $Prefix = Join-Path $ParentDirectory ('runtime-command-{0:00}' -f $script:CommandSequence)
+    $OutputLog = "$Prefix.out.log"
+    $ErrorLog = "$Prefix.err.log"
+    $ArgumentLine = ($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+    $Child = $null
+    try {
+        $Child = Start-Process -FilePath $Program -ArgumentList $ArgumentLine -PassThru -NoNewWindow -RedirectStandardOutput $OutputLog -RedirectStandardError $ErrorLog
+        $null = $Child.Handle
+        $CommandStarted = [DateTime]::UtcNow
+        $CommandDeadline = $CommandStarted.AddSeconds($TimeoutSeconds)
+        $InstallReport.command = @{ program = $Program; pid = $Child.Id; stdout_log = $OutputLog; stderr_log = $ErrorLog }
+        Save-Report
+        $NextProgress = [DateTime]::MinValue
+        while (-not $Child.WaitForExit(250)) {
+            Assert-SetupTime
+            if ([DateTime]::UtcNow -ge $CommandDeadline) { throw "The $($InstallReport.stage) command exceeded $TimeoutSeconds seconds. See $OutputLog and $ErrorLog." }
+            if ([DateTime]::UtcNow -ge $NextProgress) {
+                $InstallReport.command.elapsed_seconds = [int]([DateTime]::UtcNow - $CommandStarted).TotalSeconds
+                Save-Report
+                Write-Host "crYOLO $($InstallReport.stage): $($InstallReport.command.elapsed_seconds)s elapsed. Log: $OutputLog"
+                $NextProgress = [DateTime]::UtcNow.AddSeconds(5)
+            }
+        }
+        $ExitCode = $Child.ExitCode
+        if ($null -eq $ExitCode -or $ExitCode -ne 0) { throw "Command failed with exit code ${ExitCode}: $Program. See $ErrorLog." }
+        Assert-SetupTime
+    } finally {
+        if ($Child) {
+            try { Stop-SetupChild $Child } finally { $Child.Dispose() }
+        }
+    }
+}
+function Get-BoundedDownload {
+    param([string]$Uri, [string]$Destination, [int]$TimeoutSeconds = 300)
+    Assert-SetupTime
+    $Client = New-Object Net.WebClient
+    try {
+        $Task = $Client.DownloadFileTaskAsync([Uri]$Uri, $Destination)
+        $StartedDownload = [DateTime]::UtcNow
+        $DownloadDeadline = $StartedDownload.AddSeconds($TimeoutSeconds)
+        $NextProgress = [DateTime]::MinValue
+        while (-not $Task.IsCompleted) {
+            Assert-SetupTime
+            if ([DateTime]::UtcNow -ge $DownloadDeadline) { throw "Download exceeded $TimeoutSeconds seconds: $Uri" }
+            if ([DateTime]::UtcNow -ge $NextProgress) {
+                $Downloaded = 0
+                if (Test-Path -LiteralPath $Destination) { $Downloaded = (Get-Item -LiteralPath $Destination).Length }
+                $InstallReport.download = @{ url = $Uri; bytes = $Downloaded; elapsed_seconds = [int]([DateTime]::UtcNow - $StartedDownload).TotalSeconds }
+                Save-Report
+                Write-Host "crYOLO $($InstallReport.stage): downloaded $Downloaded bytes."
+                $NextProgress = [DateTime]::UtcNow.AddSeconds(5)
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        $Task.GetAwaiter().GetResult()
+        $InstallReport.download = @{ url = $Uri; bytes = (Get-Item -LiteralPath $Destination).Length; completed_utc = [DateTime]::UtcNow.ToString('o') }
+        Save-Report
+        Assert-SetupTime
+    } finally {
+        $Client.CancelAsync()
+        $Client.Dispose()
+    }
 }
 function Read-Health {
     $script:HealthFailure = $null
@@ -35,15 +131,18 @@ function Read-Health {
     $ProbeProgress = Join-Path $ParentDirectory "runtime-health-progress.json"
     $Arguments = '"' + (Join-Path $PSScriptRoot "runtime_health.py") + '" --progress-report "' + $ProbeProgress + '"'
     try {
+        Assert-SetupTime
         $Probe = Start-Process -FilePath $RuntimePython -ArgumentList $Arguments -PassThru -NoNewWindow -RedirectStandardOutput $ProbeOutput -RedirectStandardError $ProbeError
         # Keep the native process handle while it is alive. Windows PowerShell
         # Start-Process can otherwise lose ExitCode after a short-lived child exits.
         # Process.ExitCode requires a valid local process handle (Microsoft .NET).
         $null = $Probe.Handle
-        if (-not $Probe.WaitForExit(120000)) {
+        $HealthWait = [int][Math]::Min(120000, [Math]::Max(1, ($script:SetupDeadline - [DateTime]::UtcNow).TotalMilliseconds))
+        if (-not $Probe.WaitForExit($HealthWait)) {
             $Probe.Kill()
             if (-not $Probe.WaitForExit(5000)) { throw 'The runtime health process did not stop after cancellation.' }
-            $script:HealthFailure = @{ status = 'timeout'; error = 'The crYOLO runtime health check exceeded 120 seconds.'; log = $ProbeError }
+            $HealthSeconds = [int][Math]::Ceiling($HealthWait / 1000.0)
+            $script:HealthFailure = @{ status = 'timeout'; error = "The crYOLO runtime health check exceeded $HealthSeconds seconds."; log = $ProbeError }
             $script:HealthFailure | ConvertTo-Json | Set-Content -LiteralPath $ProbeOutput -Encoding UTF8
             return $null
         }
@@ -81,7 +180,7 @@ function Ensure-BackendWeights {
     $Expected = "0eb044b4018be4b8c530389843d9650569751439fdab2880f3020e65ff2ff358"
     if ((Test-Path -LiteralPath $Backend) -and ((Get-FileHash -LiteralPath $Backend -Algorithm SHA256).Hash.ToLowerInvariant() -eq $Expected)) { return }
     $Temporary = "$Backend.download"
-    Invoke-WebRequest -Uri "https://ndownloader.figshare.com/files/16406843" -OutFile $Temporary -UseBasicParsing
+    Get-BoundedDownload "https://ndownloader.figshare.com/files/16406843" $Temporary
     if ((Get-FileHash -LiteralPath $Temporary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Expected) {
         Remove-Item -LiteralPath $Temporary -Force
         throw "The upstream crYOLO initialization weights failed their checksum."
@@ -125,6 +224,9 @@ function Copy-PrivateVCRuntime {
 }
 
 $Lock = $null
+$OwnLock = $false
+$script:CommandSequence = 0
+$script:SetupDeadline = [DateTime]::UtcNow.AddSeconds($SetupTimeoutSeconds)
 $InstallReport = $null
 $OldEnvironment = @{}
 foreach ($Name in @('CUDA_VISIBLE_DEVICES', 'TF_CPP_MIN_LOG_LEVEL', 'OMP_NUM_THREADS', 'PYTHONNOUSERSITE', 'PYTHONPATH', 'PYTHONHOME', 'PIP_CONFIG_FILE', 'PSModulePath')) {
@@ -159,15 +261,28 @@ try {
         scope = "private CPU runtime and upstream initialization weights; no trained capsid model" }
     $InstallReport.powershell_version = $PSVersionTable.PSVersion.ToString()
     $InstallReport.powershell_module_root = $HostModuleRoot
-    # An interrupted process releases the OS lock; first-use and installer serialize.
-    $Deadline = [DateTime]::UtcNow.AddMinutes(45)
+    # A second installer/repair must not queue for most of an hour.
+    $LockOwner = Join-Path $ParentDirectory 'runtime-setup-owner.json'
+    $InstallReport.stage = 'waiting for setup lock'
+    $Deadline = [DateTime]::UtcNow.AddSeconds($LockTimeoutSeconds)
     while (-not $Lock) {
         try { $Lock = [IO.File]::Open((Join-Path $ParentDirectory "runtime-setup.lock"), 'OpenOrCreate', 'ReadWrite', 'None') }
         catch [IO.IOException] {
-            if ([DateTime]::UtcNow -gt $Deadline) { throw "Another crYOLO setup is still running." }
+            if (($_.Exception.HResult -band 0xffff) -notin @(11, 32, 33)) { throw }
+            if ([DateTime]::UtcNow -ge $Deadline) {
+                $Owner = ''
+                if (Test-Path -LiteralPath $LockOwner) { $Owner = Get-Content -LiteralPath $LockOwner -Raw }
+                throw "Another crYOLO setup is still running. Finish or cancel it before retrying. Owner: $Owner"
+            }
+            Write-Host 'Waiting for the other crYOLO installer or repair to finish...'
             Start-Sleep -Milliseconds 500
         }
     }
+    $OwnLock = $true
+    @{ pid = $PID; started_utc = $Started; runtime_directory = $RuntimeDirectory } | ConvertTo-Json | Set-Content -LiteralPath $LockOwner -Encoding UTF8
+    $InstallReport.stage = 'health-check'
+    Save-Report
+    Assert-SetupTime
     $env:CUDA_VISIBLE_DEVICES = ""
     $env:TF_CPP_MIN_LOG_LEVEL = "2"
     $env:OMP_NUM_THREADS = "4"
@@ -219,8 +334,8 @@ try {
         $BaseHealthy = $false
         if (Test-Path -LiteralPath $Python37 -PathType Leaf) {
             try {
-                & $Python37 -c "import sys,struct,venv,ensurepip; assert sys.version_info[:2] == (3,7) and struct.calcsize('P') == 8" 2>$null
-                $BaseHealthy = $LASTEXITCODE -eq 0
+                Invoke-Checked $Python37 @('-c', "import sys,struct,venv,ensurepip; assert sys.version_info[:2] == (3,7) and struct.calcsize('P') == 8") -TimeoutSeconds 30
+                $BaseHealthy = $true
             } catch { $BaseHealthy = $false }
         }
         if (-not $BaseHealthy) {
@@ -244,7 +359,7 @@ try {
                 Copy-Item -LiteralPath $BundledPackage -Destination $Package -Force
                 $InstallReport.python_package_source = 'bundled'
             } elseif (-not (Test-Path -LiteralPath $Package) -or (Get-FileHash -LiteralPath $Package -Algorithm SHA256).Hash.ToLowerInvariant() -ne $PythonHash) {
-                Invoke-WebRequest -Uri $PythonUrl -OutFile $Package -UseBasicParsing
+                Get-BoundedDownload $PythonUrl $Package -TimeoutSeconds 120
                 $InstallReport.python_package_source = 'upstream-download'
             } else {
                 $InstallReport.python_package_source = 'verified-cache'
@@ -262,14 +377,17 @@ try {
     Invoke-Checked $Python37 @('-c', "import sys,struct; assert sys.version_info[:2] == (3,7) and struct.calcsize('P') == 8, 'Python 3.7 x64 is required'")
     $InstallReport.base_python = $Python37
     # venv repairs its own missing files in place; no recursive removal of any folder.
-    Invoke-Checked $Python37 @('-m', 'venv', $RuntimeDirectory)
+    Invoke-Checked $Python37 @('-m', 'venv', $RuntimeDirectory) -TimeoutSeconds 180
     Copy-PrivateVCRuntime (Join-Path $RuntimeDirectory 'Scripts')
     if ($BaseDirectory) { Copy-PrivateVCRuntime $BaseDirectory }
     $InstallReport.stage = "packages"
     Save-Report
-    Invoke-Checked $RuntimePython @('-m', 'pip', '--isolated', 'install', 'pip==24.0', 'setuptools==65.6.3', 'wheel==0.42.0')
-    Invoke-Checked $RuntimePython @('-m', 'pip', '--isolated', 'install', '--force-reinstall', '-r', (Join-Path $PSScriptRoot 'runtime-requirements-windows.txt'))
-    Invoke-Checked $RuntimePython @('-m', 'pip', '--isolated', 'install', '--force-reinstall', '--no-deps', '--no-build-isolation', 'cryolo==1.9.9', 'GooeyDev==1.0.8b5', 'lineenhancer==1.0.9.dev2', 'cryoloBM==1.6.1')
+    $PipLog = Join-Path $ParentDirectory 'runtime-pip.log'
+    Set-Content -LiteralPath $PipLog -Value '' -Encoding UTF8
+    $PipArguments = @('-m', 'pip', '--isolated', '--no-input', '--disable-pip-version-check', '--timeout', '15', '--retries', '1', '--log', $PipLog)
+    Invoke-Checked $RuntimePython ($PipArguments + @('install', 'pip==24.0', 'setuptools==65.6.3', 'wheel==0.42.0'))
+    Invoke-Checked $RuntimePython ($PipArguments + @('install', '--force-reinstall', '-r', (Join-Path $PSScriptRoot 'runtime-requirements-windows.txt')))
+    Invoke-Checked $RuntimePython ($PipArguments + @('install', '--force-reinstall', '--no-deps', '--no-build-isolation', 'cryolo==1.9.9', 'GooeyDev==1.0.8b5', 'lineenhancer==1.0.9.dev2', 'cryoloBM==1.6.1'))
     $InstallReport.stage = "initialization-weights"
     Save-Report
     Ensure-BackendWeights
@@ -299,5 +417,6 @@ try {
     exit 1
 } finally {
     foreach ($Name in $OldEnvironment.Keys) { [Environment]::SetEnvironmentVariable($Name, $OldEnvironment[$Name], 'Process') }
+    if ($OwnLock -and (Test-Path -LiteralPath $LockOwner)) { Remove-Item -LiteralPath $LockOwner -Force }
     if ($Lock) { $Lock.Dispose() }
 }

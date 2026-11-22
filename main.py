@@ -4,6 +4,231 @@ Generated from the companion tested modules. Run python main.py --help.
 """
 from __future__ import annotations
 
+_SARU_STANDALONE = True
+
+
+# ---------------- cryolo_onnx.py ----------------
+
+import argparse
+from contextlib import redirect_stdout, redirect_stderr
+import hashlib
+import json
+import math
+from pathlib import Path
+import sys
+import time
+
+import numpy as np
+from PIL import Image
+
+ONNX_FORMAT = "saru-cryolo-onnx-v1"
+STANDARD_H5_SHA256 = "a883be0bf39f0a93b0e2c36441c062fac5ab3672c044a7cf0703dc01853d3761"
+
+
+def resolve_onnx_checkpoint(checkpoint) -> Path | None:
+    """Resolve paths without loading a model, hashing files or importing ORT.
+
+    Only the known standard H5 filename can migrate to a sibling ONNX file.
+    The worker verifies its source identity before executing that migration.
+    """
+    path = Path(checkpoint).expanduser()
+    if path.suffix.lower() == ".onnx":
+        return path
+    if path.name.lower() == "cryolo-capsids.h5":
+        candidate = path.with_suffix(".onnx")
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def validate_metadata(raw, *, expected_source_sha256=None, source_h5=None):
+    """Accept only the explicit, tested full-frame capsid export contract."""
+    if not isinstance(raw, str) or len(raw) > 65536:
+        raise ValueError("The ONNX model is missing valid SARU detector metadata.")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("The ONNX detector metadata must be a JSON object.")
+    required = {
+        "format": ONNX_FORMAT, "architecture": "PhosaurusNet",
+        "input_size": [320, 320], "input_layout": "NHWC", "output_layout": "NHWAC",
+        "normalization": "STANDARD", "labels": ["particle"], "filament_model": False,
+        "nms_threshold": .3, "estimated_size_rounding": "truncate",
+        "extraction_box_size": 1, "preprocessing": "pil-grayscale-bilinear-standard-v1",
+    }
+    for name, expected in required.items():
+        if data.get(name) != expected:
+            raise ValueError(f"Unsupported ONNX detector metadata: {name}.")
+    for name in ("input_name", "output_name"):
+        if not isinstance(data.get(name), str) or not data[name]:
+            raise ValueError(f"Missing ONNX tensor name: {name}.")
+    if not isinstance(data.get("opset"), int) or not 13 <= data["opset"] <= 18:
+        raise ValueError("Unsupported ONNX export version.")
+    anchors = data.get("anchors")
+    if (not isinstance(anchors, list) or len(anchors) != 2
+            or any(isinstance(x, bool) or not isinstance(x, (float, int))
+                   or not math.isfinite(x) or not 0 < x < 100 for x in anchors)):
+        raise ValueError("The ONNX model requires two finite learned anchor values.")
+    source = data.get("source_h5_sha256")
+    if (not isinstance(source, str) or len(source) != 64
+            or any(char not in "0123456789abcdef" for char in source)):
+        raise ValueError("The ONNX model has no valid source checkpoint identity.")
+    if expected_source_sha256 is not None and source != expected_source_sha256:
+        raise ValueError("The ONNX model does not match the saved standard crYOLO checkpoint. Install the matching offline model bundle.")
+    if source_h5 is not None and file_sha256(source_h5) != source:
+        raise ValueError("The ONNX model does not match the selected H5 weights. Select the matching ONNX model explicitly.")
+    return data
+
+
+def preprocess_image(rgb):
+    """Pillow grayscale/bilinear preprocessing and the trained STANDARD scale."""
+    image = Image.fromarray(np.asarray(rgb, dtype=np.uint8)).convert("L")
+    image = image.resize((320, 320), resample=Image.Resampling.BILINEAR)
+    values = np.asarray(image, dtype=np.float32)
+    denominator = np.float32(6 * float(values.std()) + 1e-6)
+    normalized = (values - values.mean()) / denominator
+    return np.ascontiguousarray(normalized[None, ..., None])
+
+
+def decode_detections(raw, image_shape, anchors, threshold=.3, nms_threshold=.3):
+    """Decode raw network outputs to the detector ROIs used by SARU contours."""
+    logits = np.asarray(raw, dtype=np.float32)
+    if logits.shape != (1, 20, 20, 1, 6) or not np.isfinite(logits).all():
+        raise ValueError("The detector returned an invalid raw tensor.")
+    if not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("Confidence threshold must be between zero and one.")
+    height, width = image_shape
+    if height < 1 or width < 1:
+        raise ValueError("Input image dimensions must be positive.")
+    grid_h, grid_w = logits.shape[1:3]
+    values = logits[0, :, :, 0]
+    with np.errstate(over="ignore"):
+        activated = np.float32(1) / (np.float32(1) + np.exp(-values[..., [0, 1, 4]]))
+        extent = np.exp(values[..., 2:4])
+    if not np.isfinite(extent).all():
+        raise ValueError("The detector returned non-finite box dimensions.")
+    xnorm = ((np.arange(grid_w)[None, :] + activated[..., 0]) / grid_w).astype(np.float32)
+    ynorm = ((np.arange(grid_h)[:, None] + activated[..., 1]) / grid_h).astype(np.float32)
+    wnorm = extent[..., 0] * np.float32(anchors[0]) / np.float32(grid_w)
+    hnorm = extent[..., 1] * np.float32(anchors[1]) / np.float32(grid_h)
+    # Preserve the float32 full-tile coordinate round trip before converting
+    # to pixels. Legacy NumPy used float64 for scalar pixel multiplication.
+    xnorm = xnorm * np.float32(width) / np.float32(width)
+    ynorm = ynorm * np.float32(height) / np.float32(height)
+    wnorm = wnorm * np.float32(width) / np.float32(width)
+    hnorm = hnorm * np.float32(height) / np.float32(height)
+    confidence = activated[..., 2].reshape(-1)
+    regions = np.stack((xnorm, ynorm, wnorm, hnorm), axis=-1).reshape(-1, 4).astype(np.float64)
+    eligible = np.flatnonzero(confidence > min(.1, threshold))
+    if not len(eligible):
+        return []
+    order = eligible[np.argsort(confidence[eligible], kind="quicksort")[::-1]]
+    lower = regions[:, :2] - regions[:, 2:] / 2
+    upper = regions[:, :2] + regions[:, 2:] / 2
+    areas = np.prod(regions[:, 2:], axis=1)
+    retained = []
+    while len(order):
+        chosen, others = order[0], order[1:]
+        retained.append(int(chosen))
+        overlap = np.maximum(0, np.minimum(upper[chosen], upper[others]) - np.maximum(lower[chosen], lower[others]))
+        intersection = np.prod(overlap, axis=1)
+        iou = intersection / (areas[chosen] + areas[others] - intersection)
+        order = others[iou < nms_threshold]
+    result = []
+    for index in retained:
+        score = float(confidence[index])
+        if score < threshold:
+            continue
+        cx, cy, bw, bh = regions[index] * np.array([width, height, width, height], dtype=np.float64)
+        # Match the 1px extraction-box border rule. Learned extents, including
+        # partially clipped targets, remain independent of that extraction box.
+        if not (.5 <= cx < width - .5 and .5 < cy <= height - .5):
+            continue
+        bw, bh = int(bw), int(bh)
+        if bw <= 0 or bh <= 0:
+            raise ValueError("The detector returned nonpositive estimated dimensions.")
+        result.append({"x0": cx-bw/2, "y0": cy-bh/2, "x1": cx+bw/2,
+                       "y1": cy+bh/2, "confidence": score})
+    return sorted(result, key=lambda box: (-box["confidence"], box["y0"], box["x0"]))
+
+
+def run_prediction(model, image_path, *, threshold=.3, cpu_threads=4,
+                   expected_source_sha256=None, source_h5=None):
+    import onnxruntime as ort
+    ort.disable_telemetry_events()
+    if not 1 <= cpu_threads <= 64:
+        raise ValueError("CPU thread count must be between 1 and 64.")
+    started = time.monotonic()
+    print("Loading offline crYOLO model", flush=True)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = cpu_threads
+    options.inter_op_num_threads = 1
+    session = ort.InferenceSession(str(model), sess_options=options, providers=["CPUExecutionProvider"])
+    metadata = validate_metadata(session.get_modelmeta().custom_metadata_map.get("saru_cryolo"),
+                                 expected_source_sha256=expected_source_sha256, source_h5=source_h5)
+    inputs, outputs = session.get_inputs(), session.get_outputs()
+    if (len(inputs) != 1 or inputs[0].name != metadata["input_name"] or inputs[0].type != "tensor(float)"
+            or inputs[0].shape[1:] != [320, 320, 1]
+            or len(outputs) != 1 or outputs[0].name != metadata["output_name"]
+            or outputs[0].type != "tensor(float)" or outputs[0].shape[1:] != [20, 20, 1, 6]):
+        raise ValueError("ONNX tensor signatures do not match the exported detector metadata.")
+    with Image.open(image_path) as image:
+        rgb = np.asarray(image.convert("RGB"))
+    print("Running offline crYOLO prediction", flush=True)
+    raw = session.run([metadata["output_name"]], {metadata["input_name"]: preprocess_image(rgb)})[0]
+    detections = decode_detections(raw, rgb.shape[:2], metadata["anchors"], threshold, metadata["nms_threshold"])
+    return {"format": "saru-cryolo-detections-v1", "runtime_format": "onnx",
+            "runtime": "onnxruntime-cpu", "runtime_version": ort.__version__,
+            "source_h5_sha256": metadata["source_h5_sha256"], "model_sha256": file_sha256(model),
+            "image_shape": list(rgb.shape[:2]), "detections": detections,
+            "elapsed_seconds": time.monotonic()-started}
+
+
+def _execute_worker(args):
+    try:
+        result = run_prediction(args.model, args.input, threshold=args.threshold, cpu_threads=args.cpu_threads,
+                                source_h5=args.source_h5, expected_source_sha256=args.expected_source_sha256)
+        args.output.write_text(json.dumps(result, allow_nan=False), encoding="utf-8")
+        print(f"Offline crYOLO completed: {len(result['detections'])} detections", flush=True)
+        return 0
+    except Exception as exc:
+        print(f"Offline crYOLO prediction failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return 1
+
+
+def onnx_worker_main(argv=None):
+    parser = argparse.ArgumentParser(description="Isolated offline crYOLO prediction worker")
+    parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--threshold", type=float, default=.3)
+    parser.add_argument("--cpu-threads", type=int, default=4)
+    parser.add_argument("--source-h5", type=Path)
+    parser.add_argument("--expected-source-sha256")
+    parser.add_argument("--log", type=Path)
+    args = parser.parse_args(argv)
+    if args.log is not None:
+        # Frozen console=False workers have sys.stdout/stderr=None even when
+        # OS handles are redirected. An explicit stream retains useful errors.
+        with args.log.open("a", encoding="utf-8", buffering=1) as stream:
+            with redirect_stdout(stream), redirect_stderr(stream):
+                return _execute_worker(args)
+    return _execute_worker(args)
+
+
+main = onnx_worker_main
+
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["--cryolo-onnx-worker"]:
+    raise SystemExit(onnx_worker_main(sys.argv[2:]))
 
 # ---------------- application_icon.py ----------------
 
@@ -2764,6 +2989,7 @@ def repair_cryolo_runtime(*, cancel=None, progress=None) -> Path:
 # ---------------- cryolo_recognition.py ----------------
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import copy
 import json
 import logging
@@ -2774,6 +3000,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Sequence
@@ -2954,11 +3181,51 @@ def read_cbox(path: str | Path, image_shape, threshold: float) -> list[CryoloBox
         raise RecognitionError(f"Malformed crYOLO CBOX output: {exc}") from exc
 
 
-def _stop_process(process):
+def read_onnx_detections(path, image_shape):
+    """Validate the bounded worker protocol before accepting any detector ROI."""
+    path = Path(path)
+    try:
+        if not path.is_file():
+            raise ValueError("the prediction worker did not produce its result")
+        if path.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("the prediction result exceeds 2 MiB")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict) or data.get("format") != "saru-cryolo-detections-v1"
+                or data.get("runtime_format") != "onnx" or data.get("image_shape") != list(image_shape)):
+            raise ValueError("the prediction result does not match the input image")
+        rows = data.get("detections")
+        if not isinstance(rows, list) or len(rows) > 400:
+            raise ValueError("invalid detection list")
+        boxes = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("invalid detection record")
+            values = [row[name] for name in ("x0", "y0", "x1", "y1", "confidence")]
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
+                raise ValueError("invalid detection coordinates or confidence")
+            box = CryoloBox(*values)
+            if (box.x0 >= box.x1 or box.y0 >= box.y1 or not 0 <= box.confidence <= 1
+                    or not 0 <= (box.x0+box.x1)/2 <= image_shape[1]
+                    or not 0 <= (box.y0+box.y1)/2 <= image_shape[0]):
+                raise ValueError("invalid detection extent")
+            boxes.append(box)
+        return sorted(boxes, key=lambda box: (-box.confidence, box.y0, box.x0)), data
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RecognitionError(f"Invalid offline crYOLO output: {exc}") from exc
+
+
+def _stop_process(process, *, terminate_tree=True):
     """Stop only this request's process group, including preprocessing workers."""
     if process.poll() is not None:
         return
-    if os.name != "nt":
+    if not terminate_tree:
+        # The bundled ONNX worker has no child processes. Terminate it directly
+        # without requiring an external command or affecting other app windows.
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    elif os.name != "nt":
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -2977,7 +3244,7 @@ def _stop_process(process):
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        if os.name != "nt":
+        if os.name != "nt" and terminate_tree:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -3003,10 +3270,23 @@ class CryoloRecognizer:
         self._profile = None
         self._process = None
         self.last_prediction_log = None
+        self._runtime_format = "onnx" if self._selected_onnx_checkpoint() else "legacy"
+        self._prediction_metadata = None
+
+    def _selected_onnx_checkpoint(self):
+        explicit_runtime = self.config.cryolo_python or os.environ.get("SARU_CRYOLO_PYTHON")
+        if Path(self.config.checkpoint).suffix.lower() == ".h5" and explicit_runtime:
+            return None
+        return resolve_onnx_checkpoint(self.config.checkpoint)
 
     def _paths(self, cancel=None, progress=None):
         _report_progress(progress, "Checking crYOLO model files")
         weights = Path(self.config.checkpoint).expanduser().resolve()
+        python_value = getattr(self.config, "cryolo_python", None) or os.environ.get("SARU_CRYOLO_PYTHON")
+        if not python_value:
+            raise RecognitionError("This H5 checkpoint needs the matching offline ONNX model bundle. "
+                                   "Select cryolo-capsids.onnx or place it beside cryolo-capsids.h5. "
+                                   "Legacy H5 inference requires an explicit --cryolo-python runtime.")
         config_value = getattr(self.config, "cryolo_config", None)
         config_path = (Path(config_value).expanduser().resolve() if config_value
                        else weights.with_name("cryolo-config.json"))
@@ -3020,21 +3300,13 @@ class CryoloRecognizer:
                 raise ValueError("Missing model configuration.")
         except (OSError, ValueError) as exc:
             raise RecognitionError(f"Invalid crYOLO configuration: {exc}") from exc
-        python_value = getattr(self.config, "cryolo_python", None) or os.environ.get("SARU_CRYOLO_PYTHON")
-        if not python_value:
-            try:
-                python_value = str(ensure_cryolo_runtime(
-                    cancel=cancel, progress=lambda message: _report_progress(progress, message)))
-            except RuntimeSetupCancelled as exc:
-                raise Cancelled(str(exc)) from exc
-            except (RuntimeSetupError, OSError) as exc:
-                raise RecognitionError(f"Could not prepare the crYOLO runtime: {exc}") from exc
         _check_cancel(cancel)
         executable = shutil.which(str(python_value))
         if executable is None and Path(python_value).expanduser().is_file():
             executable = os.path.abspath(os.path.expanduser(python_value))
         if not executable:
-            raise RecognitionError(f"The configured crYOLO runtime was not found: {python_value}. Run SARU Picker Setup to repair the runtime, or correct the explicit --cryolo-python override.")
+            raise RecognitionError(f"The configured legacy crYOLO runtime was not found: {python_value}. "
+                                   "Correct the explicit --cryolo-python override or select the bundled ONNX model.")
         # Keep the venv executable spelling: resolving its symlink would
         # bypass pyvenv.cfg and lose the separately installed crYOLO packages.
         executable = os.path.abspath(executable)
@@ -3042,9 +3314,26 @@ class CryoloRecognizer:
 
     def _predict(self, rgb, cancel, progress=None):
         _check_cancel(cancel)
-        executable, weights, config_path = self._paths(cancel, progress)
+        onnx_path = self._selected_onnx_checkpoint()
+        source_h5 = None
+        if onnx_path is not None:
+            _report_progress(progress, "Checking offline crYOLO model")
+            weights = onnx_path.resolve()
+            if not weights.is_file():
+                raise RecognitionError(f"Offline crYOLO model not found: {weights}. Install the matching offline model bundle.")
+            if self.config.device == "cuda":
+                raise RecognitionError("The bundled offline crYOLO engine uses CPU. Choose Auto or CPU for this model.")
+            selected = Path(self.config.checkpoint).expanduser().resolve()
+            source_h5 = selected if selected.suffix.lower() == ".h5" and selected.is_file() else None
+            executable, config_path = sys.executable, None
+            signature_paths = (weights,) + ((source_h5,) if source_h5 is not None else ())
+            self._runtime_format, self.device = "onnx", "cpu"
+        else:
+            executable, weights, config_path = self._paths(cancel, progress)
+            signature_paths = (weights, config_path)
+            self._runtime_format = "legacy"
         signature = tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns)
-                          for p in (weights, config_path))
+                          for p in signature_paths)
         key = _image_key(rgb)
         if key == self._key and signature == self._artifact_signature and self._boxes is not None:
             _report_progress(progress, "Using cached crYOLO detections")
@@ -3061,18 +3350,39 @@ class CryoloRecognizer:
             # The screenshot is top-left origin. crYOLO's PNG loader keeps this
             # orientation; its CBOX exporter flips Y to bottom-left coordinates.
             Image.fromarray(rgb).convert("L").save(inputs / "screen.png")
-            command = [executable, "-m", "cryolo.predict", "-c", str(config_path),
-                       "-w", str(weights), "-i", str(inputs), "-o", str(output),
-                       "-t", str(threshold), "-pbs", "1", "--num_cpu",
-                       str(self.config.cpu_threads), "--write_empty"]
+            process_directory = folder
+            result_path = folder / "detections.json"
+            if onnx_path is not None:
+                if getattr(sys, "frozen", False):
+                    command = [executable, "--cryolo-onnx-worker"]
+                elif globals().get("_SARU_STANDALONE", False):
+                    command = [executable, str(Path(__file__).resolve()), "--cryolo-onnx-worker"]
+                else:
+                    command = [executable, "-m", "cryolo_onnx"]
+                command += ["--model", str(weights), "--input", str(inputs / "screen.png"),
+                            "--output", str(result_path), "--threshold", str(threshold),
+                            "--cpu-threads", str(self.config.cpu_threads)]
+                if Path(self.config.checkpoint).suffix.lower() == ".h5":
+                    command += ["--expected-source-sha256", STANDARD_H5_SHA256]
+                    if source_h5 is not None:
+                        command += ["--source-h5", str(source_h5)]
+                if not getattr(sys, "frozen", False):
+                    # Absolute request paths keep image/output isolation while
+                    # the source worker module remains importable without PYTHONPATH.
+                    process_directory = Path(__file__).resolve().parent
+            else:
+                command = [executable, "-m", "cryolo.predict", "-c", str(config_path),
+                           "-w", str(weights), "-i", str(inputs), "-o", str(output),
+                           "-t", str(threshold), "-pbs", "1", "--num_cpu",
+                           str(self.config.cpu_threads), "--write_empty"]
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             env.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-            if self.config.device == "cpu":
+            if self.config.device == "cpu" and onnx_path is None:
                 # crYOLO 1.9.9 strips the minus sign from `-g -1`; use the
                 # TensorFlow/CUDA environment control and leave -g unspecified.
                 env["CUDA_VISIBLE_DEVICES"] = "-1"
-            elif self.config.device == "cuda":
+            elif self.config.device == "cuda" and onnx_path is None:
                 # Fail an explicit GPU choice rather than letting TensorFlow
                 # silently place the requested run on the CPU.
                 probe = ("import runpy; import tensorflow as tf; "
@@ -3082,14 +3392,18 @@ class CryoloRecognizer:
                 command[1:3] = ["-c", probe]
                 command.extend(["-g", "0"])
             log_path = folder / "predict.log"
+            if onnx_path is not None:
+                command += ["--log", str(log_path)]
             started = time.monotonic()
             _report_progress(progress, "Loading crYOLO model and predicting")
             try:
                 with log_path.open("wb") as log:
-                    with external_process_environment(env) as child_env:
+                    process_env = (nullcontext(env) if onnx_path is not None and getattr(sys, "frozen", False)
+                                   else external_process_environment(env))
+                    with process_env as child_env:
                         self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                                          stdout=log, stderr=subprocess.STDOUT,
-                                                         cwd=folder, env=child_env,
+                                                         cwd=process_directory, env=child_env,
                                                          **_child_process_options())
                     while self._process.poll() is None:
                         _check_cancel(cancel)
@@ -3106,7 +3420,11 @@ class CryoloRecognizer:
                     raise RecognitionError(f"crYOLO prediction failed (exit {code}).\n{tail}")
                 _report_progress(progress, "Reading crYOLO detections")
                 try:
-                    boxes = read_cbox(output / "CBOX" / "screen.cbox", rgb.shape[:2], threshold)
+                    if onnx_path is not None:
+                        boxes, self._prediction_metadata = read_onnx_detections(result_path, rgb.shape[:2])
+                    else:
+                        boxes = read_cbox(output / "CBOX" / "screen.cbox", rgb.shape[:2], threshold)
+                        self._prediction_metadata = None
                 except RecognitionError as exc:
                     raise RecognitionError(f"{exc}\nLast runtime output:\n{_prediction_log_tail(log_path)}") from exc
                 CRYOLO_LOG.info("crYOLO prediction completed in %.2fs: %d detections", time.monotonic()-started, len(boxes))
@@ -3120,10 +3438,10 @@ class CryoloRecognizer:
                     raise RecognitionError(f"{exc}\nPrediction log: {retained}") from exc
                 raise
             except OSError as exc:
-                raise RecognitionError(f"Could not start the crYOLO Python runtime: {exc}") from exc
+                raise RecognitionError(f"Could not start the crYOLO prediction process: {exc}") from exc
             finally:
                 if self._process is not None:
-                    _stop_process(self._process)
+                    _stop_process(self._process, terminate_tree=self._runtime_format != "onnx")
                     self._process = None
                 self.last_prediction_log = _retain_prediction_log(log_path)
         _check_cancel(cancel)
@@ -3233,6 +3551,8 @@ class CryoloRecognizer:
         candidates, evidence, carbon, area, appearance = self._refine(rgb, boxes, cancel, prompt=prompt, progress=progress)
         _check_cancel(cancel)
         self.last_detection = {"backend": "cryolo", "profile": self.config.automatic_profile,
+                               "runtime_format": self._runtime_format,
+                               "runtime": "onnxruntime-cpu" if self._runtime_format == "onnx" else "legacy-cryolo",
                                "cryolo_detections": len(boxes), "selected_contours": len(candidates),
                                "confidence_threshold": getattr(self.config, "cryolo_threshold", .3),
                                "detections_supplied": True, "requested_device": self.config.device,
@@ -3282,6 +3602,8 @@ class CryoloRecognizer:
             selected.append(detection)
         candidates, evidence, carbon, area, appearance = self._refine(rgb, selected, cancel, prompt=True, progress=progress)
         self.last_detection = {"backend": "cryolo", "mode": "prompt_selection",
+                               "runtime_format": self._runtime_format,
+                               "runtime": "onnxruntime-cpu" if self._runtime_format == "onnx" else "legacy-cryolo",
                                "cryolo_detections": len(boxes), "selected_detection_boxes": len(selected),
                                "selected_contours": len(candidates), "detections_cached": cached,
                                "capsid_evidence": evidence, "carbon_guard": carbon,
@@ -3291,7 +3613,7 @@ class CryoloRecognizer:
 
     def close(self):
         if self._process is not None:
-            _stop_process(self._process)
+            _stop_process(self._process, terminate_tree=self._runtime_format != "onnx")
         self._process = self._profile = self._boxes = self._automatic_result = None
         self._key = self._artifact_signature = self._automatic_key = None
         self._automatic_report = None
@@ -3386,7 +3708,7 @@ def validate_detector_settings(payload) -> dict:
         elif key == "sam_checkpoint":
             result[key] = _optional_path(value, key, (".pth", ".pt"))
         elif key == "cryolo_checkpoint":
-            result[key] = _optional_path(value, key, (".h5",))
+            result[key] = _optional_path(value, key, (".onnx", ".h5"))
         elif key == "cryolo_config":
             result[key] = _optional_path(value, key)
         elif key == "sam_model_type":
@@ -5751,7 +6073,7 @@ def initialize_detector_fields(owner, tk, args, checkpoint_path):
     sam_path = getattr(args, "sam_checkpoint", None) or (
         checkpoint_path if backend == "sam" else directory / "sam_vit_b_01ec64.pth")
     cryolo_path = getattr(args, "cryolo_checkpoint", None) or (
-        checkpoint_path if backend == "cryolo" else directory / "cryolo-capsids.h5")
+        checkpoint_path if backend == "cryolo" else directory / "cryolo-capsids.onnx")
     owner.detection_profile = tk.StringVar(value=selected)
     owner.automatic_profile = owner.detection_profile  # Existing controller/settings callers.
     owner.sam_checkpoint = tk.StringVar(value=str(sam_path))
@@ -6839,18 +7161,15 @@ class ScreenPickerApp:
             self.active_token = previous_token
             raise
         self.job_kind, self.job_started = kind, time.perf_counter()
-        if kind in {"recognition", "runtime repair"}:
-            begin_recognition_progress(self, token, self.job_started,
-                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        if kind == "recognition":
+            begin_recognition_progress(self, token, self.job_started)
         else:
             clear_recognition_progress(self)
         self.status.set(f"{kind.capitalize()}… Escape stops.")
         refresh_recognition_progress(self, self.paused)
 
     def _result(self, kind, value):
-        if kind == "runtime repair":
-            self.status.set("crYOLO runtime repaired. Close settings, then choose Detect.")
-        elif kind == "manual picks":
+        if kind == "manual picks":
             if self.overlay is not None:
                 self.overlay.clear()
                 self.overlay.hide()
@@ -7081,23 +7400,6 @@ class ScreenPickerApp:
             return False
         return True
 
-    def repair_runtime(self):
-        """Explicit maintenance action; never run an installer on the Tk thread."""
-        try:
-            if self.runner.busy or self.transition or self.auto_remaining or self.drawing:
-                self.status.set("Stop the active operation before repairing the crYOLO runtime.")
-                return
-            message = getattr(self, "_advanced_message", None)
-            if self.advanced is not None and message is not None:
-                # Reuse the help row so progress remains visible in the focused
-                # settings window without adding height at high DPI.
-                message.configure(textvariable=self.status)
-            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
-                cancel=lambda: token.cancelled,
-                progress=lambda phase: queue_recognition_progress(self, token, phase)))
-        except Exception as exc:
-            self._error(exc)
-
     def _open_picking_speed(self, event=None):
         if self._settings_available():
             self.open_advanced()
@@ -7154,8 +7456,8 @@ class ScreenPickerApp:
                                     break
                 self.ttk.Button(frame, text="Browse…", command=browse).grid(row=index, column=2, padx=4)
             path_row(1, "SAM checkpoint", self.sam_checkpoint, [("SAM checkpoint", "*.pth *.pt")])
-            path_row(2, "crYOLO weights", self.cryolo_checkpoint, [("crYOLO weights", "*.h5")])
-            path_row(3, "crYOLO configuration", self.cryolo_config, [("crYOLO configuration", "*.json")])
+            path_row(2, "crYOLO weights", self.cryolo_checkpoint, [("crYOLO weights", "*.onnx *.h5")])
+            path_row(3, "crYOLO config (H5 only)", self.cryolo_config, [("crYOLO configuration", "*.json")])
             for index, (label, variable, choices) in enumerate((
                 ("Device", self.device, ("auto", "cpu", "cuda")),
                 ("SAM model type", self.model_type, ("vit_b", "vit_l", "vit_h"))), 4):
@@ -7178,20 +7480,15 @@ class ScreenPickerApp:
                     return
                 window.destroy()
                 self.advanced = None
-                self._advanced_message = None
                 self._gate_manual()
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
             self.ttk.Label(frame, text="capsid, capsid-learned and generic use SAM. crYOLO uses its trained detector with learned contour refinement.",
                            wraplength=settings_wrap).grid(row=index, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self._advanced_message = self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
-                                                  wraplength=settings_wrap)
-            self._advanced_message.grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            actions = self.ttk.Frame(frame)
-            actions.grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
-            self.ttk.Button(actions, text="Done", command=close_settings).pack(side="left", padx=4)
-            self.ttk.Button(actions, text="Repair crYOLO runtime", command=self.repair_runtime).pack(side="left", padx=4)
+            self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
+                           wraplength=settings_wrap).grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)
@@ -7276,7 +7573,7 @@ from PIL import Image, ImageDraw
 APP_LOG = logging.getLogger("saru_picker")
 APP_VERSION = "3.0.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
-DEFAULT_CRYOLO_CHECKPOINT = "cryolo-capsids.h5"
+DEFAULT_CRYOLO_CHECKPOINT = "cryolo-capsids.onnx"
 ACTIVE_BACKEND = "sam"
 
 
@@ -8695,18 +8992,31 @@ def run_smoke_test(checkpoint: Path, log_path: Path) -> dict[str, Any]:
 
 
 def cryolo_diagnostic_report(log_path: Path, config: RecognitionConfig) -> dict[str, Any]:
+    explicit_legacy = (Path(config.checkpoint).suffix.lower() == ".h5"
+                       and (config.cryolo_python or os.environ.get("SARU_CRYOLO_PYTHON")))
+    onnx_checkpoint = None if explicit_legacy else resolve_onnx_checkpoint(config.checkpoint)
     report = diagnostic_report(log_path, Path(config.checkpoint))
     report.update(backend="cryolo", cryolo_config=config.cryolo_config,
                   cryolo_config_exists=bool(config.cryolo_config and Path(config.cryolo_config).is_file()),
                   cryolo_python=config.cryolo_python,
-                  note="Metadata inspection only. crYOLO runs in its separate Python environment; use --smoke-test to check real inference.")
+                  inference_runtime="onnxruntime" if onnx_checkpoint is not None else "legacy H5",
+                  effective_checkpoint=str(onnx_checkpoint) if onnx_checkpoint is not None else config.checkpoint,
+                  effective_checkpoint_exists=(onnx_checkpoint if onnx_checkpoint is not None else Path(config.checkpoint)).is_file(),
+                  cryolo_config_required=onnx_checkpoint is None,
+                  note=("Metadata inspection only. Bundled crYOLO runs offline with ONNX Runtime and embedded model metadata; use --smoke-test for real inference."
+                        if onnx_checkpoint is not None else
+                        "Metadata inspection only. Legacy H5 requires an explicit --cryolo-python runtime; automatic runtime installation is disabled."))
     report["dependencies"] = {name: version for name, version in report["dependencies"].items()
                               if name not in {"torch", "torchvision", "segment-anything"}}
+    try:
+        report["dependencies"]["onnxruntime"] = importlib.metadata.version("onnxruntime")
+    except importlib.metadata.PackageNotFoundError:
+        report["dependencies"]["onnxruntime"] = None
     return report
 
 
 def run_cryolo_smoke_test(log_path: Path, config: RecognitionConfig) -> dict[str, Any]:
-    """Exercise the selected crYOLO process without sending desktop events."""
+    """Exercise the selected crYOLO detector without sending desktop events."""
     report = cryolo_diagnostic_report(log_path, config)
     report.update(mode="smoke-test", status="running", checks=[])
     recognizer = None
@@ -8971,7 +9281,7 @@ class PickerApp:
             row.pack(fill="x")
             ttk.Entry(row, textvariable=variable, width=29).pack(side="left", fill="x", expand=True)
             ttk.Button(row, text="…", width=3, command=lambda backend=backend: self.browse_model(backend)).pack(side="right")
-        ttk.Label(model, text="crYOLO configuration (.json)").pack(anchor="w")
+        ttk.Label(model, text="crYOLO config (H5 only)").pack(anchor="w")
         ttk.Entry(model, textvariable=self.cryolo_config, width=36).pack(fill="x")
         row = ttk.Frame(model)
         row.pack(fill="x", pady=3)
@@ -8988,7 +9298,6 @@ class PickerApp:
             ttk.Entry(row, textvariable=variable, width=9).pack(side="right")
         self._applied_model_config = detector_config_from_fields(self)
         ttk.Button(model, text="Apply detection settings", command=self._apply_model_settings).pack(fill="x", pady=5)
-        ttk.Button(model, text="Repair crYOLO runtime", command=self.repair_runtime).pack(fill="x")
         self.tool = tk.StringVar(value="box")
         tools_frame = ttk.LabelFrame(controls, text="3. Draw on preview", padding=7)
         tools_frame.pack(fill="x", pady=4)
@@ -9113,7 +9422,7 @@ class PickerApp:
 
     def browse_model(self, backend=None):
         backend = backend or resolve_detection_profile(detection_profile_value(self))[0]
-        path = self.filedialog.askopenfilename(filetypes=([("crYOLO weights", "*.h5")] if backend == "cryolo" else
+        path = self.filedialog.askopenfilename(filetypes=([("crYOLO weights", "*.onnx *.h5")] if backend == "cryolo" else
                                                         [("PyTorch checkpoint", "*.pth *.pt")]) + [("All files", "*")])
         if path:
             (self.cryolo_checkpoint if backend == "cryolo" else self.sam_checkpoint).set(path)
@@ -9386,22 +9695,12 @@ class PickerApp:
         submitted = self.runner.submit(guarded, token=token)
         self.job_kind, self.job_started = kind, time.perf_counter()
         self.active_token = submitted
-        if kind in {"prompt", "automatic proposals", "batch recognition", "runtime repair"}:
-            begin_recognition_progress(self, submitted, self.job_started,
-                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        if kind in {"prompt", "automatic proposals", "batch recognition"}:
+            begin_recognition_progress(self, submitted, self.job_started)
         else:
             clear_recognition_progress(self)
         self.status.set(f"{kind}: running. Esc cancels; an active model forward pass may need to finish.")
         refresh_recognition_progress(self, self.batch_paused)
-
-    def repair_runtime(self):
-        try:
-            self._ensure_idle(allow_model_changes=True)
-            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
-                cancel=lambda: token.cancelled,
-                progress=lambda phase: queue_recognition_progress(self, token, phase)))
-        except Exception as exc:
-            self._error(exc)
 
     def segment_prompt(self):
         try:
@@ -9733,9 +10032,7 @@ class PickerApp:
         self.root.after(40, self.poll)
 
     def _handle_result(self, kind, value, elapsed):
-        if kind == "runtime repair":
-            self.status.set("crYOLO runtime repaired. Choose Generate automatic proposals to retry.")
-        elif kind == "prompt":
+        if kind == "prompt":
             self.alternatives, self.alternative_index = value, 0
             self.render()
             self.status.set(f"Prompt finished in {elapsed:.2f}s. Review alternatives, then accept the intended inner region.")
@@ -9837,15 +10134,16 @@ def build_parser():
     parser.add_argument("--image", help="Open an image in the optional offline review editor.")
     parser.add_argument("--backend", choices=("sam", "cryolo"), default=None,
                         help="Optional explicit backend. By default the detection profile selects SAM or crYOLO.")
-    parser.add_argument("--checkpoint", help="Model weights: SAM .pth or crYOLO .h5; otherwise use the selected backend's bundled model.")
+    parser.add_argument("--checkpoint", help="Model weights: SAM .pth or crYOLO .onnx; otherwise use the selected backend's bundled model.")
     parser.add_argument("--sam-checkpoint", help="Separate SAM weights used by the three original detection profiles.")
-    parser.add_argument("--cryolo-checkpoint", help="Separate crYOLO .h5 weights used by the crYOLO detection profile.")
-    parser.add_argument("--cryolo-config", help="crYOLO JSON configuration; defaults to cryolo-config.json beside its weights.")
-    parser.add_argument("--cryolo-python", help="Python executable in the separate crYOLO environment.")
+    parser.add_argument("--cryolo-checkpoint", help="crYOLO ONNX model (bundled by default). Legacy H5 requires a verified ONNX sibling or explicit --cryolo-python.")
+    parser.add_argument("--cryolo-config", help="Legacy H5 JSON configuration. ONNX uses embedded metadata and ignores this option.")
+    parser.add_argument("--cryolo-python", help="Expert override for a separately managed legacy H5 crYOLO runtime; unused for ONNX.")
     parser.add_argument("--cryolo-threshold", type=float, default=.3, help="crYOLO detector confidence threshold (0 to 1).")
-    parser.add_argument("--cryolo-timeout", type=float, default=180.0, help="Maximum seconds for a crYOLO prediction process.")
+    parser.add_argument("--cryolo-timeout", type=float, default=180.0, help="Maximum seconds for a crYOLO prediction worker.")
     parser.add_argument("--model-type", choices=("vit_b", "vit_l", "vit_h"), default="vit_b")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="auto or cpu for bundled crYOLO ONNX; cuda requires a supported GPU runtime.")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--segment-image", help="Run headless recognition on a clean image, without any desktop events.")
     modes.add_argument("--diagnostics", action="store_true", help="Report installed dependency metadata without loading a detector.")

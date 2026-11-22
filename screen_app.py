@@ -28,7 +28,6 @@ from manual_sampling import legacy_contour_points, mask_contour_points
 from micrograph_navigation import NoNewMicrographError, wait_for_next_micrograph
 from recognition import (Cancelled, RecognitionConfig, SamRecognizer, create_recognizer, union_masks,
                          DEFAULT_MIN_CAPSID_AREA_PX)
-from runtime_management import repair_cryolo_runtime
 from screen_overlay import (ScreenOverlay, InputSurface, ManualMouseObserver,
                             keep_control_panel_above, control_panel_bounds)
 
@@ -118,7 +117,7 @@ def initialize_detector_fields(owner, tk, args, checkpoint_path):
     sam_path = getattr(args, "sam_checkpoint", None) or (
         checkpoint_path if backend == "sam" else directory / "sam_vit_b_01ec64.pth")
     cryolo_path = getattr(args, "cryolo_checkpoint", None) or (
-        checkpoint_path if backend == "cryolo" else directory / "cryolo-capsids.h5")
+        checkpoint_path if backend == "cryolo" else directory / "cryolo-capsids.onnx")
     owner.detection_profile = tk.StringVar(value=selected)
     owner.automatic_profile = owner.detection_profile  # Existing controller/settings callers.
     owner.sam_checkpoint = tk.StringVar(value=str(sam_path))
@@ -1206,18 +1205,15 @@ class ScreenPickerApp:
             self.active_token = previous_token
             raise
         self.job_kind, self.job_started = kind, time.perf_counter()
-        if kind in {"recognition", "runtime repair"}:
-            begin_recognition_progress(self, token, self.job_started,
-                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        if kind == "recognition":
+            begin_recognition_progress(self, token, self.job_started)
         else:
             clear_recognition_progress(self)
         self.status.set(f"{kind.capitalize()}… Escape stops.")
         refresh_recognition_progress(self, self.paused)
 
     def _result(self, kind, value):
-        if kind == "runtime repair":
-            self.status.set("crYOLO runtime repaired. Close settings, then choose Detect.")
-        elif kind == "manual picks":
+        if kind == "manual picks":
             if self.overlay is not None:
                 self.overlay.clear()
                 self.overlay.hide()
@@ -1448,23 +1444,6 @@ class ScreenPickerApp:
             return False
         return True
 
-    def repair_runtime(self):
-        """Explicit maintenance action; never run an installer on the Tk thread."""
-        try:
-            if self.runner.busy or self.transition or self.auto_remaining or self.drawing:
-                self.status.set("Stop the active operation before repairing the crYOLO runtime.")
-                return
-            message = getattr(self, "_advanced_message", None)
-            if self.advanced is not None and message is not None:
-                # Reuse the help row so progress remains visible in the focused
-                # settings window without adding height at high DPI.
-                message.configure(textvariable=self.status)
-            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
-                cancel=lambda: token.cancelled,
-                progress=lambda phase: queue_recognition_progress(self, token, phase)))
-        except Exception as exc:
-            self._error(exc)
-
     def _open_picking_speed(self, event=None):
         if self._settings_available():
             self.open_advanced()
@@ -1521,8 +1500,8 @@ class ScreenPickerApp:
                                     break
                 self.ttk.Button(frame, text="Browse…", command=browse).grid(row=index, column=2, padx=4)
             path_row(1, "SAM checkpoint", self.sam_checkpoint, [("SAM checkpoint", "*.pth *.pt")])
-            path_row(2, "crYOLO weights", self.cryolo_checkpoint, [("crYOLO weights", "*.h5")])
-            path_row(3, "crYOLO configuration", self.cryolo_config, [("crYOLO configuration", "*.json")])
+            path_row(2, "crYOLO weights", self.cryolo_checkpoint, [("crYOLO weights", "*.onnx *.h5")])
+            path_row(3, "crYOLO config (H5 only)", self.cryolo_config, [("crYOLO configuration", "*.json")])
             for index, (label, variable, choices) in enumerate((
                 ("Device", self.device, ("auto", "cpu", "cuda")),
                 ("SAM model type", self.model_type, ("vit_b", "vit_l", "vit_h"))), 4):
@@ -1545,20 +1524,15 @@ class ScreenPickerApp:
                     return
                 window.destroy()
                 self.advanced = None
-                self._advanced_message = None
                 self._gate_manual()
                 self._sync_manual()
                 if self.mode == "semi-auto":
                     self._present_masks()
             self.ttk.Label(frame, text="capsid, capsid-learned and generic use SAM. crYOLO uses its trained detector with learned contour refinement.",
                            wraplength=settings_wrap).grid(row=index, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            self._advanced_message = self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
-                                                  wraplength=settings_wrap)
-            self._advanced_message.grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            actions = self.ttk.Frame(frame)
-            actions.grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
-            self.ttk.Button(actions, text="Done", command=close_settings).pack(side="left", padx=4)
-            self.ttk.Button(actions, text="Repair crYOLO runtime", command=self.repair_runtime).pack(side="left", padx=4)
+            self.ttk.Label(frame, text="For crYOLO, Select by box selects detections; use manual mode for missed targets. Area 0 allows all capsid sizes; delay 0 is fastest.",
+                           wraplength=settings_wrap).grid(row=index + 1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.ttk.Button(frame, text="Done", command=close_settings).grid(row=index + 2, column=0, columnspan=3, pady=(10, 0))
             window.protocol("WM_DELETE_WINDOW", close_settings)
         except Exception as exc:
             self._error(exc)

@@ -5,3 +5,6 @@ Pillow>=10,<14
 scipy>=1.10,<2
 PyAutoGUI>=0.9.54,<0.10
 pynput>=1.7.6,<2
+
+# Offline execution of the exported crYOLO network (CPU).
+onnxruntime==1.23.2

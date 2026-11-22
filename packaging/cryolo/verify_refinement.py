@@ -1,8 +1,8 @@
 """Frozen-runtime checks of positive, dense and cancelled crYOLO refinement.
 
 Detector boxes and the constant numeric appearance fixture are deliberately
-synthetic. These checks execute the production contour path; the separate H5
-smoke check executes real crYOLO prediction. Neither measures capsid accuracy.
+synthetic. These checks execute the production contour path; the separate ONNX
+smoke check executes real prediction. Neither measures capsid accuracy.
 """
 from __future__ import annotations
 

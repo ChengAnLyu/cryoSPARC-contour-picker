@@ -15,11 +15,11 @@ The corrected **3.0.0** application includes the three existing SAM-based detect
 
 The first three profiles use the bundled SAM ViT-B checkpoint. The fourth uses the supplied private crYOLO checkpoint. These are four detection choices, not four SAM architectures. The default remains `capsid`; choosing another profile is remembered. Model files remain separate so switching profiles does not load one backend's weights into the other.
 
-Download both private release archives: **SARU-Picker-Windows-CPU-3.0.0.zip** (installer) and **SARU-Picker-Models-3.0.0.zip** (trained model files). Extract both into the **same folder**, keeping the H5, JSON and icon files beside **SARU-Picker-Setup-3.0.0-win64.exe**, then run Setup. The two archives keep each download below the 512 MiB file limit. Setup installs the SAM runtime/checkpoint, the private crYOLO weights/configuration and the learned appearance profile. It also installs and verifies the separate crYOLO runtime automatically into its managed location. **Do not select a Python executable.** First-time crYOLO runtime setup needs internet access; an already healthy managed runtime is reused.
+Download both private release archives: **SARU-Picker-Windows-CPU-3.0.0.zip** (installer) and **SARU-Picker-Models-3.0.0.zip** (trained model files). Extract both into the **same folder**, keeping the ONNX, JSON and icon files beside **SARU-Picker-Setup-3.0.0-win64.exe**, then run Setup. The two archives keep each download below the 512 MiB file limit. Setup includes the SAM runtime/checkpoint and ONNX Runtime CPU, and copies the private crYOLO model and learned appearance profile. **Installation and prediction need no runtime download, Python selection or Repair step.** Download the updated models ZIP as well: this edition uses `cryolo-capsids.onnx` instead of the earlier H5 sidecar.
 
 This installer upgrades the earlier 3.0.0 crYOLO-only package using the same installation identity and directory. The application now has a neutral SARU Picker title and all four profile choices. Screen capture, manual drawing, contour refinement, spacing, click delay, carbon checks, minimum contour area and micrograph navigation retain their existing behavior.
 
-The crYOLO weights are the completed 160-example, 20-epoch fit selected at epoch 18. This correction changes model selection and installation, without retraining or claiming new biological accuracy. See [model details](CRYOLO.md) and [Windows build instructions](packaging/cryolo/README.md).
+The crYOLO weights are the completed 160-example, 20-epoch fit selected at epoch 18. The offline edition exports that same trained network to ONNX, without retraining or claiming new biological accuracy. Its embedded metadata records the original checkpoint identity and inference settings. See [model details](CRYOLO.md) and [Windows build instructions](packaging/cryolo/README.md).
 
 ## Manual mode — original interaction
 
@@ -72,19 +72,19 @@ The app stops if navigation leaves the same image visible, returns to a recently
 
 Visible annotations are passive. A separate, nearly transparent input surface catches ROI selection, box prompts, and semi-auto mask clicks. Only the temporary annotation/input layers are hidden before screenshots and generated clicks. The control panel remains visible, interactive, and above these layers. Keep it outside the selected micrograph area; an overlapping panel produces an explicit message instead of disappearing. The underlying screen is never replaced by a required snapshot editor.
 
-Live control currently supports the primary Windows monitor. Moving the micrograph or changing zoom requires a fresh detection. Up to 10,000 generated clicks are allowed per operation. Cancellation is checked between clicks; an active native model forward pass must finish before its cancelled result can be discarded.
+Live control currently supports the primary Windows monitor. Moving the micrograph or changing zoom requires a fresh detection. Up to 10,000 generated clicks are allowed per operation. Cancellation is checked between clicks; SAM may need to finish its active native forward pass before discarding a cancelled result; crYOLO runs in a cancellable child process.
 
 ## Picking speed and model settings
 
 The click delay and particle spacing retain the 2.9.0 behavior. **Advanced → Detection profile** provides the four choices. Applying a different profile retires old proposals while preserving completed pick history; switching is prevented while work is active. The app remembers separate SAM and crYOLO weight paths and does not silently substitute one backend for another.
 
-SAM profile settings retain their existing behavior. The crYOLO confidence threshold defaults to **0.3**, and its runtime is found automatically. Lowering confidence can recover more marked regions but also creates more unwanted detections. crYOLO supplies bounding boxes; existing image-based processing refines their interiors, checks carbon boundaries and filters final contour size. These contours are approximate picking regions. Confidence is separate from mask IoU.
+SAM profile settings retain their existing behavior. The crYOLO confidence threshold defaults to **0.3**, and its CPU inference runtime is bundled. Lowering confidence can recover more marked regions but also creates more unwanted detections. crYOLO supplies bounding boxes; existing image-based processing refines their interiors, checks carbon boundaries and filters final contour size. These contours are approximate picking regions. Confidence is separate from mask IoU.
 
 Recognition latency is separate from click playback speed. A new crYOLO capture starts its isolated inference process; startup contributes to latency. Cached predictions are reused for an identical capture. No hardware-matched speed improvement over SAM is claimed.
 
 ## Running from source
 
-The Windows installer includes the modern GUI and SAM runtime. Source users can use Python 3.12 x64 with Tcl/Tk:
+The Windows installer includes the modern GUI, SAM runtime and ONNX Runtime CPU. Source users can use Python 3.12 x64 with Tcl/Tk:
 
 ```powershell
 py -3.12 -m venv .venv
@@ -94,7 +94,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe main.py
 ```
 
-Place the verified SAM checkpoint in `models/sam_vit_b_01ec64.pth`; the private release supplies `cryolo-capsids.h5`, `cryolo-config.json` and `capsid-profile.json`. The managed Windows crYOLO runtime is discovered automatically. Source users on other platforms may still provide `--cryolo-python` explicitly. This advanced CLI override is not a required Windows installation step and is not shown in the profile settings.
+Place the verified SAM checkpoint in `models/sam_vit_b_01ec64.pth`; the private release supplies `cryolo-capsids.onnx` and `capsid-profile.json`. The ONNX model contains its inference settings, so a saved legacy JSON configuration is not required. Expert source users can still run an H5 model with an explicitly supplied `--cryolo-python`; ordinary detection never installs a legacy runtime.
 
 ## Optional offline tools
 
@@ -103,7 +103,7 @@ Place the verified SAM checkpoint in `models/sam_vit_b_01ec64.pth`; the private 
 Headless segmentation remains available, with no desktop input:
 
 ```powershell
-python main.py --automatic-profile cryolo --segment-image my_micrograph.png --checkpoint cryolo-capsids.h5 --device cpu --output result
+python main.py --automatic-profile cryolo --segment-image my_micrograph.png --checkpoint cryolo-capsids.onnx --device cpu --output result
 ```
 
 Without a box or point, headless recognition uses the selected automatic detection profile. In crYOLO mode, box/point arguments select matching detections; SAM profiles retain prompted segmentation. CLI and optional offline review exports retain their explicit spacing/inset controls; live screen modes use the per-contour manual convention described above.
@@ -118,6 +118,6 @@ python main.py --diagnostics --report diagnostics.json
 python main.py --smoke-test --report smoke.json
 ```
 
-Diagnostics checks metadata. The smoke test performs real inference and requires the trained weights, configuration and runtime. Windows build checks exercise native controls and overlays at four text scales, the crYOLO Advanced panel, frozen version/backend metadata, installer sidecar copying and uninstall. The separate stock-runtime job executes synthetic network inference; private biological accuracy comes from the supplied model evaluation record.
+Diagnostics checks metadata. The smoke test performs real inference and requires the model and appearance profile. Windows build checks exercise native controls and overlays at four text scales, the four-profile selector, frozen version/backend metadata, installer sidecar copying and uninstall. A synthetic ONNX network tests the installed application’s prediction and contour pipeline with network access blocked. These checks establish installation and inference operation; private biological accuracy comes from the supplied model evaluation record.
 
-Unified settings are kept in the SARU Picker user-data directory. The isolated crYOLO runtime remains under `%LOCALAPPDATA%\SARU_Picker_crYOLO` on Windows. The installed launcher also records startup and native-fault information there. Historical SAM packaging files remain in `packaging/`; use `packaging/cryolo/build.ps1` for the 3.0.0 release.
+Unified settings are kept in the SARU Picker user-data directory. The installed launcher records startup and native-fault information under `%LOCALAPPDATA%\SARU_Picker_crYOLO` on Windows. An old legacy runtime may remain there but is not used by ONNX inference. Historical SAM packaging files remain in `packaging/`; use `packaging/cryolo/build.ps1` for the 3.0.0 release.

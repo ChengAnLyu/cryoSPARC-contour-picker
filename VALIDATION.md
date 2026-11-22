@@ -407,3 +407,23 @@ Source, frozen and installed reports from the release workflow establish
 which gates actually ran and passed; no new test count or measured speedup
 is inferred from the changed default alone.
 
+
+
+## 3.0.0 offline crYOLO inference
+
+The installation-hang correction exports the existing 160-example H5 checkpoint
+to ONNX and bundles ONNX Runtime CPU. It removes automatic legacy runtime setup
+from installation and recognition. No model is retrained. The independent worker
+validates embedded model metadata, runs the full-frame network, decodes boxes and
+uses the unchanged production contour processing. Legacy H5 inference requires
+an explicit interpreter override; its optional source setup helper has bounded
+lock, download and command waits.
+
+Private verification compares stock TensorFlow outputs with ONNX on all 160
+original clean images, including a separate pass through current Pillow/NumPy
+preprocessing. Per-case numerical, decoder, contour and picking-point results
+belong in the delivered model record. These are conversion-equivalence checks,
+not held-out biological validation. Public Windows CI uses a synthetic Conv
+network to test positive inference through the frozen and installed worker,
+checks exact sidecar copies, and blocks network access during installed checks.
+The release record must cite the completed run and its actual reports.

@@ -40,7 +40,7 @@ jobs:
           $process = Start-Process -FilePath $download -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$compiler`"" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw 'Compiler setup failed.' }
           "SARU_CRYOLO_ISCC=$(Join-Path $compiler 'ISCC.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build and verify four-profile app and automatic runtime setup
+      - name: Build and verify four-profile offline app and installer
         shell: pwsh
         run: ./packaging/cryolo/build.ps1 -PythonExe (Get-Command python).Source -IsccPath $env:SARU_CRYOLO_ISCC -TestInstaller
       - name: Upload downloadable installer
@@ -98,17 +98,6 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
-      - name: Stage runtime diagnostics
-        if: always()
-        shell: pwsh
-        run: |
-          $target = Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo'
-          New-Item -ItemType Directory -Force -Path $target | Out-Null
-          $runtime = Join-Path $env:LOCALAPPDATA 'SARU_Picker_crYOLO'
-          foreach ($name in @('runtime-install-report.json','runtime-health.json','runtime-health.log','runtime-setup.log')) {
-            $source = Join-Path $runtime $name
-            if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $target $name) }
-          }
       - name: Preserve GUI build diagnostics
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -120,55 +109,5 @@ jobs:
             artifacts/cryolo/*.log
             artifacts/cryolo/SHA256SUMS.txt
             build/cryolo/pyinstaller/**/warn-*.txt
-          if-no-files-found: warn
-          retention-days: 14
-
-  native-cryolo-runtime:
-    runs-on: windows-2022
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - name: Bootstrap private Python and upstream CPU runtime
-        shell: pwsh
-        run: |
-          $runtime = Join-Path $env:RUNNER_TEMP 'saru-cryolo-env'
-          $setup = Join-Path $env:GITHUB_WORKSPACE 'packaging/cryolo/setup-runtime.ps1'
-          $report = Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime-install.json'
-          $arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $setup + '" -ForcePrivatePython -RuntimeDirectory "' + $runtime + '" -Report "' + $report + '"'
-          # Start-Process preserves the raw inherited PSModulePath, like Inno
-          # Exec. Direct powershell.exe invocation from pwsh repairs that path
-          # specially and previously hid a real installer bootstrap defect.
-          $process = Start-Process -FilePath "$env:WINDIR/System32/WindowsPowerShell/v1.0/powershell.exe" -ArgumentList $arguments -NoNewWindow -Wait -PassThru
-          if ($process.ExitCode -ne 0) {
-            if (Test-Path -LiteralPath $report) { Get-Content -LiteralPath $report -Raw }
-            throw 'Private runtime setup failed under the Windows PowerShell host and inheritance used by Setup.'
-          }
-      - name: Exercise stock model inference on synthetic data
-        shell: pwsh
-        run: |
-          $python = Join-Path $env:RUNNER_TEMP 'saru-cryolo-env/Scripts/python.exe'
-          & $python packaging/cryolo/verify_runtime.py artifacts/cryolo-runtime
-          if ($LASTEXITCODE -ne 0) { throw 'Synthetic runtime inference failed.' }
-      - name: Preserve runtime installation evidence
-        if: always()
-        shell: pwsh
-        run: |
-          $target = Join-Path $env:GITHUB_WORKSPACE 'artifacts/cryolo-runtime'
-          New-Item -ItemType Directory -Force -Path $target | Out-Null
-          foreach ($name in @('runtime-health.json','runtime-health.log','runtime-health-progress.json')) {
-            $source = Join-Path $env:RUNNER_TEMP $name
-            if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $target $name) }
-          }
-      - name: Upload runtime installation evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: SARU-Picker-crYOLO-runtime-check-3.0.0-${{ github.run_number }}
-          path: |
-            artifacts/cryolo-runtime-install.json
-            artifacts/cryolo-runtime/runtime-inference.json
-            artifacts/cryolo-runtime/synthetic-cli.log
-            artifacts/cryolo-runtime/runtime-health*.json
-            artifacts/cryolo-runtime/runtime-health.log
           if-no-files-found: warn
           retention-days: 14

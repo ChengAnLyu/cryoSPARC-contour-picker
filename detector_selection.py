@@ -91,7 +91,7 @@ def validate_detector_settings(payload) -> dict:
         elif key == "sam_checkpoint":
             result[key] = _optional_path(value, key, (".pth", ".pt"))
         elif key == "cryolo_checkpoint":
-            result[key] = _optional_path(value, key, (".h5",))
+            result[key] = _optional_path(value, key, (".onnx", ".h5"))
         elif key == "cryolo_config":
             result[key] = _optional_path(value, key)
         elif key == "sam_model_type":

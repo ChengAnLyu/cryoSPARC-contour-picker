@@ -438,7 +438,7 @@ class ScreenControllerTests(unittest.TestCase):
             with self.subTest(backend=backend):
                 app = app_state("semi-auto")
                 app._model_config = Mock(return_value=RecognitionConfig(
-                    "model.h5" if backend == "cryolo" else "model.pth", backend=backend))
+                    "model.onnx" if backend == "cryolo" else "model.pth", backend=backend))
                 def recognize(rgb, **options):
                     self.assertEqual("progress" in options, backend == "cryolo")
                     if backend == "cryolo":
@@ -507,38 +507,6 @@ class ScreenControllerTests(unittest.TestCase):
         app.poll()
         self.assertEqual(app.status.get(), "model runtime failed")
         self.assertIsNone(app._recognition_progress)
-
-    def test_explicit_runtime_repair_is_worker_only_and_visible_in_settings(self):
-        app = app_state("semi-auto")
-        app.advanced, app._advanced_message = object(), Mock()
-        def repair(*, cancel, progress):
-            self.assertFalse(cancel())
-            progress("Repairing runtime")
-            return Path("managed-python.exe")
-        with patch("screen_app.repair_cryolo_runtime", side_effect=repair) as helper:
-            app.repair_runtime()
-            helper.assert_not_called()
-            app._advanced_message.configure.assert_called_once_with(textvariable=app.status)
-            self.assertEqual(app.job_kind, "runtime repair")
-            self.assertTrue(app.status.get().startswith("Runtime repair:"))
-            token = app.active_token
-            value = app.runner.finish()
-        app.runner.results.append(TaskResult(token, value=value))
-        app.poll()
-        self.assertIn("runtime repaired", app.status.get())
-        self.assertIsNone(app._recognition_progress)
-
-    def test_repair_cannot_replace_active_work_and_escape_cancels_its_token(self):
-        app = app_state("semi-auto")
-        with patch("screen_app.repair_cryolo_runtime") as helper:
-            app.repair_runtime()
-            token = app.active_token
-            app.repair_runtime()
-            self.assertEqual(len(app.runner.jobs), 1)
-            self.assertFalse(token.cancelled)
-            app.stop()
-            self.assertTrue(token.cancelled)
-            helper.assert_not_called()
 
     def test_disabled_or_panel_press_never_starts_a_capture(self):
         app = app_state()

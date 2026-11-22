@@ -28,12 +28,13 @@ function Invoke-Frozen {
     param([string]$Executable, [string]$Arguments, [string]$Report, [int]$TimeoutSeconds = 600)
     if (Test-Path -LiteralPath $Report) { Remove-Item -LiteralPath $Report }
     $Process = Start-Process -FilePath $Executable -ArgumentList "$Arguments --report `"$Report`"" -PassThru
+    $null = $Process.Handle
     if (-not $Process.WaitForExit($TimeoutSeconds * 1000)) {
         Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
         throw "Frozen application check timed out: $Report"
     }
     $Process.Refresh()
-    if ($Process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Report)) { throw "Application check failed: $Report" }
+    if ($null -eq $Process.ExitCode -or $Process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Report)) { throw "Application check failed: $Report" }
     $Data = Get-Content -LiteralPath $Report -Raw | ConvertFrom-Json
     if ($Data.status -ne 'ok' -or $Data.version -ne $Version) { throw "Application check did not report $Version success: $Report" }
     return $Data
@@ -64,6 +65,16 @@ function Invoke-SamSmoke {
 }
 Push-Location $ProjectRoot
 $PreviousModel = $env:SARU_MODEL_FILE
+$PreviousOffline = $env:SARU_VERIFY_OFFLINE
+$FirewallRules = @()
+$PreviousFirewallProfiles = @()
+$Synthetic = Join-Path $BuildDirectory 'synthetic-onnx-fixture'
+function Block-TestNetwork {
+    param([string]$Program)
+    $Name = 'SARU-offline-' + [guid]::NewGuid().ToString('N')
+    New-NetFirewallRule -Name $Name -DisplayName $Name -Direction Outbound -Action Block -Program $Program -Profile Any -Enabled True | Out-Null
+    $script:FirewallRules += $Name
+}
 try {
     New-Item -ItemType Directory -Force -Path $BuildDirectory, $ArtifactDirectory | Out-Null
     Invoke-Checked $PythonExe @('-c', "import sys,struct; assert sys.version_info[:2]==(3,12) and struct.calcsize('P')==8")
@@ -92,34 +103,23 @@ try {
     }
     Assert-Checkpoint $ModelFile
     $env:SARU_MODEL_FILE = $ModelFile
-    # Bundle the official private Python package; no installed Python or
-    # machine-wide installer registration is needed on the user's computer.
-    New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot '.build-cache') | Out-Null
-    $PythonPackage = Join-Path $ProjectRoot '.build-cache\python.3.7.9.nupkg'
-    if (-not (Test-Path -LiteralPath $PythonPackage)) {
-        Invoke-WebRequest -Uri 'https://api.nuget.org/v3-flatcontainer/python/3.7.9/python.3.7.9.nupkg' -OutFile $PythonPackage -UseBasicParsing
-    }
-    if ((Get-Item -LiteralPath $PythonPackage).Length -ne 14758084 -or
-        (Get-FileHash -LiteralPath $PythonPackage).Hash.ToLowerInvariant() -ne '029e1ea5beeb142cd0f2da4e75c45f49bd7e0c7b48eb5bb6c6947f2d1b665c5e') {
-        throw 'The official private Python 3.7.9 package failed verification.'
-    }
     Invoke-Checked $BuildPython @('packaging\cryolo\collect_notices.py', (Join-Path $BuildDirectory 'third-party-notices'))
-    Invoke-Checked $BuildPython @('-c', "import pathlib,sys,zipfile; pathlib.Path(sys.argv[2]).write_bytes(zipfile.ZipFile(sys.argv[1]).read('tools/LICENSE.txt'))", $PythonPackage, (Join-Path $BuildDirectory 'third-party-notices\Python37-LICENSE.txt'))
+    Invoke-Checked $BuildPython @('packaging\cryolo\verify_onnx.py', '--make-fixture', '--fixture', $Synthetic)
+    Invoke-Checked $BuildPython @('packaging\cryolo\verify_onnx.py', '--fixture', $Synthetic, '--report', (Join-Path $ArtifactDirectory 'source-onnx-smoke.json'))
     Invoke-Checked $BuildPython @('-m', 'PyInstaller', '--noconfirm', '--clean', '--distpath', 'dist', '--workpath', (Join-Path $BuildDirectory 'pyinstaller'), 'packaging\cryolo\saru_cryolo.spec')
     $Distribution = Join-Path $ProjectRoot 'dist\SARU_Picker_crYOLO'
     $Executable = Join-Path $Distribution 'SARU Picker crYOLO.exe'
     Assert-Checkpoint (Join-Path $Distribution "_internal\models\$($Manifest.filename)")
-    foreach ($File in @(Get-ChildItem -LiteralPath $Distribution -Recurse -File | Where-Object { $_.Extension -in @('.h5','.pth','.pt') })) {
+    foreach ($File in @(Get-ChildItem -LiteralPath $Distribution -Recurse -File | Where-Object { $_.Extension -in @('.h5','.pth','.pt','.onnx') })) {
         if ($File.Name -ne $Manifest.filename) { throw "Public bundle contains unexpected model weights: $($File.Name)" }
     }
     foreach ($Library in @('tensorflow','keras','cryolo')) {
-        if (Test-Path -LiteralPath (Join-Path $Distribution "_internal\$Library")) { throw "External runtime was bundled: $Library" }
+        if (Test-Path -LiteralPath (Join-Path $Distribution "_internal\$Library")) { throw "Forbidden legacy runtime was bundled: $Library" }
     }
-    foreach ($Runtime in @('MSVCP140.dll','VCRUNTIME140.dll','VCRUNTIME140_1.dll','torch\lib\fbgemm.dll','torch\lib\asmjit.dll','torch\lib\libiomp5md.dll')) {
+    foreach ($Runtime in @('MSVCP140.dll','VCRUNTIME140.dll','VCRUNTIME140_1.dll','torch\lib\fbgemm.dll','torch\lib\asmjit.dll','torch\lib\libiomp5md.dll','onnxruntime\capi\onnxruntime.dll','onnxruntime\capi\onnxruntime_providers_shared.dll','onnxruntime\capi\onnxruntime_pybind11_state.pyd')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Distribution "_internal\$Runtime"))) { throw "Required native library is absent: $Runtime" }
     }
-    # Check exactly the canonical DLLs that runtime setup will copy. Keeping
-    # this evidence before Setup exposes signature failures even if setup fails.
+    # Verify bundled Windows native runtime DLLs before freezing/install checks.
     $VCFiles = @()
     $VCFailures = @()
     foreach ($Name in @('msvcp140.dll','msvcp140_1.dll','msvcp140_2.dll','msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','vcruntime140.dll','vcruntime140_1.dll','concrt140.dll')) {
@@ -139,14 +139,23 @@ try {
     $VCJson | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'bundled-vc-runtime.json') -Encoding UTF8
     Write-Host $VCJson
     if ($VCFailures.Count) { throw "Bundled VC runtime verification failed: $($VCFailures -join '; ')" }
-    foreach ($File in @('setup-runtime.ps1','runtime_health.py','runtime-requirements-windows.txt','Install-crYOLO-Runtime.cmd')) {
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $File) -Destination $Distribution -Force
+    foreach ($Name in @('setup-runtime.ps1','runtime_health.py','runtime-requirements-windows.txt','Install-crYOLO-Runtime.cmd','python.3.7.9.nupkg')) {
+        if (Test-Path -LiteralPath (Join-Path $Distribution $Name)) { throw "Obsolete runtime helper was bundled: $Name" }
     }
-    Copy-Item -LiteralPath $PythonPackage -Destination $Distribution -Force
+    # The launcher guard also runs in the same-EXE ONNX worker. It rejects
+    # sockets and any attempt to launch a separate Python/setup process.
+    $env:SARU_VERIFY_OFFLINE = '1'
+    if ($TestInstaller) {
+        $PreviousFirewallProfiles = @(Get-NetFirewallProfile | Select-Object Name,Enabled)
+        Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True
+        Block-TestNetwork $Executable
+    }
     Invoke-Diagnostics $Executable (Join-Path $ArtifactDirectory 'frozen-diagnostics.json')
     Invoke-SamSmoke $Executable (Join-Path $ArtifactDirectory 'frozen-sam-smoke.json')
     $Refinement = Invoke-Frozen $Executable '--cryolo-refinement-smoke' (Join-Path $ArtifactDirectory 'frozen-cryolo-refinement.json') 300
     if (-not $Refinement.frozen -or @($Refinement.checks | Where-Object { $_.status -eq 'ok' }).Count -ne 4) { throw 'Frozen positive/dense refinement checks were incomplete.' }
+    $Onnx = Invoke-Frozen $Executable "--cryolo-onnx-smoke --fixture `"$Synthetic`"" (Join-Path $ArtifactDirectory 'frozen-onnx-smoke.json') 180
+    if (-not $Onnx.frozen -or -not $Onnx.offline_guard -or -not $Onnx.actual_onnx_inference -or $Onnx.positive_contours -lt 1) { throw 'Frozen offline ONNX positive inference was incomplete.' }
     Compress-Archive -Path $Distribution -DestinationPath (Join-Path $ArtifactDirectory "SARU-Picker-GUI-$Version-win64.zip") -Force
     if ($IsccPath) {
         Invoke-Checked $IsccPath @("/DAppVersion=$Version", "/DAppSourceDir=$Distribution", "/DAppOutputDir=$ArtifactDirectory", (Join-Path $PSScriptRoot 'installer.iss'))
@@ -158,35 +167,45 @@ try {
             $SidecarStage = Join-Path $env:RUNNER_TEMP 'SARU Sidecar Test'
             if ((Test-Path -LiteralPath $InstallDirectory) -or (Test-Path -LiteralPath $SidecarStage)) { throw 'Installer test requires new directories.' }
             New-Item -ItemType Directory -Path $SidecarStage | Out-Null
+            # Inert upgrade remnants verify removal of owned obsolete helpers.
+            New-Item -ItemType Directory -Path $InstallDirectory | Out-Null
+            foreach ($Name in @('setup-runtime.ps1','runtime_health.py','runtime-requirements-windows.txt','Install-crYOLO-Runtime.cmd','python.3.7.9.nupkg')) {
+                'Synthetic obsolete helper; must never run.' | Set-Content -LiteralPath (Join-Path $InstallDirectory $Name)
+            }
             $StagedInstaller = Join-Path $SidecarStage (Split-Path $Installer -Leaf)
             Copy-Item -LiteralPath $Installer -Destination $StagedInstaller
-            'Synthetic copy fixture; this is not a trained model.' | Set-Content -LiteralPath (Join-Path $SidecarStage 'cryolo-capsids.h5') -Encoding ASCII
-            '{"fixture":"copy check only"}' | Set-Content -LiteralPath (Join-Path $SidecarStage 'cryolo-config.json') -Encoding ASCII
+            Copy-Item -LiteralPath (Join-Path $Synthetic 'cryolo-capsids.onnx'),(Join-Path $Synthetic 'cryolo-config.json') -Destination $SidecarStage
             Invoke-Checked $BuildPython @('packaging\verify_capsid_profile_installation.py', 'make-fixture', '--directory', $SidecarStage, '--report', (Join-Path $ArtifactDirectory 'capsid-profile-fixture.json'))
             Copy-Item -LiteralPath (Join-Path $ProjectRoot 'assets\app-icon.ico'),(Join-Path $ProjectRoot 'assets\app-icon.png') -Destination $SidecarStage
             $InstallLog = Join-Path $ArtifactDirectory 'installer-smoke.log'
-            $Process = Start-Process -FilePath $StagedInstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$InstallDirectory`" /LOG=`"$InstallLog`"" -Wait -PassThru
-            $RuntimeReport = Join-Path $env:LOCALAPPDATA 'SARU_Picker_crYOLO\runtime-install-report.json'
-            if (Test-Path -LiteralPath $RuntimeReport) {
-                Copy-Item -LiteralPath $RuntimeReport -Destination (Join-Path $ArtifactDirectory 'installed-runtime-setup.json')
-                Write-Host (Get-Content -LiteralPath $RuntimeReport -Raw)
-            }
-            if ($Process.ExitCode -ne 0) {
-                Write-Host (Get-Content -LiteralPath $InstallLog -Tail 50 | Out-String)
-                throw "Installer exited $($Process.ExitCode); inspect installed-runtime-setup.json and installer-smoke.log."
-            }
-            $RuntimeResult = Get-Content -LiteralPath $RuntimeReport -Raw | ConvertFrom-Json
-            if ($RuntimeResult.status -ne 'ok') { throw 'Setup did not finish a healthy crYOLO runtime.' }
-            $RuntimePython = Join-Path $env:LOCALAPPDATA 'SARU_Picker_crYOLO\cryolo-env\Scripts\python.exe'
-            if (-not (Test-Path -LiteralPath $RuntimePython)) { throw 'Automatic private runtime is absent.' }
+            Block-TestNetwork $StagedInstaller
             $InstalledExe = Join-Path $InstallDirectory 'SARU Picker crYOLO.exe'
+            Block-TestNetwork $InstalledExe
+            $LegacyReport = Join-Path $env:LOCALAPPDATA 'SARU_Picker_crYOLO\runtime-install-report.json'
+            $LegacyRuntime = Join-Path $env:LOCALAPPDATA 'SARU_Picker_crYOLO\cryolo-env'
+            if ((Test-Path -LiteralPath $LegacyReport) -or (Test-Path -LiteralPath $LegacyRuntime)) { throw 'Offline installer test requires no previous managed runtime.' }
+            $InstallWatch = [Diagnostics.Stopwatch]::StartNew()
+            $Process = Start-Process -FilePath $StagedInstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$InstallDirectory`" /LOG=`"$InstallLog`"" -PassThru
+            $null = $Process.Handle
+            if (-not $Process.WaitForExit(300000)) { Stop-Process -Id $Process.Id -Force; throw 'Offline installer exceeded five minutes.' }
+            $Process.Refresh()
+            if ($null -eq $Process.ExitCode -or $Process.ExitCode -ne 0) {
+                Write-Host (Get-Content -LiteralPath $InstallLog -Tail 50 | Out-String)
+                throw "Offline installer exited $($Process.ExitCode); inspect installer-smoke.log."
+            }
+            $InstallWatch.Stop()
+            if ((Test-Path -LiteralPath $LegacyReport) -or (Test-Path -LiteralPath $LegacyRuntime)) { throw 'Offline installer unexpectedly prepared a legacy runtime.' }
+            foreach ($Name in @('setup-runtime.ps1','runtime_health.py','runtime-requirements-windows.txt','Install-crYOLO-Runtime.cmd','python.3.7.9.nupkg')) {
+                if (Test-Path -LiteralPath (Join-Path $InstallDirectory $Name)) { throw "Obsolete runtime helper was installed: $Name" }
+            }
+            @{status='ok'; version=$Version; elapsed_seconds=$InstallWatch.Elapsed.TotalSeconds; network_blocked=$true; firewall_rules=$FirewallRules; obsolete_helpers_removed=$true; legacy_python_created=$false; runtime_setup_invoked=$false; separate_python_required=$false} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'installed-offline-setup.json') -Encoding UTF8
             Invoke-Diagnostics $InstalledExe (Join-Path $ArtifactDirectory 'installed-diagnostics.json')
             Invoke-SamSmoke $InstalledExe (Join-Path $ArtifactDirectory 'installed-sam-smoke.json')
             $Refinement = Invoke-Frozen $InstalledExe '--cryolo-refinement-smoke' (Join-Path $ArtifactDirectory 'installed-cryolo-refinement.json') 300
             if (-not $Refinement.frozen -or @($Refinement.checks | Where-Object { $_.status -eq 'ok' }).Count -ne 4) { throw 'Installed positive/dense refinement checks were incomplete.' }
             Invoke-Checked $BuildPython @('packaging\verify_capsid_profile_installation.py', 'verify', '--install-directory', $InstallDirectory, '--fixture-directory', $SidecarStage, '--runtime-report', (Join-Path $ArtifactDirectory 'installed-sam-smoke.json'), '--report', (Join-Path $ArtifactDirectory 'installed-capsid-profile.json'))
             $CopiedSidecars = @()
-            foreach ($Sidecar in @('cryolo-capsids.h5','cryolo-config.json','capsid-profile.json','app-icon.ico','app-icon.png')) {
+            foreach ($Sidecar in @('cryolo-capsids.onnx','cryolo-config.json','capsid-profile.json','app-icon.ico','app-icon.png')) {
                 $Subdirectory = if ($Sidecar -like 'app-icon.*') { '_internal\assets' } else { '_internal\models' }
                 $InstalledSidecar = Join-Path (Join-Path $InstallDirectory $Subdirectory) $Sidecar
                 if (-not (Test-Path -LiteralPath $InstalledSidecar)) { throw "Installer did not copy sidecar: $Sidecar" }
@@ -194,17 +213,14 @@ try {
                 $CopiedSidecars += $Sidecar
             }
             @{status='ok'; version=$Version; copied_sidecars=$CopiedSidecars; fixture_scope='Synthetic private-sidecar copy checks and constant appearance-model inference; no trained detector accuracy.'} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'installed-sidecar-copy.json') -Encoding UTF8
-            # Crucial boundary check: the frozen, torch-bearing executable must
-            # spawn the isolated TensorFlow process without inheriting its DLL path.
-            $Synthetic = Join-Path $env:RUNNER_TEMP 'SARU Synthetic crYOLO'
-            try {
-                Invoke-Checked $RuntimePython @('packaging\cryolo\verify_runtime.py', $Synthetic, '--keep-fixture')
-                Copy-Item -LiteralPath (Join-Path $SidecarStage 'capsid-profile.json') -Destination $Synthetic
-                $Arguments = "--smoke-test --automatic-profile cryolo --checkpoint `"$(Join-Path $Synthetic 'synthetic-untrained.h5')`" --cryolo-config `"$(Join-Path $Synthetic 'synthetic-config.json')`" --cryolo-threshold 0.99"
-                $Bridge = Invoke-Frozen $InstalledExe $Arguments (Join-Path $ArtifactDirectory 'installed-frozen-cryolo-smoke.json')
-                if ($Bridge.backend -ne 'cryolo' -or @($Bridge.checks | Where-Object { $_.name -eq 'cryolo_inference' -and $_.status -eq 'ok' }).Count -ne 1) { throw 'Frozen GUI did not execute real crYOLO inference.' }
-                Copy-Item -LiteralPath (Join-Path $Synthetic 'runtime-inference.json') -Destination (Join-Path $ArtifactDirectory 'installed-native-cryolo-smoke.json')
-            } finally { if (Test-Path -LiteralPath $Synthetic) { Remove-Item -LiteralPath $Synthetic -Recurse -Force } }
+            # Use the actually installed model/config/profile copies. The
+            # fixture image is transient test input, never included in artifacts.
+            $InstalledModels = Join-Path $InstallDirectory '_internal\models'
+            Copy-Item -LiteralPath (Join-Path $Synthetic 'synthetic.png') -Destination $InstalledModels
+            $Onnx = Invoke-Frozen $InstalledExe "--cryolo-onnx-smoke --fixture `"$InstalledModels`"" (Join-Path $ArtifactDirectory 'installed-frozen-onnx-smoke.json') 180
+            if (-not $Onnx.frozen -or -not $Onnx.offline_guard -or -not $Onnx.actual_onnx_inference -or $Onnx.positive_contours -lt 1) { throw 'Installed offline ONNX positive inference was incomplete.' }
+            if ((Test-Path -LiteralPath $LegacyReport) -or (Test-Path -LiteralPath $LegacyRuntime)) { throw 'Recognition unexpectedly prepared a legacy runtime.' }
+            Remove-Item -LiteralPath (Join-Path $InstalledModels 'synthetic.png')
             $Uninstaller = Start-Process -FilePath (Join-Path $InstallDirectory 'unins000.exe') -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait -PassThru
             if ($Uninstaller.ExitCode -ne 0) { throw "Uninstaller exited $($Uninstaller.ExitCode)." }
             Remove-Item -LiteralPath $SidecarStage -Recurse -Force
@@ -213,6 +229,13 @@ try {
     @(Get-ChildItem -LiteralPath $ArtifactDirectory -File | Where-Object { $_.Extension -in @('.exe','.zip') } | ForEach-Object {
         "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
     }) | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'SHA256SUMS.txt') -Encoding ASCII
-    @{status='ok'; version=$Version; default_profile='capsid'; profiles=@('capsid','capsid-learned','generic','crYOLO'); sam_runtime_and_vit_b_bundled=$true; private_python_package_bundled=$true; private_python_version='3.7.9'; private_weights_bundled=$false; cryolo_runtime_bundled=$false; cryolo_runtime_automatically_installed=$true; frozen_sam_inference_tested=$true; frozen_positive_dense_refinement_tested=$true; installed_positive_dense_refinement_tested=[bool]($TestInstaller -and $IsccPath); installed_cryolo_inference_tested=[bool]($TestInstaller -and $IsccPath); model_accuracy_tested=$false; note='Synthetic runtime checks only; installed crYOLO boundary verification requires -TestInstaller. No private trained-model accuracy claim.'} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'build-manifest.json') -Encoding UTF8
+    @{status='ok'; version=$Version; default_profile='capsid'; profiles=@('capsid','capsid-learned','generic','crYOLO'); sam_runtime_and_vit_b_bundled=$true; onnx_runtime_bundled=$true; onnx_runtime_version='1.23.2'; offline_installation=$true; private_python_package_bundled=$false; private_weights_bundled=$false; stock_cryolo_bundled=$false; cryolo_runtime_automatically_installed=$false; frozen_sam_inference_tested=$true; frozen_onnx_positive_inference_tested=$true; frozen_positive_dense_refinement_tested=$true; installed_positive_dense_refinement_tested=[bool]($TestInstaller -and $IsccPath); installed_onnx_positive_inference_tested=[bool]($TestInstaller -and $IsccPath); model_accuracy_tested=$false; note='Synthetic CPU inference and refinement checks; no private trained-model accuracy claim.'} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'build-manifest.json') -Encoding UTF8
     Invoke-Checked $BuildPython @('packaging\cryolo\prepare_downloads.py', $ArtifactDirectory, '--version', $Version)
-} finally { $env:SARU_MODEL_FILE = $PreviousModel; Pop-Location }
+} finally {
+    $env:SARU_MODEL_FILE = $PreviousModel
+    $env:SARU_VERIFY_OFFLINE = $PreviousOffline
+    foreach ($Rule in $FirewallRules) { Remove-NetFirewallRule -Name $Rule -ErrorAction SilentlyContinue }
+    foreach ($Profile in $PreviousFirewallProfiles) { Set-NetFirewallProfile -Profile $Profile.Name -Enabled $Profile.Enabled -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $Synthetic) { Remove-Item -LiteralPath $Synthetic -Recurse -Force }
+    Pop-Location
+}

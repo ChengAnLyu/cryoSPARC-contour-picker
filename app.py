@@ -43,7 +43,6 @@ from execution import (
     WorkerBusyError, play_clicks,
 )
 from desktop import DesktopAdapter, GlobalHotkeys, enable_dpi_awareness
-from runtime_management import repair_cryolo_runtime
 from screen_app import (ScreenPickerApp, screen_model_batches, screen_changed_fraction,
                         screen_region_overlaps_panel, initialize_detector_fields, detector_config_from_fields,
                         detection_profile_value, persist_detector_fields, apply_detector_args,
@@ -56,7 +55,7 @@ from screen_overlay import TRANSPARENT_RGB, control_panel_bounds, verify_screen_
 APP_LOG = logging.getLogger("saru_picker")
 APP_VERSION = "3.0.0"
 DEFAULT_CHECKPOINT = "sam_vit_b_01ec64.pth"
-DEFAULT_CRYOLO_CHECKPOINT = "cryolo-capsids.h5"
+DEFAULT_CRYOLO_CHECKPOINT = "cryolo-capsids.onnx"
 ACTIVE_BACKEND = "sam"
 
 
@@ -1475,18 +1474,32 @@ def run_smoke_test(checkpoint: Path, log_path: Path) -> dict[str, Any]:
 
 
 def cryolo_diagnostic_report(log_path: Path, config: RecognitionConfig) -> dict[str, Any]:
+    from cryolo_onnx import resolve_onnx_checkpoint
+    explicit_legacy = (Path(config.checkpoint).suffix.lower() == ".h5"
+                       and (config.cryolo_python or os.environ.get("SARU_CRYOLO_PYTHON")))
+    onnx_checkpoint = None if explicit_legacy else resolve_onnx_checkpoint(config.checkpoint)
     report = diagnostic_report(log_path, Path(config.checkpoint))
     report.update(backend="cryolo", cryolo_config=config.cryolo_config,
                   cryolo_config_exists=bool(config.cryolo_config and Path(config.cryolo_config).is_file()),
                   cryolo_python=config.cryolo_python,
-                  note="Metadata inspection only. crYOLO runs in its separate Python environment; use --smoke-test to check real inference.")
+                  inference_runtime="onnxruntime" if onnx_checkpoint is not None else "legacy H5",
+                  effective_checkpoint=str(onnx_checkpoint) if onnx_checkpoint is not None else config.checkpoint,
+                  effective_checkpoint_exists=(onnx_checkpoint if onnx_checkpoint is not None else Path(config.checkpoint)).is_file(),
+                  cryolo_config_required=onnx_checkpoint is None,
+                  note=("Metadata inspection only. Bundled crYOLO runs offline with ONNX Runtime and embedded model metadata; use --smoke-test for real inference."
+                        if onnx_checkpoint is not None else
+                        "Metadata inspection only. Legacy H5 requires an explicit --cryolo-python runtime; automatic runtime installation is disabled."))
     report["dependencies"] = {name: version for name, version in report["dependencies"].items()
                               if name not in {"torch", "torchvision", "segment-anything"}}
+    try:
+        report["dependencies"]["onnxruntime"] = importlib.metadata.version("onnxruntime")
+    except importlib.metadata.PackageNotFoundError:
+        report["dependencies"]["onnxruntime"] = None
     return report
 
 
 def run_cryolo_smoke_test(log_path: Path, config: RecognitionConfig) -> dict[str, Any]:
-    """Exercise the selected crYOLO process without sending desktop events."""
+    """Exercise the selected crYOLO detector without sending desktop events."""
     report = cryolo_diagnostic_report(log_path, config)
     report.update(mode="smoke-test", status="running", checks=[])
     recognizer = None
@@ -1751,7 +1764,7 @@ class PickerApp:
             row.pack(fill="x")
             ttk.Entry(row, textvariable=variable, width=29).pack(side="left", fill="x", expand=True)
             ttk.Button(row, text="…", width=3, command=lambda backend=backend: self.browse_model(backend)).pack(side="right")
-        ttk.Label(model, text="crYOLO configuration (.json)").pack(anchor="w")
+        ttk.Label(model, text="crYOLO config (H5 only)").pack(anchor="w")
         ttk.Entry(model, textvariable=self.cryolo_config, width=36).pack(fill="x")
         row = ttk.Frame(model)
         row.pack(fill="x", pady=3)
@@ -1768,7 +1781,6 @@ class PickerApp:
             ttk.Entry(row, textvariable=variable, width=9).pack(side="right")
         self._applied_model_config = detector_config_from_fields(self)
         ttk.Button(model, text="Apply detection settings", command=self._apply_model_settings).pack(fill="x", pady=5)
-        ttk.Button(model, text="Repair crYOLO runtime", command=self.repair_runtime).pack(fill="x")
         self.tool = tk.StringVar(value="box")
         tools_frame = ttk.LabelFrame(controls, text="3. Draw on preview", padding=7)
         tools_frame.pack(fill="x", pady=4)
@@ -1893,7 +1905,7 @@ class PickerApp:
 
     def browse_model(self, backend=None):
         backend = backend or resolve_detection_profile(detection_profile_value(self))[0]
-        path = self.filedialog.askopenfilename(filetypes=([("crYOLO weights", "*.h5")] if backend == "cryolo" else
+        path = self.filedialog.askopenfilename(filetypes=([("crYOLO weights", "*.onnx *.h5")] if backend == "cryolo" else
                                                         [("PyTorch checkpoint", "*.pth *.pt")]) + [("All files", "*")])
         if path:
             (self.cryolo_checkpoint if backend == "cryolo" else self.sam_checkpoint).set(path)
@@ -2166,22 +2178,12 @@ class PickerApp:
         submitted = self.runner.submit(guarded, token=token)
         self.job_kind, self.job_started = kind, time.perf_counter()
         self.active_token = submitted
-        if kind in {"prompt", "automatic proposals", "batch recognition", "runtime repair"}:
-            begin_recognition_progress(self, submitted, self.job_started,
-                                       label="Runtime repair" if kind == "runtime repair" else "Recognition")
+        if kind in {"prompt", "automatic proposals", "batch recognition"}:
+            begin_recognition_progress(self, submitted, self.job_started)
         else:
             clear_recognition_progress(self)
         self.status.set(f"{kind}: running. Esc cancels; an active model forward pass may need to finish.")
         refresh_recognition_progress(self, self.batch_paused)
-
-    def repair_runtime(self):
-        try:
-            self._ensure_idle(allow_model_changes=True)
-            self._submit("runtime repair", lambda token: repair_cryolo_runtime(
-                cancel=lambda: token.cancelled,
-                progress=lambda phase: queue_recognition_progress(self, token, phase)))
-        except Exception as exc:
-            self._error(exc)
 
     def segment_prompt(self):
         try:
@@ -2513,9 +2515,7 @@ class PickerApp:
         self.root.after(40, self.poll)
 
     def _handle_result(self, kind, value, elapsed):
-        if kind == "runtime repair":
-            self.status.set("crYOLO runtime repaired. Choose Generate automatic proposals to retry.")
-        elif kind == "prompt":
+        if kind == "prompt":
             self.alternatives, self.alternative_index = value, 0
             self.render()
             self.status.set(f"Prompt finished in {elapsed:.2f}s. Review alternatives, then accept the intended inner region.")
@@ -2617,15 +2617,16 @@ def build_parser():
     parser.add_argument("--image", help="Open an image in the optional offline review editor.")
     parser.add_argument("--backend", choices=("sam", "cryolo"), default=None,
                         help="Optional explicit backend. By default the detection profile selects SAM or crYOLO.")
-    parser.add_argument("--checkpoint", help="Model weights: SAM .pth or crYOLO .h5; otherwise use the selected backend's bundled model.")
+    parser.add_argument("--checkpoint", help="Model weights: SAM .pth or crYOLO .onnx; otherwise use the selected backend's bundled model.")
     parser.add_argument("--sam-checkpoint", help="Separate SAM weights used by the three original detection profiles.")
-    parser.add_argument("--cryolo-checkpoint", help="Separate crYOLO .h5 weights used by the crYOLO detection profile.")
-    parser.add_argument("--cryolo-config", help="crYOLO JSON configuration; defaults to cryolo-config.json beside its weights.")
-    parser.add_argument("--cryolo-python", help="Python executable in the separate crYOLO environment.")
+    parser.add_argument("--cryolo-checkpoint", help="crYOLO ONNX model (bundled by default). Legacy H5 requires a verified ONNX sibling or explicit --cryolo-python.")
+    parser.add_argument("--cryolo-config", help="Legacy H5 JSON configuration. ONNX uses embedded metadata and ignores this option.")
+    parser.add_argument("--cryolo-python", help="Expert override for a separately managed legacy H5 crYOLO runtime; unused for ONNX.")
     parser.add_argument("--cryolo-threshold", type=float, default=.3, help="crYOLO detector confidence threshold (0 to 1).")
-    parser.add_argument("--cryolo-timeout", type=float, default=180.0, help="Maximum seconds for a crYOLO prediction process.")
+    parser.add_argument("--cryolo-timeout", type=float, default=180.0, help="Maximum seconds for a crYOLO prediction worker.")
     parser.add_argument("--model-type", choices=("vit_b", "vit_l", "vit_h"), default="vit_b")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto",
+                        help="auto or cpu for bundled crYOLO ONNX; cuda requires a supported GPU runtime.")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--segment-image", help="Run headless recognition on a clean image, without any desktop events.")
     modes.add_argument("--diagnostics", action="store_true", help="Report installed dependency metadata without loading a detector.")

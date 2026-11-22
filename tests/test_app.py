@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import queue
 import tempfile
-import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -14,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 from app import PickerApp, changed_fraction, export_review, image_digest, selected_grid
-from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskResult, WorkerBusyError
+from execution import CancellationToken, CaptureGeometry, TaskResult, WorkerBusyError
 from recognition import RecognitionConfig, make_candidate
 
 
@@ -367,7 +366,7 @@ class ReviewRecognitionProgressTests(unittest.TestCase):
         app.prompt_box = (1, 2, 8, 9)
         app.prompt_points, app.prompt_labels = [(3, 4)], [1]
         config = RecognitionConfig(
-            checkpoint="model.h5" if backend == "cryolo" else "model.pth",
+            checkpoint="model.onnx" if backend == "cryolo" else "model.pth",
             backend=backend,
             automatic_profile="capsid-learned" if backend == "cryolo" else "capsid",
         )
@@ -541,85 +540,6 @@ class ReviewRecognitionProgressTests(unittest.TestCase):
             "Recognition: Current detector phase\n1s elapsed. Escape stops.",
         )
 
-    def test_runtime_repair_runs_in_worker_reports_progress_and_completes(self):
-        app = headless_app()
-        ui_thread = threading.get_ident()
-        repaired_path = Path("private-runtime/python.exe")
-
-        def repair(*, cancel, progress):
-            self.assertNotEqual(threading.get_ident(), ui_thread)
-            self.assertFalse(cancel())
-            progress("Checking runtime installation")
-            return repaired_path
-
-        with patch("app.repair_cryolo_runtime", side_effect=repair) as repair_call:
-            with patch("app.time.perf_counter", return_value=100.0):
-                app.repair_runtime()
-            repair_call.assert_not_called()
-            self.assertEqual(app.job_kind, "runtime repair")
-            work, token, _ = app.runner.submissions[0]
-            with ThreadPoolExecutor(max_workers=1) as worker:
-                value = worker.submit(work, token).result(timeout=2)
-
-        self.assertEqual(value, repaired_path)
-        self.poll_at(app, 103.0)
-        self.assertEqual(
-            app.status.get(),
-            "Runtime repair: Checking runtime installation\n3s elapsed. Escape stops.",
-        )
-        app.runner.results = [TaskResult(token, value=value)]
-        self.poll_at(app, 104.0)
-        self.assertIn("crYOLO runtime repaired", app.status.get())
-        self.assertIsNone(app._recognition_progress)
-        self.assertIsNone(app.active_token)
-        self.assertEqual(len(app.runner.submissions), 1)
-        self.assertEqual(app.errors, [])
-
-    def test_stop_cancels_active_runtime_repair_and_ignores_late_progress(self):
-        app = headless_app()
-        entered, release = threading.Event(), threading.Event()
-
-        def repair(*, cancel, progress):
-            progress("Repairing runtime")
-            entered.set()
-            if not release.wait(2):
-                raise AssertionError("Test did not release repair worker")
-            self.assertTrue(cancel())
-            progress("Late cancelled repair phase")
-            raise CancelledOperation("Runtime repair cancelled")
-
-        with patch("app.repair_cryolo_runtime", side_effect=repair):
-            app.repair_runtime()
-            work, token, _ = app.runner.submissions[0]
-            with ThreadPoolExecutor(max_workers=1) as worker:
-                pending = worker.submit(work, token)
-                try:
-                    self.assertTrue(entered.wait(2))
-                    app.stop()
-                    stopped_status = app.status.get()
-                finally:
-                    release.set()
-                with self.assertRaises(CancelledOperation):
-                    pending.result(timeout=2)
-
-        self.poll_at(app, 110.0)
-        self.assertTrue(token.cancelled)
-        self.assertIsNone(app._recognition_progress)
-        self.assertEqual(app.status.get(), stopped_status)
-        self.assertEqual(app.errors, [])
-
-    def test_busy_runtime_repair_does_not_start_another_worker(self):
-        app = headless_app()
-        app._submit("automatic proposals", lambda token: [])
-        previous = app.active_token
-        with patch("app.repair_cryolo_runtime") as repair:
-            app.repair_runtime()
-        repair.assert_not_called()
-        self.assertEqual(len(app.runner.submissions), 1)
-        self.assertIs(app.active_token, previous)
-        self.assertFalse(previous.cancelled)
-        self.assertEqual(len(app.errors), 1)
-        self.assertIn("operation is active", str(app.errors[0]))
 
 
 if __name__ == "__main__":

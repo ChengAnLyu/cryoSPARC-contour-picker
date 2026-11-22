@@ -44,11 +44,12 @@ def test_unrepresentable_backend_profile_pairs_are_rejected(backend, profile):
         profile_from_backend(backend, profile)
 
 
-def test_settings_round_trip_keeps_both_models_and_no_interpreter(tmp_path):
+@pytest.mark.parametrize("suffix", [".onnx", ".h5"])
+def test_settings_round_trip_keeps_both_models_and_no_interpreter(tmp_path, suffix):
     path = tmp_path / "new" / "detector-settings.json"
     payload = {
         "detection_profile": "cryolo", "sam_checkpoint": "models/sam_vit_b.pth",
-        "sam_model_type": "vit_b", "cryolo_checkpoint": "models/capsids.h5",
+        "sam_model_type": "vit_b", "cryolo_checkpoint": "models/capsids" + suffix,
         "cryolo_config": "models/config.json", "cryolo_threshold": .3,
         "cryolo_timeout": 180, "device": "auto", "points_per_side": 8,
         "min_capsid_area": 3500, "cryolo_python": "private/python.exe",
@@ -58,13 +59,13 @@ def test_settings_round_trip_keeps_both_models_and_no_interpreter(tmp_path):
     actual = load_detector_settings(path)
     assert actual["detection_profile"] == "crYOLO"
     assert actual["sam_checkpoint"] == "models/sam_vit_b.pth"
-    assert actual["cryolo_checkpoint"] == "models/capsids.h5"
+    assert actual["cryolo_checkpoint"] == "models/capsids" + suffix
     assert not {"cryolo_python", "backend", "checkpoint"} & actual.keys()
     assert actual == json.loads(path.read_text())
 
 
 @pytest.mark.parametrize("key,value", [
-    ("sam_checkpoint", "capsids.h5"), ("cryolo_checkpoint", "sam.pth"),
+    ("sam_checkpoint", "capsids.h5"), ("sam_checkpoint", "capsids.onnx"), ("cryolo_checkpoint", "sam.pth"),
     ("sam_checkpoint", 42), ("cryolo_checkpoint", ["model.h5"]),
     ("cryolo_config", "bad\x00path"), ("cryolo_threshold", float("nan")),
     ("cryolo_threshold", float("inf")), ("cryolo_threshold", 10**1000), ("cryolo_threshold", True),
