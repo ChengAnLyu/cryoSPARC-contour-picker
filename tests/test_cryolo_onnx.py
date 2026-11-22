@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cryolo_onnx import (STANDARD_H5_SHA256, decode_detections, file_sha256,
                          onnx_worker_main, preprocess_image, resolve_onnx_checkpoint,
                          validate_metadata)
-from cryolo_recognition import CryoloRecognizer, read_onnx_detections
+from cryolo_recognition import CryoloBox, CryoloRecognizer, read_onnx_detections
 from recognition import Cancelled, RecognitionConfig, RecognitionError
 
 
@@ -40,6 +40,115 @@ def test_only_standard_h5_migrates_and_explicit_onnx_paths_are_preserved(tmp_pat
     assert resolve_onnx_checkpoint(custom) is None
     assert resolve_onnx_checkpoint(tmp_path / 'missing.onnx') == tmp_path / 'missing.onnx'
 
+
+
+@pytest.mark.parametrize('location', ['bundle/models', 'bundle', 'executable/models',
+                                      'executable', 'source/models', 'source'])
+def test_standard_h5_finds_installed_export_without_loading_or_hashing(tmp_path, monkeypatch, location):
+    stale = tmp_path / 'old-download' / 'cryolo-capsids.h5'
+    exported = tmp_path / location / 'cryolo-capsids.onnx'
+    exported.parent.mkdir(parents=True)
+    exported.write_bytes(b'metadata and source identity checked in the worker')
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(sys, '_MEIPASS', str(tmp_path / 'bundle'), raising=False)
+    monkeypatch.setattr(sys, 'executable', str(tmp_path / 'executable' / 'picker.exe'))
+    monkeypatch.setattr('cryolo_onnx.__file__', str(tmp_path / 'source' / 'cryolo_onnx.py'))
+    with patch('cryolo_onnx.file_sha256', side_effect=AssertionError('No model reads on Tk')):
+        assert resolve_onnx_checkpoint(stale) == exported
+        assert resolve_onnx_checkpoint(stale.with_name('custom.h5')) is None
+        explicit = stale.with_name('chosen.onnx')
+        assert resolve_onnx_checkpoint(explicit) == explicit
+        sibling = stale.with_suffix('.onnx')
+        sibling.parent.mkdir(parents=True)
+        sibling.write_bytes(b'adjacent export wins')
+        assert resolve_onnx_checkpoint(stale) == sibling
+
+
+@pytest.fixture
+def relocated_model(tmp_path, monkeypatch):
+    installed = tmp_path / 'installed' / 'models'
+    installed.mkdir(parents=True)
+    exported = installed / 'cryolo-capsids.onnx'
+    exported.write_bytes(b'fixture validated by a test worker')
+    monkeypatch.setattr(sys, 'frozen', False, raising=False)
+    monkeypatch.setattr('cryolo_onnx.__file__', str(installed.parent / 'cryolo_onnx.py'))
+    monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    monkeypatch.setattr('cryolo_recognition._prediction_log_directory', lambda: tmp_path/'diagnostics')
+    selected = tmp_path / 'old-download' / 'cryolo-capsids.h5'
+    return selected, exported
+
+
+@pytest.mark.parametrize('h5_exists', [False, True])
+def test_relocated_h5_keeps_worker_identity_validation(relocated_model, h5_exists):
+    selected, exported = relocated_model
+    if h5_exists:
+        selected.parent.mkdir()
+        selected.write_bytes(b'worker must hash this existing selection')
+    def start(command, **kwargs):
+        assert Path(command[command.index('--model') + 1]) == exported
+        assert command[command.index('--expected-source-sha256') + 1] == STANDARD_H5_SHA256
+        assert ('--source-h5' in command) is h5_exists
+        if h5_exists:
+            assert Path(command[command.index('--source-h5') + 1]) == selected
+        Path(command[command.index('--output')+1]).write_text(json.dumps({
+            'format':'saru-cryolo-detections-v1', 'runtime_format':'onnx',
+            'image_shape':[80,120], 'detections':[]}))
+        class Completed:
+            returncode = 0
+            def poll(self): return 0
+        return Completed()
+    config = RecognitionConfig(str(selected), backend='cryolo', automatic_profile='capsid',
+                               cryolo_config='/removed/cryolo-config.json')
+    with patch('cryolo_recognition.subprocess.Popen', side_effect=start):
+        model = CryoloRecognizer(config)
+        assert model.automatic(np.zeros((80,120,3), np.uint8)) == []
+    assert model.config.checkpoint == str(selected)
+    assert model.last_detection['runtime_format'] == 'onnx'
+
+
+@pytest.mark.parametrize('override', ['argument', 'environment'])
+def test_relocated_model_respects_explicit_legacy_override(relocated_model, monkeypatch, override):
+    selected, _ = relocated_model
+    if override == 'environment':
+        monkeypatch.setenv('SARU_CRYOLO_PYTHON', sys.executable)
+    config = RecognitionConfig(str(selected), backend='cryolo',
+                               cryolo_python=sys.executable if override == 'argument' else None)
+    assert CryoloRecognizer(config)._selected_onnx_checkpoint() is None
+
+
+@pytest.mark.parametrize('explicit_profile', [False, True])
+def test_relocated_model_refines_with_effective_companion_profile(relocated_model, explicit_profile):
+    from test_capsid import synthetic_core
+    from test_capsid_prior import fixture
+    selected, exported = relocated_model
+    profile = exported.with_name('capsid-profile.json')
+    profile.write_text(json.dumps(fixture()))
+    # A stale profile beside the original H5 must not override the installed
+    # model's companion. An explicitly selected profile remains authoritative.
+    selected.parent.mkdir()
+    stale_profile = selected.with_name('capsid-profile.json')
+    stale_profile.write_text('invalid stale profile')
+    if explicit_profile:
+        profile = selected.with_name('custom-profile.json')
+        profile.write_text(json.dumps(fixture()))
+    config = RecognitionConfig(str(selected), backend='cryolo', automatic_profile='capsid-learned',
+                               capsid_prior_path=str(profile) if explicit_profile else None)
+    model = CryoloRecognizer(config)
+    rgb, _, _ = synthetic_core()
+    candidates, _, _, _, appearance = model._refine(rgb, [CryoloBox(38, 41, 127, 127, .9)], None)
+    assert len(candidates) == 1
+    assert Path(appearance['path']) == profile
+
+
+def test_missing_standard_export_has_install_guidance_without_python_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, 'frozen', False, raising=False)
+    monkeypatch.setattr('cryolo_onnx.__file__', str(tmp_path / 'cryolo_onnx.py'))
+    monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    config = RecognitionConfig(str(tmp_path / 'missing' / 'cryolo-capsids.h5'), backend='cryolo')
+    with pytest.raises(RecognitionError, match='offline crYOLO model is missing') as error:
+        CryoloRecognizer(config).automatic(np.zeros((80, 120, 3), np.uint8))
+    assert 'model ZIP beside Setup' in str(error.value)
+    assert '--cryolo-python' not in str(error.value)
 
 def test_metadata_validates_source_identity_in_worker(tmp_path):
     source = tmp_path / 'weights.h5'

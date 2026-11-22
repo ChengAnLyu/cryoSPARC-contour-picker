@@ -23,19 +23,31 @@ STANDARD_H5_SHA256 = "a883be0bf39f0a93b0e2c36441c062fac5ab3672c044a7cf0703dc0185
 
 
 def resolve_onnx_checkpoint(checkpoint) -> Path | None:
-    """Resolve paths without loading a model, hashing files or importing ORT.
+    """Locate the standard export without loading, hashing or importing ORT.
 
-    Only the known standard H5 filename can migrate to a sibling ONNX file.
-    The worker verifies its source identity before executing that migration.
+    Older installations saved an H5 path, sometimes outside the installation.
+    Prefer its adjacent export, then look in this application's model locations.
+    Keep the original selection in the caller's config: the worker must still
+    validate the export's standard source identity and any existing selected H5.
+    Explicit ONNX choices and custom H5 filenames are never substituted.
     """
     path = Path(checkpoint).expanduser()
     if path.suffix.lower() == ".onnx":
         return path
-    if path.name.lower() == "cryolo-capsids.h5":
-        candidate = path.with_suffix(".onnx")
-        if candidate.is_file():
-            return candidate
-    return None
+    if path.name.lower() != "cryolo-capsids.h5":
+        return None
+    candidates = [path.with_suffix(".onnx")]
+    directories = []
+    if getattr(sys, "frozen", False):
+        if getattr(sys, "_MEIPASS", None):
+            bundle = Path(sys._MEIPASS)
+            directories.extend((bundle / "models", bundle))
+        executable_directory = Path(sys.executable).resolve().parent
+        directories.extend((executable_directory / "models", executable_directory))
+    source_directory = Path(__file__).resolve().parent
+    directories.extend((source_directory / "models", source_directory))
+    candidates.extend(directory / "cryolo-capsids.onnx" for directory in directories)
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
 
 
 def file_sha256(path):

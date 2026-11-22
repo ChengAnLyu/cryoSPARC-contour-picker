@@ -448,3 +448,22 @@ this workflow without sending events to another application.
 Detector models, thresholds, contour refinement and sampling are unchanged.
 Earlier private model-conversion records remain relevant; this update does
 not rerun training or claim new model accuracy.
+
+## 3.0.0 saved crYOLO model paths
+
+The upgrade regression involved saved standard H5 paths outside the installed
+model directory. The old resolver only considered an adjacent ONNX file; the
+Windows smoke tests selected the installed ONNX explicitly and missed this case.
+The corrected resolver searches known application model directories for the
+standard H5 selection. Implicit appearance-profile lookup follows the effective
+ONNX path. Custom H5 selections and explicit legacy interpreter overrides retain
+their separate behavior, and the prediction worker retains source identity
+verification.
+
+Regression coverage includes missing and existing H5 paths, installed model
+fallback, companion profile resolution, custom models, explicit runtime
+overrides, and missing-model guidance. Windows packaging checks exercise saved
+H5 preferences with no adjacent ONNX and a second installation without sidecars
+beside Setup. The release record identifies the completed run and its results.
+The trained model, decoder, contour processing, sampling and previous auto
+marker-redraw correction are unchanged.

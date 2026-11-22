@@ -59,7 +59,12 @@ installation is required. The model export does not retrain or change the
 learned weights. Release-specific numerical comparison and contour results
 belong in the supplied model record.
 
-Known default H5 model selections migrate to the verified matching ONNX export.
+Known default H5 model selections migrate to the verified matching ONNX export,
+first beside the saved H5 and then in the application's installed model folders.
+The implicit appearance profile follows the effective ONNX model. A saved H5
+path may therefore remain in preferences even when its old folder is gone.
+The worker checks the export's source identity and, if the selected H5 still
+exists, checks that file too. These checks do not run on the GUI thread.
 Custom H5 files require a matching exported model; they do not trigger a runtime
 installation. The previous **Repair crYOLO runtime** control is removed.
 Prediction errors retain diagnostics at
@@ -111,6 +116,8 @@ The [Windows workflow](../../.github/workflows/build-cryolo-windows.yml) require
   may be created. Installation is limited to five minutes.
 - Exact private-sidecar copying, appearance-profile inference and removal of
   obsolete owned runtime helpers during upgrade.
+- A second installation without sidecars beside Setup, retaining installed
+  models, followed by actual inference from persisted obsolete H5 settings.
 
 Synthetic models and images remain temporary and are removed. These checks
 establish packaging operation, not biological accuracy. Private training images,

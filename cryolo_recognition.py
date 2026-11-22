@@ -312,8 +312,12 @@ class CryoloRecognizer:
         weights = Path(self.config.checkpoint).expanduser().resolve()
         python_value = getattr(self.config, "cryolo_python", None) or os.environ.get("SARU_CRYOLO_PYTHON")
         if not python_value:
-            raise RecognitionError("This H5 checkpoint needs the matching offline ONNX model bundle. "
-                                   "Select cryolo-capsids.onnx or place it beside cryolo-capsids.h5. "
+            if weights.name.lower() == "cryolo-capsids.h5":
+                raise RecognitionError("The offline crYOLO model is missing from this installation. "
+                                       "Extract the current SARU Picker model ZIP beside Setup and run Setup again, "
+                                       "or select cryolo-capsids.onnx in Advanced. No Python installation or runtime repair is needed.")
+            raise RecognitionError("This custom H5 checkpoint needs a matching offline ONNX model bundle. "
+                                   "Select the matching ONNX model in Advanced. "
                                    "Legacy H5 inference requires an explicit --cryolo-python runtime.")
         config_value = getattr(self.config, "cryolo_config", None)
         config_path = (Path(config_value).expanduser().resolve() if config_value
@@ -493,7 +497,11 @@ class CryoloRecognizer:
         if self.config.automatic_profile == "capsid-learned":
             if self._profile is None:
                 try:
-                    path = resolve_profile_path(self.config.checkpoint, self.config.capsid_prior_path)
+                    # A saved H5 may resolve to an installed ONNX in a different
+                    # folder. Its implicit appearance profile must travel with
+                    # that effective model, not the obsolete saved H5 location.
+                    checkpoint = self._selected_onnx_checkpoint() or self.config.checkpoint
+                    path = resolve_profile_path(checkpoint, self.config.capsid_prior_path)
                     if path is None:
                         raise ValueError("capsid-profile.json is missing beside the crYOLO weights")
                     self._profile = load_profile(path)

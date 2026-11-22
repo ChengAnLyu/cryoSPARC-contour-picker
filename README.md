@@ -19,6 +19,8 @@ Download both private release archives: **SARU-Picker-Windows-CPU-3.0.0.zip** (i
 
 This installer upgrades the earlier 3.0.0 crYOLO-only package using the same installation identity and directory. The application now has a neutral SARU Picker title and all four profile choices. Screen capture, manual drawing, contour refinement, spacing, click delay, carbon checks, minimum contour area and micrograph navigation retain their existing behavior.
 
+The model-path correction also finds the installed ONNX model when saved settings still point to an old `cryolo-capsids.h5` in another folder. Its learned appearance profile is resolved beside the effective ONNX model. Install over the existing application to retain installed models. If the offline model has never been installed, extract the models ZIP beside Setup and rerun it; no Python selection or runtime repair is required.
+
 The crYOLO weights are the completed 160-example, 20-epoch fit selected at epoch 18. The offline edition exports that same trained network to ONNX, without retraining or claiming new biological accuracy. Its embedded metadata records the original checkpoint identity and inference settings. See [model details](CRYOLO.md) and [Windows build instructions](packaging/cryolo/README.md).
 
 ## Manual mode — original interaction

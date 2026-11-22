@@ -106,3 +106,24 @@ def test_public_conv_fixture_executes_real_positive_inference(tmp_path, monkeypa
     report = verification.verify(tmp_path)
     assert report['actual_onnx_inference'] is True
     assert report['detections'] == 1 and report['positive_contours'] >= 1
+
+
+def test_saved_h5_preference_uses_installed_onnx_for_real_positive_inference(tmp_path, monkeypatch):
+    pytest.importorskip('onnx')
+    pytest.importorskip('onnxruntime')
+    import cryolo_onnx
+
+    monkeypatch.delenv('SARU_CRYOLO_PYTHON', raising=False)
+    monkeypatch.syspath_prepend(str(DIRECTORY))
+    verification = load_module('saved_preferences_fixture_test', 'verify_onnx.py')
+    verification.make_fixture(tmp_path)
+    # Source tests emulate the default module-relative installation location;
+    # native Windows repeats this against real installed files without a path
+    # override, after an application-only installer upgrade.
+    monkeypatch.setattr(cryolo_onnx, '__file__', str(tmp_path / 'cryolo_onnx.py'))
+    report = verification.verify_saved_preferences(tmp_path)
+    assert report['saved_preference_loaded'] is True
+    assert report['legacy_h5_missing'] and report['adjacent_onnx_missing']
+    assert report['installed_onnx_found'] and report['actual_onnx_inference']
+    assert report['positive_contours'] >= 1 and report['grid_points'] > 0
+    assert report['external_python_required'] is False

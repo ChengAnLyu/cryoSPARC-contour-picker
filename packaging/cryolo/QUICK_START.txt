@@ -43,6 +43,13 @@ Detector settings:
 Prediction failure details:
   %LOCALAPPDATA%\SARU_Picker\cryolo-prediction.log
 
+UPGRADE MODEL PATH CORRECTION
+Saved selections of the supplied cryolo-capsids.h5 automatically find the
+matching installed cryolo-capsids.onnx, even when the old H5 folder is gone.
+The matching appearance profile is loaded beside the effective ONNX model.
+Install over the existing application to keep installed models. If the model
+is missing, extract the models ZIP beside Setup and run Setup again.
+
 Portable alternative
   Extract the entire GUI ZIP. Put the model/config/profile in
   SARU_Picker_crYOLO/_internal/models and icons in _internal/assets.

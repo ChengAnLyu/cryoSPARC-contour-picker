@@ -1536,13 +1536,16 @@ def cryolo_diagnostic_report(log_path: Path, config: RecognitionConfig) -> dict[
     report.update(backend="cryolo", cryolo_config=config.cryolo_config,
                   cryolo_config_exists=bool(config.cryolo_config and Path(config.cryolo_config).is_file()),
                   cryolo_python=config.cryolo_python,
-                  inference_runtime="onnxruntime" if onnx_checkpoint is not None else "legacy H5",
+                  inference_runtime=("onnxruntime" if onnx_checkpoint is not None else
+                                     "legacy H5" if explicit_legacy else "offline model missing"),
                   effective_checkpoint=str(onnx_checkpoint) if onnx_checkpoint is not None else config.checkpoint,
                   effective_checkpoint_exists=(onnx_checkpoint if onnx_checkpoint is not None else Path(config.checkpoint)).is_file(),
-                  cryolo_config_required=onnx_checkpoint is None,
+                  cryolo_config_required=bool(explicit_legacy),
                   note=("Metadata inspection only. Bundled crYOLO runs offline with ONNX Runtime and embedded model metadata; use --smoke-test for real inference."
                         if onnx_checkpoint is not None else
-                        "Metadata inspection only. Legacy H5 requires an explicit --cryolo-python runtime; automatic runtime installation is disabled."))
+                        "Metadata inspection only. Using the explicit legacy H5 runtime override; automatic runtime installation is disabled."
+                        if explicit_legacy else
+                        "Offline crYOLO model not found. Install the current SARU Picker model bundle or select cryolo-capsids.onnx in Advanced. No Python installation or runtime repair is needed."))
     report["dependencies"] = {name: version for name, version in report["dependencies"].items()
                               if name not in {"torch", "torchvision", "segment-anything"}}
     try:
@@ -2673,7 +2676,7 @@ def build_parser():
                         help="Optional explicit backend. By default the detection profile selects SAM or crYOLO.")
     parser.add_argument("--checkpoint", help="Model weights: SAM .pth or crYOLO .onnx; otherwise use the selected backend's bundled model.")
     parser.add_argument("--sam-checkpoint", help="Separate SAM weights used by the three original detection profiles.")
-    parser.add_argument("--cryolo-checkpoint", help="crYOLO ONNX model (bundled by default). Legacy H5 requires a verified ONNX sibling or explicit --cryolo-python.")
+    parser.add_argument("--cryolo-checkpoint", help="crYOLO ONNX model (bundled by default). Saved standard H5 paths use the matching adjacent or installed ONNX export; other H5 files require explicit --cryolo-python.")
     parser.add_argument("--cryolo-config", help="Legacy H5 JSON configuration. ONNX uses embedded metadata and ignores this option.")
     parser.add_argument("--cryolo-python", help="Expert override for a separately managed legacy H5 crYOLO runtime; unused for ONNX.")
     parser.add_argument("--cryolo-threshold", type=float, default=.3, help="crYOLO detector confidence threshold (0 to 1).")

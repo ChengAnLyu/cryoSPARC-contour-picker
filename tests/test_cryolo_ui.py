@@ -189,6 +189,29 @@ def test_onnx_diagnostics_identify_embedded_metadata_without_legacy_setup(tmp_pa
     assert report["mode"] == "diagnostics"
 
 
+@pytest.mark.parametrize("installed", [True, False])
+def test_saved_h5_diagnostics_use_installed_model_or_report_missing_offline_bundle(tmp_path, monkeypatch, installed):
+    stale = tmp_path / "removed-download" / "cryolo-capsids.h5"
+    models = tmp_path / "installed" / "models"
+    models.mkdir(parents=True)
+    onnx = models / "cryolo-capsids.onnx"
+    if installed:
+        onnx.write_bytes(b"model verification remains in the worker")
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr("cryolo_onnx.__file__", str(models.parent / "cryolo_onnx.py"))
+    monkeypatch.delenv("SARU_CRYOLO_PYTHON", raising=False)
+    config = RecognitionConfig(str(stale), backend="cryolo", cryolo_config="removed-config.json")
+    with patch("cryolo_onnx.file_sha256", side_effect=AssertionError("Diagnostics must not hash the model")):
+        report = app.cryolo_diagnostic_report(tmp_path / "test.log", config)
+    assert report["inference_runtime"] == ("onnxruntime" if installed else "offline model missing")
+    assert Path(report["effective_checkpoint"]) == (onnx if installed else stale)
+    assert report["effective_checkpoint_exists"] is installed
+    assert report["cryolo_config_required"] is False
+    if not installed:
+        assert "model bundle" in report["note"]
+        assert "--cryolo-python" not in report["note"]
+
+
 @pytest.mark.parametrize("override", ["argument", "environment"])
 @pytest.mark.parametrize("suffix", [".h5", ".onnx"])
 def test_diagnostics_match_explicit_legacy_override_without_loading_model(tmp_path, override, suffix):

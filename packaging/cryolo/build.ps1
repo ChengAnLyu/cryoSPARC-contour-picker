@@ -220,6 +220,34 @@ try {
             $Onnx = Invoke-Frozen $InstalledExe "--cryolo-onnx-smoke --fixture `"$InstalledModels`"" (Join-Path $ArtifactDirectory 'installed-frozen-onnx-smoke.json') 180
             if (-not $Onnx.frozen -or -not $Onnx.offline_guard -or -not $Onnx.actual_onnx_inference -or $Onnx.positive_contours -lt 1) { throw 'Installed offline ONNX positive inference was incomplete.' }
             if ((Test-Path -LiteralPath $LegacyReport) -or (Test-Path -LiteralPath $LegacyRuntime)) { throw 'Recognition unexpectedly prepared a legacy runtime.' }
+            # Reproduce an application-only update: the new Setup has no
+            # private sidecars beside it and must preserve installed models.
+            $PreservedHashes = @{}
+            foreach ($Sidecar in @('cryolo-capsids.onnx','cryolo-config.json','capsid-profile.json')) {
+                $PreservedHashes[$Sidecar] = (Get-FileHash -LiteralPath (Join-Path $InstalledModels $Sidecar)).Hash
+                Remove-Item -LiteralPath (Join-Path $SidecarStage $Sidecar)
+            }
+            $UpgradeLog = Join-Path $ArtifactDirectory 'installer-upgrade-smoke.log'
+            $UpgradeWatch = [Diagnostics.Stopwatch]::StartNew()
+            $Upgrade = Start-Process -FilePath $StagedInstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR=`"$InstallDirectory`" /LOG=`"$UpgradeLog`"" -PassThru
+            $null = $Upgrade.Handle
+            if (-not $Upgrade.WaitForExit(300000)) { Stop-Process -Id $Upgrade.Id -Force; throw 'Offline application-only upgrade exceeded five minutes.' }
+            $Upgrade.Refresh()
+            if ($null -eq $Upgrade.ExitCode -or $Upgrade.ExitCode -ne 0) {
+                Write-Host (Get-Content -LiteralPath $UpgradeLog -Tail 50 | Out-String)
+                throw "Offline application-only upgrade exited $($Upgrade.ExitCode)."
+            }
+            $UpgradeWatch.Stop()
+            foreach ($Sidecar in $PreservedHashes.Keys) {
+                if ((Get-FileHash -LiteralPath (Join-Path $InstalledModels $Sidecar)).Hash -ne $PreservedHashes[$Sidecar]) {
+                    throw "Application-only upgrade changed an installed model sidecar: $Sidecar"
+                }
+            }
+            if ((Test-Path -LiteralPath $LegacyReport) -or (Test-Path -LiteralPath $LegacyRuntime)) { throw 'Application-only upgrade unexpectedly prepared a legacy runtime.' }
+            @{status='ok'; version=$Version; elapsed_seconds=$UpgradeWatch.Elapsed.TotalSeconds; network_blocked=$true; source_model_sidecars_present=$false; installed_model_sidecars_preserved=$true; preserved_files=@($PreservedHashes.Keys); legacy_python_created=$false} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ArtifactDirectory 'installed-app-only-upgrade.json') -Encoding UTF8
+            $Migration = Invoke-Frozen $InstalledExe "--cryolo-onnx-smoke --saved-preferences --fixture `"$InstalledModels`"" (Join-Path $ArtifactDirectory 'installed-saved-preferences-onnx-smoke.json') 180
+            if (-not $Migration.frozen -or -not $Migration.offline_guard -or -not $Migration.saved_preference_loaded -or -not $Migration.installed_onnx_found -or -not $Migration.actual_onnx_inference -or $Migration.positive_contours -lt 1 -or $Migration.grid_points -lt 1) { throw 'Installed saved-H5 preference migration did not complete real positive ONNX inference.' }
+            if ((Test-Path -LiteralPath $LegacyReport) -or (Test-Path -LiteralPath $LegacyRuntime)) { throw 'Saved-preference migration unexpectedly prepared a legacy runtime.' }
             Remove-Item -LiteralPath (Join-Path $InstalledModels 'synthetic.png')
             $Uninstaller = Start-Process -FilePath (Join-Path $InstallDirectory 'unins000.exe') -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART' -Wait -PassThru
             if ($Uninstaller.ExitCode -ne 0) { throw "Uninstaller exited $($Uninstaller.ExitCode)." }
