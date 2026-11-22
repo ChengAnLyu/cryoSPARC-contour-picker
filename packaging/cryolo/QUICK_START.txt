@@ -56,3 +56,11 @@ Model provenance
   exercise real inference and positive contours, not assess capsid accuracy.
   Stock crYOLO software and general pretrained weights are not redistributed.
   Third-party license notices are included under _internal/licenses.
+
+AUTO PICKING UPDATE (22 November 2026)
+Auto no longer compares screenshot pixels before, during or after picking,
+or against the old reference before Down. Marker redraws can continue without
+stopping the run. Pause, Escape, target-window and click-area checks remain.
+After Down, the app still waits for a different, stable micrograph. Semi-auto
+and recognition alignment checks are unchanged. Existing offline models can
+be reused; this is an application-only update, still version 3.0.0.

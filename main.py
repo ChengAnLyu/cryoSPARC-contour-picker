@@ -6980,12 +6980,17 @@ class ScreenPickerApp:
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the micrograph.")
-                alignment = screen_background_guard((), geometry, spacing, picked)
-                if alignment is None:
-                    raise RuntimeError("Too little unchanged background to verify the remaining contours. Select a larger area and Detect again.")
-                if screen_background_changed(reference, self._capture_region(geometry), alignment) > .03:
-                    raise RuntimeError("The micrograph changed before picking. Detect again.")
-                background = screen_background_guard(candidates if planned else (), geometry, spacing, picked)
+                # cryoSPARC's marker rendering changes the screenshot during
+                # auto playback. Keep target checks, but do not use those
+                # expected pixel changes as evidence that playback must stop.
+                background = None
+                if not auto:
+                    alignment = screen_background_guard((), geometry, spacing, picked)
+                    if alignment is None:
+                        raise RuntimeError("Too little unchanged background to verify the remaining contours. Select a larger area and Detect again.")
+                    if screen_background_changed(reference, self._capture_region(geometry), alignment) > .03:
+                        raise RuntimeError("The micrograph changed before picking. Detect again.")
+                    background = screen_background_guard(candidates if planned else (), geometry, spacing, picked)
                 next_check = time.monotonic() + .75
                 def verify_scene(*, force=False):
                     nonlocal next_check
@@ -7052,6 +7057,7 @@ class ScreenPickerApp:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
                 return {"count": count, "ids": {batch.candidate_id for batch in batches}, "reference": after,
                         "auto": auto, "contours": len(batches), "scene_verified": background is not None,
+                        "scene_check": "skipped-auto" if auto else "background",
                         "frame_id": frame_id, "picked": tuple(completed_local),
                         "planning": {"spacing": spacing, "raw_grid_points": raw_count,
                                      "blocked_grid_points": blocked_count,
@@ -7074,8 +7080,8 @@ class ScreenPickerApp:
             self.auto_completed = 0
             self.hotkeys.enable_space_pause(True)
             if self.candidates and self.reference is not None:
-                # Execute the exact displayed proposals. The picking worker
-                # first compares a fresh clean capture with this reference.
+                # Execute the exact displayed proposals. Auto playback keeps
+                # target checks but allows cryoSPARC to paint pick markers.
                 self.auto_history = [self.reference.copy()]
                 self._start_model_picks(self.candidates, auto=True)
             else:
@@ -7127,7 +7133,7 @@ class ScreenPickerApp:
                 if background is None:
                     raise RuntimeError("Too little unchanged background to verify the next micrograph. Select a larger screen area.")
                 before = self._capture_region(geometry)
-                if reference is not None and screen_background_changed(reference, before, background) > .03:
+                if not auto and reference is not None and screen_background_changed(reference, before, background) > .03:
                     raise RuntimeError("The micrograph changed before navigation. Detect again.")
                 token.wait_until_ready()
                 self.desktop.press_next("down")
@@ -7217,7 +7223,7 @@ class ScreenPickerApp:
             # event budget. Commit actual clicks before making the next
             # contour selectable; its planner must see the complete history.
             self.picked_points.update(value.get("picked", ()))
-            if not value.get("scene_verified", True):
+            if not value["auto"] and not value.get("scene_verified", True):
                 self.stop(message=f"{value['count']} picks placed. Too little unchanged background to verify alignment; select a larger area and Detect again.")
                 self.candidates, self.alternatives = [], []
                 self.reference = self.rgb = None
@@ -8309,13 +8315,37 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
 
     class MemoryDesktop:
         def __init__(self):
-            self.frames = [np.repeat(np.random.default_rng(210+index).integers(
+            self.original_frames = [np.repeat(np.random.default_rng(210+index).integers(
                 60, 190, (geometry.height, geometry.width), dtype=np.uint8)[..., None], 3, axis=2)
                 for index in range(4)]
             self.reset()
         def reset(self, index=0):
+            self.frames = [frame.copy() for frame in self.original_frames]
             self.index = index
             self.keys, self.clicks, self.thread_ids = [], [], set()
+            self.paint_auto_markers = False
+            self.marked_frames, self.late_marked_frames = set(), set()
+            self.marker_updates, self.marker_guard_differences = 0, []
+        def _paint_marker_reflow(self, *, late=False):
+            frame = self.frames[self.index]
+            before = frame.copy()
+            if late:
+                # Paint after playback's final capture but before Down. This
+                # deliberately changes pixels outside the known pick margins.
+                frame[:16] = (245, 15, 25)
+                self.late_marked_frames.add(self.index)
+            else:
+                # A wide repaint makes the previous background check fail,
+                # even though the synthetic target and all pick positions stay
+                # fixed. Alternating colours exercises repeated marker redraws.
+                frame[-24:] = (15, 245, 25) if self.marker_updates % 2 else (245, 25, 15)
+                self.marker_updates += 1
+                self.marked_frames.add(self.index)
+            guard = screen_background_guard([candidates[self.index], extra_candidates[self.index]],
+                                            geometry, 20)
+            if guard is None:
+                raise RuntimeError("Synthetic marker fixture lost its navigation background.")
+            self.marker_guard_differences.append(screen_background_changed(before, frame, guard))
         def focus_target(self, target):
             self.ensure_target(target)
         def ensure_target(self, target):
@@ -8332,6 +8362,9 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
         def screenshot(self, region):
             self.window_under_roi(region)
             self._layers_hidden()
+            if (self.paint_auto_markers and picker.job_kind == "next frame"
+                    and self.index in self.marked_frames and self.index not in self.late_marked_frames):
+                self._paint_marker_reflow(late=True)
             return self.frames[self.index].copy()
         def click(self, x, y):
             self._layers_hidden()
@@ -8339,6 +8372,8 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
                 raise RuntimeError("A generated cycle test pick escaped the selected area.")
             self.thread_ids.add(threading.get_ident())
             self.clicks.append((self.index, x, y))
+            if self.paint_auto_markers:
+                self._paint_marker_reflow()
         def press_next(self, key):
             self._layers_hidden()
             if key != "down":
@@ -8348,13 +8383,17 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
             self.index = min(self.index + 1, len(self.frames)-1)
 
     desktop = MemoryDesktop()
-    candidates = []
+    candidates, extra_candidates = [], []
     for index in range(4):
         left = 15 + index * 30
         mask = polygon_mask([(left+9, 30), (left+43, 30), (left+54, 48),
                              (left+49, 94), (left+10, 101), (left, 73)],
                             (geometry.height, geometry.width))
         candidates.append(make_candidate(mask, source="synthetic micrograph-cycle check"))
+        extra_mask = polygon_mask([(176, 32), (219, 32), (224, 56),
+                                   (216, 102), (175, 99), (168, 66)],
+                                  (geometry.height, geometry.width))
+        extra_candidates.append(make_candidate(extra_mask, source="synthetic second auto contour"))
 
     class Recognizer:
         def __init__(self):
@@ -8367,7 +8406,10 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
             if not np.array_equal(rgb, desktop.frames[index]):
                 raise RuntimeError("Recognition used a stale synthetic micrograph.")
             self.calls.append(index)
-            return [] if index in self.empty_frames else [candidates[index]]
+            if index in self.empty_frames:
+                return []
+            return ([candidates[index], extra_candidates[index]] if desktop.paint_auto_markers
+                    else [candidates[index]])
 
     model = Recognizer()
 
@@ -8441,6 +8483,7 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
         # Stop while the next navigation job is waiting: no stale continuation
         # may detect or pick the fourth frame after this explicit stop.
         prepare("auto")
+        desktop.paint_auto_markers = True
         model.empty_frames = {1}
         picker.frames.set(0)
         picker.start_auto()
@@ -8457,11 +8500,27 @@ def _smoke_micrograph_cycle(picker) -> dict[str, Any]:
             raise RuntimeError("Auto produced duplicate test picks or did not disable after Stop.")
         if len(desktop.thread_ids) != 1 or threading.get_ident() in desktop.thread_ids:
             raise RuntimeError("Navigation/picking did not use the serialized background worker.")
+        expected = []
+        for index in (0, 2):
+            for batch in screen_model_batches([candidates[index], extra_candidates[index]], geometry, 20):
+                expected.extend((index, int(x), int(y)) for x, y in batch.screen)
+        if desktop.clicks != expected:
+            raise RuntimeError("Marker redraws interrupted or changed the ordered multi-contour auto picks.")
+        if (desktop.marked_frames != {0, 2} or desktop.late_marked_frames != {0, 2}
+                or desktop.marker_updates != len(expected)
+                or not desktop.marker_guard_differences
+                or min(desktop.marker_guard_differences) <= .03):
+            raise RuntimeError("The auto fixture did not exercise marker changes beyond the former background threshold.")
         auto = {"continuous_setting": 0, "detected_frames": list(model.calls),
                 "picked_frames": sorted({index for index, _, _ in desktop.clicks}),
                 "empty_frame_skipped": True, "down_keys": len(desktop.keys),
                 "unique_test_picks": len(desktop.clicks), "stop_during_navigation": True,
-                "no_detection_or_picks_after_stop": True}
+                "no_detection_or_picks_after_stop": True,
+                "contours_per_picked_frame": 2,
+                "marker_repaints_during_picking": desktop.marker_updates,
+                "late_marker_frames_before_down": sorted(desktop.late_marked_frames),
+                "minimum_marker_background_change": min(desktop.marker_guard_differences),
+                "ordered_picks_unchanged_by_markers": True}
 
         # The last list item returns the same screenshot after Down. This must
         # stop with no new recognition or picking, rather than re-picking it.

@@ -1024,12 +1024,17 @@ class ScreenPickerApp:
                 token.sleep(.12)
                 if self.desktop.window_under_roi(geometry) != target:
                     raise RuntimeError("Another window covers the micrograph.")
-                alignment = screen_background_guard((), geometry, spacing, picked)
-                if alignment is None:
-                    raise RuntimeError("Too little unchanged background to verify the remaining contours. Select a larger area and Detect again.")
-                if screen_background_changed(reference, self._capture_region(geometry), alignment) > .03:
-                    raise RuntimeError("The micrograph changed before picking. Detect again.")
-                background = screen_background_guard(candidates if planned else (), geometry, spacing, picked)
+                # cryoSPARC's marker rendering changes the screenshot during
+                # auto playback. Keep target checks, but do not use those
+                # expected pixel changes as evidence that playback must stop.
+                background = None
+                if not auto:
+                    alignment = screen_background_guard((), geometry, spacing, picked)
+                    if alignment is None:
+                        raise RuntimeError("Too little unchanged background to verify the remaining contours. Select a larger area and Detect again.")
+                    if screen_background_changed(reference, self._capture_region(geometry), alignment) > .03:
+                        raise RuntimeError("The micrograph changed before picking. Detect again.")
+                    background = screen_background_guard(candidates if planned else (), geometry, spacing, picked)
                 next_check = time.monotonic() + .75
                 def verify_scene(*, force=False):
                     nonlocal next_check
@@ -1096,6 +1101,7 @@ class ScreenPickerApp:
                     raise RuntimeError("The micrograph changed during picking. Detect again.")
                 return {"count": count, "ids": {batch.candidate_id for batch in batches}, "reference": after,
                         "auto": auto, "contours": len(batches), "scene_verified": background is not None,
+                        "scene_check": "skipped-auto" if auto else "background",
                         "frame_id": frame_id, "picked": tuple(completed_local),
                         "planning": {"spacing": spacing, "raw_grid_points": raw_count,
                                      "blocked_grid_points": blocked_count,
@@ -1118,8 +1124,8 @@ class ScreenPickerApp:
             self.auto_completed = 0
             self.hotkeys.enable_space_pause(True)
             if self.candidates and self.reference is not None:
-                # Execute the exact displayed proposals. The picking worker
-                # first compares a fresh clean capture with this reference.
+                # Execute the exact displayed proposals. Auto playback keeps
+                # target checks but allows cryoSPARC to paint pick markers.
                 self.auto_history = [self.reference.copy()]
                 self._start_model_picks(self.candidates, auto=True)
             else:
@@ -1171,7 +1177,7 @@ class ScreenPickerApp:
                 if background is None:
                     raise RuntimeError("Too little unchanged background to verify the next micrograph. Select a larger screen area.")
                 before = self._capture_region(geometry)
-                if reference is not None and screen_background_changed(reference, before, background) > .03:
+                if not auto and reference is not None and screen_background_changed(reference, before, background) > .03:
                     raise RuntimeError("The micrograph changed before navigation. Detect again.")
                 token.wait_until_ready()
                 self.desktop.press_next("down")
@@ -1261,7 +1267,7 @@ class ScreenPickerApp:
             # event budget. Commit actual clicks before making the next
             # contour selectable; its planner must see the complete history.
             self.picked_points.update(value.get("picked", ()))
-            if not value.get("scene_verified", True):
+            if not value["auto"] and not value.get("scene_verified", True):
                 self.stop(message=f"{value['count']} picks placed. Too little unchanged background to verify alignment; select a larger area and Detect again.")
                 self.candidates, self.alternatives = [], []
                 self.reference = self.rgb = None

@@ -427,3 +427,24 @@ not held-out biological validation. Public Windows CI uses a synthetic Conv
 network to test positive inference through the frozen and installed worker,
 checks exact sidecar copies, and blocks network access during installed checks.
 The release record must cite the completed run and its actual reports.
+
+
+## 3.0.0 auto picking marker redraws
+
+Auto click playback no longer compares captured pixels with the detection
+reference before, between or after contours. Auto pre-navigation also skips
+the old-reference comparison. The result handler distinguishes intentionally
+skipped auto checks from a failed semi-auto scene check. Target focus, window
+coverage, capture/click geometry, pause and cancellation remain active.
+
+Regression checks repaint pixels outside the old marker-exclusion regions
+and verify auto completes the planned contours. Separate checks retain
+semi-auto image-change stops, target-loss stops and cancellation. The actual
+next-micrograph waiter still requires a new stable image after one Down key;
+marker-only changes and an unchanged end-of-list frame do not authorize another
+round of picking. Native Windows source, frozen and installed checks exercise
+this workflow without sending events to another application.
+
+Detector models, thresholds, contour refinement and sampling are unchanged.
+Earlier private model-conversion records remain relevant; this update does
+not rerun training or claim new model accuracy.

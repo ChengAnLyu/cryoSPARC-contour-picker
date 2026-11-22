@@ -11,7 +11,8 @@ import numpy as np
 from execution import CancellationToken, CancelledOperation, CaptureGeometry, TaskResult
 from manual_sampling import legacy_contour_points, mask_contour_points
 from recognition import RecognitionConfig, make_candidate
-from micrograph_navigation import NoNewMicrographError, MicrographLoadTimeoutError
+from micrograph_navigation import (NoNewMicrographError, MicrographLoadTimeoutError,
+                                   wait_for_next_micrograph)
 from screen_app import (ScreenPickerApp, screen_changed_fraction, screen_mask_at, screen_model_points, screen_model_batches,
                         screen_background_guard, screen_background_changed, screen_region_overlaps_panel,
                         DEFAULT_CLICK_DELAY)
@@ -1132,6 +1133,147 @@ class ScreenControllerTests(unittest.TestCase):
         app._next_frame.assert_called_once_with()
         self.assertEqual(app.auto_remaining, 1)
 
+    def test_auto_marker_changes_do_not_stop_contours_or_prevent_navigation(self):
+        app = app_state("auto")
+        first, second = np.zeros((70, 80), bool), np.zeros((70, 80), bool)
+        first[15:40, 5:25], second[15:40, 45:65] = True, True
+        app.candidates, app.auto_remaining = [make_candidate(first), make_candidate(second)], 2
+        expected = [tuple(point) for mask in (first, second)
+                    for point in mask_contour_points(mask, 13) + [140, 100]]
+        # Markers can paint before playback, throughout a contour and between
+        # contours. Deliberately change far more than the old 3% threshold.
+        app.desktop.rgb[100:170, 140:220] = 50
+        click = app.desktop.click
+        def paint_markers(x, y):
+            click(x, y)
+            app.desktop.rgb[100:170, 140:220] = 80 + len(app.desktop.clicks) * 5
+        app.desktop.click = paint_markers
+        with patch("screen_app.screen_background_changed",
+                   side_effect=AssertionError("Auto playback must not compare screenshots")):
+            app._start_model_picks(app.candidates, auto=True)
+            app.root.run_next()
+            result = app.runner.finish()
+            self.assertEqual(app.desktop.clicks, expected)
+            self.assertEqual(result["contours"], 2)
+            self.assertFalse(result["scene_verified"])
+            self.assertEqual(result["scene_check"], "skipped-auto")
+            app._result("model picks", result)
+            self.assertEqual(app.auto_remaining, 1)
+            self.assertFalse(app.disabled.get())
+            # More delayed drawing before Down must not be compared with the
+            # post-pick reference. The freshly captured frame is the baseline.
+            app.desktop.rgb[100:170, 140:220] = 200
+            before = app.desktop.rgb[100:170, 140:220].copy()
+            marker_only = before.copy()
+            for x, y in app.picked_points:
+                marker_only[max(0, y-2):y+3, max(0, x-2):x+3] = 0
+            new = np.full_like(before, 20)
+            captures = [marker_only, new, new, new, new]
+            capture = app._capture_region
+            def capture_after_down(geometry):
+                if not app.desktop.keys:
+                    return capture(geometry)
+                return captures.pop(0) if captures else new.copy()
+            app._capture_region = capture_after_down
+            app.root.run_next()
+            def wait_without_real_sleep(capture, previous, token, **kwargs):
+                np.testing.assert_array_equal(previous, before)
+                clock = [0.0]
+                def sleep(seconds):
+                    token.check_cancelled()
+                    clock[0] += seconds
+                with patch.object(token, "sleep", side_effect=sleep):
+                    return wait_for_next_micrograph(capture, previous, token, **kwargs,
+                        clock=lambda: clock[0], minimum_wait=.01,
+                        settle_seconds=.02, poll_seconds=.01)
+            with patch("screen_app.wait_for_next_micrograph", side_effect=wait_without_real_sleep):
+                next_result = app.runner.finish()
+        self.assertEqual(app.desktop.keys, ["down"])
+        self.assertTrue(next_result["advanced"])
+        np.testing.assert_array_equal(next_result["rgb"], new)
+        self.assertEqual(app.desktop.clicks, expected)
+        app._start_detection = Mock()
+        app._result("next frame", next_result)
+        self.assertEqual(app.picked_points, set())
+        self.assertTrue(app._start_detection.call_args.kwargs["auto"])
+        np.testing.assert_array_equal(app._start_detection.call_args.kwargs["expected"], new)
+
+    def test_auto_navigation_marker_only_change_does_not_authorize_another_frame(self):
+        app = app_state("auto")
+        app.auto_remaining = 2
+        app.picked_points = {(20, 20)}
+        # The last reference can predate a widespread marker redraw, but Down
+        # must still produce a different background from its fresh baseline.
+        app.desktop.rgb[100:170, 140:220] = 180
+        before = app.desktop.rgb[100:170, 140:220].copy()
+        marker_only = before.copy()
+        marker_only[18:23, 18:23] = 0
+        capture = app._capture_region
+        app._capture_region = lambda geometry: marker_only.copy() if app.desktop.keys else capture(geometry)
+        app._next_frame(auto=True)
+        app.root.run_next()
+        def wait_without_real_sleep(capture, previous, token, **kwargs):
+            clock = [0.0]
+            def sleep(seconds):
+                token.check_cancelled()
+                clock[0] += seconds
+            with patch.object(token, "sleep", side_effect=sleep):
+                return wait_for_next_micrograph(capture, previous, token, **kwargs,
+                    clock=lambda: clock[0], minimum_wait=.01,
+                    settle_seconds=.02, poll_seconds=.1)
+        with patch("screen_app.wait_for_next_micrograph", side_effect=wait_without_real_sleep):
+            result = app.runner.finish()
+        self.assertFalse(result["advanced"])
+        self.assertEqual(app.desktop.keys, ["down"])
+        self.assertEqual(app.desktop.clicks, [])
+        app._start_detection = Mock()
+        app._result("next frame", result)
+        app._start_detection.assert_not_called()
+        self.assertFalse(app.auto_remaining)
+        self.assertTrue(app.disabled.get())
+
+    def test_auto_playback_with_no_unmarked_background_still_completes(self):
+        app = app_state("auto")
+        app.candidates = [make_candidate(np.ones((70, 80), bool))]
+        app.picked_points = {(x, y) for y in range(0, 70, 10) for x in range(0, 80, 10)}
+        self.assertIsNone(screen_background_guard((), app.geometry, 13, app.picked_points))
+        app.auto_remaining = 1
+        app._start_model_picks(app.candidates, auto=True)
+        app.root.run_next()
+        result = app.runner.finish()
+        self.assertEqual(result["count"], 0)
+        self.assertFalse(result["scene_verified"])
+        app._result("model picks", result)
+        self.assertFalse(app.auto_remaining)
+        self.assertFalse(app.disabled.get())
+        self.assertIn("Auto finished", app.status.get())
+        self.assertEqual(app.desktop.clicks, [])
+        # Playback does not need unmarked background. Navigation still needs
+        # enough of it to distinguish a real next frame from delayed markers.
+        app._next_frame(auto=True)
+        app.root.run_next()
+        with self.assertRaisesRegex(RuntimeError, "Too little unchanged background"):
+            app.runner.finish()
+        self.assertEqual(app.desktop.keys, [])
+
+    def test_auto_image_changes_do_not_disable_target_focus_checks(self):
+        app = app_state("auto")
+        mask = np.zeros((70, 80), bool)
+        mask[10:60, 5:40] = True
+        app.candidates = [make_candidate(mask)]
+        click = app.desktop.click
+        def lose_focus(x, y):
+            click(x, y)
+            app.desktop.rgb[100:170, 140:220] = 0
+            app.desktop.foreground = 77
+        app.desktop.click = lose_focus
+        app._start_model_picks(app.candidates, auto=True)
+        app.root.run_next()
+        with self.assertRaisesRegex(RuntimeError, "focus changed"):
+            app.runner.finish()
+        self.assertEqual(len(app.desktop.clicks), 1)
+        self.assertEqual(app.desktop.keys, [])
+
     def test_later_invalid_contour_rejects_all_batches_before_clicking(self):
         app = app_state("auto")
         first = np.zeros((70, 80), bool)
@@ -1282,12 +1424,11 @@ class ScreenControllerTests(unittest.TestCase):
                 app.runner.finish()
         self.assertEqual(len(app.desktop.clicks), 1)
 
-    def test_insufficient_background_clears_masks_and_stops_auto_before_next_frame(self):
-        app = app_state("auto")
-        app.auto_remaining = 2
+    def test_insufficient_background_still_clears_semi_auto_masks(self):
+        app = app_state("semi-auto")
         app.candidates = [make_candidate(np.ones((70, 80), bool))]
         app._result("model picks", {"count": 10, "ids": set(), "reference": app.reference,
-                                     "auto": True, "scene_verified": False})
+                                     "auto": False, "scene_verified": False})
         self.assertEqual(app.auto_remaining, 0)
         self.assertEqual(app.candidates, [])
         self.assertIsNone(app.reference)
@@ -1581,7 +1722,7 @@ class ScreenControllerTests(unittest.TestCase):
         np.testing.assert_array_equal(app.auto_history[0], app.reference)
         self.assertIsNot(app.auto_history[0], app.reference)
 
-    def test_auto_reused_proposals_still_reject_a_changed_screen_before_clicking(self):
+    def test_auto_reused_proposals_allow_marker_redraw_before_clicking(self):
         app = app_state("auto")
         mask = np.zeros((70, 80), bool)
         mask[15:40, 5:25] = True
@@ -1589,9 +1730,10 @@ class ScreenControllerTests(unittest.TestCase):
         app.desktop.rgb[100:170, 140:220] = 0
         app.start_auto()
         app.root.run_next()
-        with self.assertRaisesRegex(RuntimeError, "changed before picking"):
-            app.runner.finish()
-        self.assertEqual(app.desktop.clicks, [])
+        result = app.runner.finish()
+        expected = mask_contour_points(mask, 13) + [140, 100]
+        self.assertEqual(app.desktop.clicks, [tuple(point) for point in expected])
+        self.assertEqual(result["count"], len(expected))
         self.assertEqual(app.desktop.keys, [])
 
     def test_auto_reenable_restores_retained_outlines_and_reports_their_count(self):
@@ -1652,7 +1794,8 @@ class ScreenControllerTests(unittest.TestCase):
         result = app.runner.finish()
         self.assertEqual(result["count"], 0)
         self.assertEqual(result["ids"], {candidate.id})
-        self.assertTrue(result["scene_verified"])
+        self.assertFalse(result["scene_verified"])
+        self.assertEqual(result["scene_check"], "skipped-auto")
         app.poll()
         self.assertEqual(app.candidates, [])
         app._result("model picks", result)

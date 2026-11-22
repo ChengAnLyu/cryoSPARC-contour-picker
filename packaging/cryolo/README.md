@@ -70,6 +70,17 @@ licenses. Stock crYOLO software and its general pretrained weights are not
 redistributed. Training dependencies retain their upstream licenses; this
 runtime change makes no claim to broaden those permissions.
 
+## Auto picking marker redraws
+
+The 22 November auto-picking update disables old-reference screenshot comparisons
+before, during and after auto click playback, and immediately before Down.
+cryoSPARC can paint markers without interrupting the contour sequence.
+Semi-auto alignment checks, recognition alignment, focus/window/geometry checks,
+pause and cancellation remain. Navigation still requires a different stable
+frame after Down. Existing models are unchanged and can be reused.
+The native micrograph-cycle fixture exercises marker redraws through the real
+controller and worker with synthetic click/key sinks.
+
 ## Build and verification
 
 Run `packaging/cryolo/build.ps1` on Windows with Python 3.12 x64 and Git. Build

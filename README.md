@@ -51,7 +51,7 @@ Completed picks are recorded before the next contour becomes selectable. Scene c
 
 ## Auto mode
 
-Choose **auto**, select the screen area, uncheck **Disable Picking**, and choose **Start auto**. If Detect has already displayed contours, Start auto uses that exact ordered set after checking that the image still matches. Otherwise it detects first. It finishes contour 1, then contour 2, and so on, with per-contour progress. After finishing a micrograph, it sends one **Down** key, waits for a different stable image, detects its contours, and repeats the picking/navigation cycle.
+Choose **auto**, select the screen area, uncheck **Disable Picking**, and choose **Start auto**. If Detect has already displayed contours, Start auto uses that exact ordered set. Otherwise it detects first. It finishes contour 1, then contour 2, and so on, with per-contour progress. After finishing a micrograph, it sends one **Down** key, waits for a different stable image, detects its contours, and repeats the picking/navigation cycle.
 
 - **Limit (0=all)** defaults to **0**, which continues until stopped or until another micrograph cannot be verified. Set **1** to process only the current micrograph, or **2–1000** for a bounded run. A positive limit includes the current micrograph and images with no detected contours.
 - **Load (s)** defaults to **10 seconds** and is the maximum loading timeout, not a fixed delay after each Down key. Detection starts once the changed image is stable. Increase this value for a slower-loading cryoSPARC session.
@@ -59,7 +59,9 @@ Choose **auto**, select the screen area, uncheck **Disable Picking**, and choose
 
 Auto mode picks every displayed contour. The selected detection profile determines the proposals. The default **capsid** profile retains the original SAM-based filtering; **cryolo** traces contours inside crYOLO detections using the supplied appearance profile. Faint cores and fragments can be missed, and unwanted material can survive. Check representative images in semi-auto mode before an automatic run. Re-detecting the same scene retains the recorded pick positions; a verified new frame clears them.
 
-The app stops if navigation leaves the same image visible, returns to a recently seen image, or fails to reach a stable new image before the timeout. It also stops on lost target focus, unexpected movement during detection/picking, other errors, or insufficient stable background to verify remaining masks. It sends no repeated Down-key retries. At the end of a list, an unchanged view stops the run. Image-change checks are heuristics, not image registration. Keep the image zoom and position fixed during recognition and picking.
+Auto follows the detected contour positions without comparing screenshot pixels before, during or after click playback, or against the older reference just before navigation. cryoSPARC marker redraws therefore do not trigger the “micrograph changed during picking” stop. Focus, selected-window and click-area checks, pause and Escape remain active. Semi-auto retains its image-alignment checks.
+
+After Down, the app still waits for a different, stable micrograph. It stops if navigation leaves the same image visible, returns to a recently seen image, or fails to finish loading before the timeout. Recognition alignment checks also remain active. The app sends no repeated Down-key retries. Keep the image zoom and position fixed while using the detected contours.
 
 ## Screen controls and behavior
 
